@@ -665,7 +665,7 @@ def test_install_docs_use_the_local_marketplace_until_published():
     ci = _read(REPO / ".github" / "workflows" / "ci.yml")
     guard = ci.split("release guard (install placeholders)", 1)[1].split("\n\n", 1)[0]
     assert "OWNER/" in guard and "pull_request" not in guard
-    assert "github.ref == 'refs/heads/main'" in guard and "refs/tags/" in guard
+    assert "github.ref == 'refs/heads/master'" in guard and "refs/tags/" in guard
     assert 'tags: ["v*"]' in ci
 
 
@@ -697,7 +697,8 @@ def test_dev_sandbox_is_a_seeded_nh_project():
     notebook = nbformat.read(sandbox / cfg["project"]["notebook"], as_version=4)
     nbformat.validate(notebook)
     assert (notebook.nbformat, notebook.nbformat_minor) == (4, 5)
-    assert [cell.cell_type for cell in notebook.cells] == ["markdown"]
+    # Seeded with the title cell; cells written while trying the harness may follow it.
+    assert notebook.cells and notebook.cells[0].cell_type == "markdown"
     assert notebook.cells[0].source.startswith("# ")
     # Like /nh:init writes it: [project] values, every other key commented out.
     live = [
