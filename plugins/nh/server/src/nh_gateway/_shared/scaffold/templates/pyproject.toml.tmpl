@@ -1,0 +1,17 @@
+[project]
+name = $name
+version = "0.1.0"
+description = $description
+requires-python = ">=3.11"
+dependencies = [
+$dependencies
+]
+
+[dependency-groups]
+# JupyterLab for this project only; nh needs JupyterLab >= 4.6 with real-time collaboration.
+dev = [
+$dev_dependencies
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,76 @@
+#!/bin/sh
+# nh-python: print the path of a Python >= 3.9 for nh's stdlib helpers (hooks, nhctl).
+# Exits 1 when there is none. Order:
+#   1. $NH_PYTHON (an explicit override, used by tests)
+#   2. the Python of a ready runtime venv under $CLAUDE_PLUGIN_DATA
+#   3. the path cached in $CLAUDE_PLUGIN_DATA/python-path by an earlier search
+#   4. python3 on PATH, then Homebrew, then /usr/bin/python3 (on macOS only when the
+#      command-line tools are installed, so the install dialog never pops up)
+#   5. uv python find '>=3.9'
+# A searched candidate is kept only if `-I -S` reports >= 3.9; its real executable is cached.
+unset UV_PYTHON VIRTUAL_ENV PYTHONHOME
+data=${CLAUDE_PLUGIN_DATA:-}
+cache=${data:+$data/python-path}
+
+probe() {
+    [ -x "$1" ] || return 1
+    real=$("$1" -I -S -c 'import sys
+if sys.version_info >= (3, 9) and sys.executable:
+    print(sys.executable)' 2>/dev/null) || return 1
+    [ -n "$real" ] && [ -x "$real" ] && printf '%s\n' "$real"
+}
+
+found() {
+    printf '%s\n' "$1"
+    exit 0
+}
+
+remember() {
+    if [ -n "$cache" ] && mkdir -p "$data" 2>/dev/null &&
+        printf '%s\n' "$1" >"$cache.$$" 2>/dev/null; then
+        mv -f "$cache.$$" "$cache" 2>/dev/null || rm -f "$cache.$$"
+    fi
+    found "$1"
+}
+
+try() {
+    real=$(probe "$1") && remember "$real"
+}
+
+if [ -n "${NH_PYTHON:-}" ]; then
+    real=$(probe "$NH_PYTHON") && found "$real"
+    echo "nh-python: NH_PYTHON=$NH_PYTHON is not a Python >= 3.9" >&2
+    exit 1
+fi
+
+if [ -n "$data" ]; then
+    for venv in "$data"/venv-*; do
+        [ -f "$venv/.nh-ready" ] && [ -x "$venv/bin/python" ] && found "$venv/bin/python"
+    done
+    cached=
+    [ -f "$cache" ] && IFS= read -r cached <"$cache"
+    [ -n "$cached" ] && [ -x "$cached" ] && found "$cached"
+fi
+
+# /usr/bin/python3 on macOS is a stub that offers to install the command-line tools.
+system_python_ok() {
+    [ "$(uname -s 2>/dev/null)" != Darwin ] || xcode-select -p >/dev/null 2>&1
+}
+
+path_python=$(command -v python3 2>/dev/null)
+case $path_python in
+    '') ;;
+    /usr/bin/python3) system_python_ok && try "$path_python" ;;
+    *) try "$path_python" ;;
+esac
+try /opt/homebrew/bin/python3
+try /usr/local/bin/python3
+system_python_ok && try /usr/bin/python3
+
+for uv in "$(command -v uv 2>/dev/null)" "${HOME:-}/.local/bin/uv" "${HOME:-}/.cargo/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do
+    if [ -n "$uv" ] && [ -x "$uv" ]; then
+        candidate=$("$uv" python find --no-project --no-python-downloads '>=3.9' 2>/dev/null) && try "$candidate"
+        break
+    fi
+done
+exit 1

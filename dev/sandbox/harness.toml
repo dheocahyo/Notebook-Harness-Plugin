@@ -1,0 +1,91 @@
+# Notebook Harness (nh) settings for this project. Commit this file.
+# Every setting outside [project] is shown commented out at nh's built-in default;
+# uncomment a line to override it. [approval] applies after /mcp -> Reconnect.
+# version = 1
+
+[project]
+name = "sandbox"
+goal = "Which regions drive the drop in average price?"
+problem_type = "eda"            # eda | classification | regression | clustering | forecasting | other
+data_source = "data/sales.csv"
+notebook = "notebooks/01_eda.ipynb"
+env_manager = "uv"              # uv | conda (written by nhctl scaffold)
+
+[jupyter]
+# url = ""                        # empty = discover; only a loopback URL is accepted here (remote: NH_JUPYTER_URL env)
+# kernel_name = ""                # empty = the notebook's kernelspec, else python3
+
+[approval]
+# approve_before_run = false      # true = Claude Code asks before each nh_add_cell / nh_edit_cell (reconnect /mcp to apply)
+
+[turn]
+# max_code_cells = 1
+# max_retries = 2
+# max_waits = 2
+# max_undos = 3
+# max_lint_rejects = 3
+# stamp_ttl_s = 1800
+
+[exec]
+# soft_timeout_s = 100
+# hard_timeout_s = 1800
+# probe_budget_s = 0.8
+
+[output]
+# max_chars = 2000
+# max_images = 2
+# image_max_px = 768
+
+[inspect]
+# max_chars = 4000
+# head_rows = 5
+# max_rows = 20
+# max_vars = 40
+# outline_limit = 60
+
+[markdown]
+# title_max_words = 8
+# notes_min = 2
+# notes_max = 5
+# bullet_max_words = 40
+# bullet_hint_words = 25
+# heading_level = 3
+
+[lint]
+# mode = "advise"                 # advise | strict (strict turns every hint into an error)
+# comment_ratio = 8               # at most 1 comment per N code lines; 0 = no comments
+# max_line_length = 99
+# max_cell_lines = 40
+# max_nesting = 3
+# max_chain = 4
+
+[lint.rules]                    # per rule: off | hint | error
+# package_install = "error"
+# notebook_write = "error"
+# markdown_output = "error"
+# long_line = "hint"
+# long_cell = "hint"
+# deep_nesting = "hint"
+# long_chain = "hint"
+# comment_budget = "hint"
+# commented_out_code = "hint"
+# multi_statement = "hint"
+# star_import = "hint"
+# bare_except = "hint"
+# non_idempotent = "hint"
+# apply_lambda = "hint"
+# cryptic_name = "hint"
+# early_def = "hint"
+# no_visible_output = "hint"
+# many_outputs = "hint"
+# hidden_warnings = "hint"
+# prose_print = "hint"
+# kernel_only_name = "hint"
+# intent_too_long = "hint"
+# long_bullet = "hint"
+
+[stale]
+# mark = "none"                   # none | clear-count
+
+[guard]
+# foreign_mcp = "deny"            # deny | warn | off

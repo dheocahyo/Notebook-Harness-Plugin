@@ -1,0 +1,10 @@
+# Notebook Harness (nh)
+.venv/
+.conda/
+.env
+.ipynb_checkpoints/
+*jupyter_ystore.db
+# written by JupyterLab and jupyter-collaboration while the sandbox is served
+.jupyter/
+# the sandbox's environment lock is rebuilt by `nhctl env sync`
+uv.lock

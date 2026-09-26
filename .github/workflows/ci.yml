@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --project plugins/nh/server --locked --all-groups
+      - run: uv run --project plugins/nh/server ruff check .
+      - run: uv run --project plugins/nh/server ruff format --check .
+      - run: cd plugins/nh/server && uv run pyright src
+      - name: shell scripts
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -s sh plugins/nh/libexec/nh-mcp plugins/nh/libexec/nh-sync plugins/nh/libexec/nh-python plugins/nh/hooks/nh-hook plugins/nh/bin/nhctl
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: uv sync --project plugins/nh/server --locked --all-groups
+      - name: Python 3.11 for the probe and linter compatibility tests
+        run: uv python install 3.11
+      - name: unit, hooks, nhctl, gateway, contract
+        run: uv run --project plugins/nh/server pytest -q
+      - name: lint and hook helpers on the oldest supported Pythons
+        run: |
+          uv run --no-project --python 3.11 --with pytest --with pytest-timeout --with pytest-asyncio --with hypothesis \
+            python -m pytest -q -p no:cacheprovider tests/unit/test_magics.py tests/unit/test_lint_hard.py \
+            tests/unit/test_lint_hints.py tests/unit/test_lint_tokenize_compat.py tests/unit/test_dataflow.py
+
+  integration:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --project plugins/nh/server --locked --all-groups
+      - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs-${{ matrix.os }}
+          path: /tmp/pytest-of-*/**/jupyterlab.log
+          if-no-files-found: ignore
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g @anthropic-ai/claude-code@latest
+      - run: claude plugin validate --strict plugins/nh
+      - run: claude plugin validate --strict .
+      - name: release guard (version bump)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin "${{ github.base_ref }}"
+          if git diff --name-only "origin/${{ github.base_ref }}" -- plugins/nh | grep -q .; then
+            if ! git diff "origin/${{ github.base_ref }}" -- plugins/nh/.claude-plugin/plugin.json | grep -q '"version"'; then
+              echo "::error::plugins/nh changed without a version bump in plugin.json"; exit 1
+            fi
+          fi
+      - name: release guard (install placeholders)
+        # Only for what gets published (main and release tags), never on pull requests.
+        # A release tag also needs the real GitHub owner in place of <github-owner>.
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          files="README.md plugins/nh/README.md plugins/nh/.claude-plugin .claude-plugin"
+          # shellcheck disable=SC2086
+          if grep -rn "OWNER/" $files; then
+            echo "::error::OWNER placeholder in the install instructions"; exit 1
+          fi
+          # shellcheck disable=SC2086
+          if [ "$RELEASE" = "true" ] && grep -rn "<github-owner>/" $files; then
+            echo "::error::a release needs the published GitHub owner in place of <github-owner>"; exit 1
+          fi
+
+  evals:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-evals')
+    needs: plugin
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - id: gate
+        run: '[ -n "$ANTHROPIC_API_KEY" ] && echo run=true >> "$GITHUB_OUTPUT" || echo "::notice::no API key, evals skipped"'
+      - if: steps.gate.outputs.run == 'true'
+        run: npm install -g @anthropic-ai/claude-code@latest
+      - if: steps.gate.outputs.run == 'true'
+        run: claude plugin eval plugins/nh --trust-plugin --scaffold --ablation none --tag ci --threshold 0.8 --json evals.json --no-publish --max-cost-usd 15
+      - if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evals
+          path: |
+            evals.json
+            plugins/nh/evals/results/**

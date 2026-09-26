@@ -1,0 +1,50 @@
+#!/bin/sh
+# nh-mcp: stdio launcher for the nh gateway (see .mcp.json). stdout carries MCP frames only.
+#
+# Runs the gateway from source (PYTHONPATH=server/src) with the versioned runtime venv that
+# nh-sync builds. If that venv isn't ready, it starts a sync (unless one is already running)
+# and waits up to 25 s. `exec` keeps Claude Code as the gateway's parent, so the gateway's
+# os.getppid() equals the NH_CC_PID the hooks stamp.
+case $(uname -s 2>/dev/null) in
+    *MINGW* | *MSYS* | *CYGWIN*)
+        echo "nh: Windows is not supported in v0.1; use WSL" >&2
+        exit 1
+        ;;
+esac
+
+case $0 in */*) libexec=${0%/*} ;; *) libexec=. ;; esac
+libexec=$(CDPATH= cd -- "$libexec" && pwd -P) || exit 1
+root=${libexec%/*}
+data=${CLAUDE_PLUGIN_DATA:-}
+if [ -z "$data" ]; then
+    echo "nh: CLAUDE_PLUGIN_DATA is not set; the nh server must be started by Claude Code" >&2
+    exit 1
+fi
+
+unset UV_PYTHON VIRTUAL_ENV PYTHONHOME
+NH_CC_PID=$PPID
+PYTHONPATH="$root/server/src"
+PYTHONPYCACHEPREFIX="$data/pycache"
+export NH_CC_PID PYTHONPATH PYTHONPYCACHEPREFIX
+
+venv=$(/bin/sh "$libexec/nh-sync" --path) || exit 1
+
+ready() {
+    [ -f "$venv/.nh-ready" ] && [ -x "$venv/bin/python" ]
+}
+
+if ! ready; then
+    /bin/sh "$libexec/nh-sync" --ensure-background </dev/null >/dev/null 2>&1
+    polls=0
+    while ! ready && [ "$polls" -lt 50 ]; do
+        sleep 0.5
+        polls=$((polls + 1))
+    done
+fi
+
+if ready; then
+    exec "$venv/bin/python" -s -m nh_gateway
+fi
+
+echo "nh: its Python runtime is not ready yet. The first install takes about a minute and needs uv (https://docs.astral.sh/uv/); progress is logged in $data/logs/sync.log. When it finishes, run /mcp, select plugin:nh:nh and choose Reconnect." >&2
+exit 1

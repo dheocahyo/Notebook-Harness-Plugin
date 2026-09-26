@@ -1,0 +1,133 @@
+{
+  "description": "Notebook Harness (nh): turn stamps for nh write tools, guards against raw notebook edits, nh:qa-cell launch guards, run records and stops, and session and per-message context. Outside projects with a .nh/ folder the hooks only keep the plugin's Python runtime synced.",
+  "hooks": {
+    "Setup": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "setup"],
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "session-start"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "prompt-submit"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "pre-tool", "file"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^Read$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "pre-tool", "read"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|PowerShell)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "pre-tool", "shell"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__plugin_nh_nh__nh_(add_cell|edit_cell|run|undo)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "pre-tool", "nh"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__(?!plugin_nh_nh__).+__.+$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "pre-tool", "foreign-mcp"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^Workflow$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "pre-tool", "workflow"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Workflow$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "post-tool", "workflow"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "^TaskStop$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/nh-hook", "post-tool", "task-stop"],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

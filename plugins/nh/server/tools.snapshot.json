@@ -1,0 +1,332 @@
+{
+  "tools": [
+    {
+      "name": "nh_inspect",
+      "description": "Read-only view of the live notebook and kernel. view: status (connection, kernel, hooks), overview (outline + variables, default), outline (cells with ids, titles, run status, STALE and edited flags), vars (variables with shapes, dtypes, nulls), var (one variable; rows <= 20 of its head), cell (one cell's source, intent and outputs; returns its sha for nh_edit_cell), intents (why each nh cell exists). Call it before your first write in a session. Never Read .ipynb files.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "view": {
+            "default": "overview",
+            "description": "status | overview | outline | vars | var | cell | intents",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Variable name for view='var'."
+          },
+          "cell_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Cell id for view='cell', or to center the outline."
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Rows of a dataframe head for view='var' (default [inspect].head_rows, max 20)."
+          },
+          "notebook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Notebook path relative to the project. Default: the active notebook."
+          }
+        }
+      }
+    },
+    {
+      "name": "nh_add_cell",
+      "description": "Insert ONE code cell with a note above it (### title <= 8 words + 2-5 bullets: what the cell does and why) and run it now in the user's kernel. Once per user message. Pass title and notes as plain text without '#' or '-'. intent = the user's ask in one line. code: plain, readable Python; no '# %%' separators, no package installs, no markdown output. Returns the real output, a before/after self-check and readability hints.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "description": "What the cell does, at most 8 words, plain text.",
+            "type": "string"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "description": "2-5 plain bullets: what the cell does and why."
+          },
+          "intent": {
+            "description": "The user's ask in one line.",
+            "type": "string"
+          },
+          "code": {
+            "description": "The cell's Python code.",
+            "type": "string"
+          },
+          "after_cell_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Insert after this cell. Default: at the bottom."
+          },
+          "notebook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Notebook path relative to the project. Default: the active notebook."
+          }
+        },
+        "required": [
+          "title",
+          "notes",
+          "intent",
+          "code"
+        ]
+      }
+    },
+    {
+      "name": "nh_edit_cell",
+      "description": "Replace the code of ONE existing cell and run it. Use it when the user asks to change a specific cell (this is the message's one cell), or to fix the cell you wrote this message after it failed (at most 2 retries). Pass base_sha from nh_inspect(view='cell') when editing a cell you did not just write. title/notes update the note above nh's own cells; human cells never get a note.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell_id": {
+            "description": "The cell to change.",
+            "type": "string"
+          },
+          "code": {
+            "description": "The new code for the whole cell.",
+            "type": "string"
+          },
+          "base_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "sha from nh_inspect(view='cell') for cells you did not just write."
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "New note title (nh cells only)."
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "New 2-5 note bullets (nh cells only)."
+          },
+          "intent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The user's ask in one line (required if the cell has none)."
+          },
+          "notebook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Notebook path relative to the project. Default: the active notebook."
+          }
+        },
+        "required": [
+          "cell_id",
+          "code"
+        ]
+      }
+    },
+    {
+      "name": "nh_run",
+      "description": "mode='run' re-runs one existing cell unchanged; it counts as the message's one action, so only do it when the user asks. mode='wait' waits up to about 100 s more for a cell reported as RUNNING. mode='interrupt' stops a running nh cell (only after it has started).",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell_id": {
+            "description": "The cell to run, wait for, or interrupt.",
+            "type": "string"
+          },
+          "mode": {
+            "default": "run",
+            "description": "run | wait | interrupt",
+            "type": "string"
+          },
+          "notebook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Notebook path relative to the project. Default: the active notebook."
+          }
+        },
+        "required": [
+          "cell_id"
+        ]
+      }
+    },
+    {
+      "name": "nh_undo",
+      "description": "Undo nh's last change: removes a cell nh added (with its note) or restores the code from before nh's edit. Kernel variables are NOT rolled back; the result says which ones still hold undone results. Later cells that used them are marked outdated. Refuses if the user edited the cell since; pass force=true only after they confirm.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cell_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The cell to undo. Default: nh's last change."
+          },
+          "force": {
+            "default": false,
+            "description": "Only after the user confirms overwriting their own edits.",
+            "type": "boolean"
+          },
+          "notebook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Notebook path relative to the project. Default: the active notebook."
+          }
+        }
+      }
+    }
+  ],
+  "meta": {
+    "approve_off": {
+      "nh_inspect": {
+        "anthropic/alwaysLoad": true
+      },
+      "nh_add_cell": {
+        "anthropic/alwaysLoad": true
+      },
+      "nh_edit_cell": {
+        "anthropic/alwaysLoad": true
+      },
+      "nh_run": {
+        "anthropic/alwaysLoad": true
+      },
+      "nh_undo": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    "approve_on": {
+      "nh_inspect": {
+        "anthropic/alwaysLoad": true
+      },
+      "nh_add_cell": {
+        "anthropic/alwaysLoad": true,
+        "anthropic/requiresUserInteraction": true
+      },
+      "nh_edit_cell": {
+        "anthropic/alwaysLoad": true,
+        "anthropic/requiresUserInteraction": true
+      },
+      "nh_run": {
+        "anthropic/alwaysLoad": true
+      },
+      "nh_undo": {
+        "anthropic/alwaysLoad": true
+      }
+    }
+  }
+}

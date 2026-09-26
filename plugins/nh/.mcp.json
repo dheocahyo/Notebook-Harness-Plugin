@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "nh": {
+      "command": "/bin/sh",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/libexec/nh-mcp"],
+      "env": {
+        "FASTMCP_SHOW_SERVER_BANNER": "false",
+        "FASTMCP_CHECK_FOR_UPDATES": "off",
+        "FASTMCP_TELEMETRY_MODE": "off",
+        "FASTMCP_LOG_LEVEL": "WARNING",
+        "FASTMCP_ENABLE_RICH_LOGGING": "false",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

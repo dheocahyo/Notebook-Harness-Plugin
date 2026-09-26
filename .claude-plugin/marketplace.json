@@ -1,0 +1,14 @@
+{
+  "name": "notebook-harness",
+  "owner": { "name": "Dheo Cahyo" },
+  "description": "Notebook Harness: one reviewed Jupyter cell per turn for Claude Code.",
+  "plugins": [
+    {
+      "name": "nh",
+      "source": "./plugins/nh",
+      "description": "Work in your live JupyterLab notebook one executed, reviewable cell per turn, with intent notes, undo and a project scaffold (/nh:init).",
+      "category": "data-science",
+      "tags": ["jupyter", "jupyterlab", "notebook", "data-science", "mcp"]
+    }
+  ]
+}

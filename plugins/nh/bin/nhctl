@@ -1,0 +1,28 @@
+#!/bin/sh
+# nhctl: Notebook Harness project CLI. Stdlib Python >= 3.9; see scripts/nhctl/main.py.
+# Python: $NH_PYTHON, else libexec/nh-python, else python3 on PATH.
+
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *) self=$(dirname "$self")/$link ;;
+    esac
+done
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$self")/.." && pwd -P) || exit 1
+
+PY=${NH_PYTHON:-}
+if [ -z "$PY" ] && [ -f "$ROOT/libexec/nh-python" ]; then
+    PY=$(/bin/sh "$ROOT/libexec/nh-python" 2>/dev/null) || PY=
+    [ -n "$PY" ] && [ -x "$PY" ] || PY=
+fi
+if [ -z "$PY" ]; then
+    PY=$(command -v python3 2>/dev/null) || PY=
+fi
+if [ -z "$PY" ]; then
+    echo "nhctl: no python3 found (need Python 3.9 or newer)" >&2
+    exit 1
+fi
+
+exec "$PY" -I -S -B "$ROOT/scripts/nhctl/main.py" "$@"

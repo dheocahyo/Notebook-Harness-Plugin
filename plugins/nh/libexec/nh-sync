@@ -1,0 +1,183 @@
+#!/bin/sh
+# nh-sync [--check | --path | --foreground | --ensure-background]
+#
+# Builds the gateway runtime as an immutable venv at
+# $CLAUDE_PLUGIN_DATA/venv-<first 12 hex of sha256(server/uv.lock)>. A venv is ready
+# only once its .nh-ready marker exists; the marker is written last.
+#   --check              exit 0 when the runtime for this plugin version is ready
+#   --path               print that venv's path (ready or not)
+#   --foreground         build it now (waits for a sync another process is running)
+#   --ensure-background  start a detached --foreground unless ready or already syncing
+set -u
+unset UV_PYTHON VIRTUAL_ENV
+
+case $0 in */*) libexec=${0%/*} ;; *) libexec=. ;; esac
+libexec=$(CDPATH= cd -- "$libexec" && pwd -P) || exit 1
+root=${libexec%/*}
+self="$libexec/nh-sync"
+data=${CLAUDE_PLUGIN_DATA:-}
+if [ -z "$data" ]; then
+    echo "nh-sync: CLAUDE_PLUGIN_DATA is not set" >&2
+    exit 2
+fi
+lock="$data/sync.lock"
+log="$data/logs/sync.log"
+wait_max=600
+
+lock_hash() {
+    lockfile="$root/server/uv.lock"
+    [ -f "$lockfile" ] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum=$(sha256sum <"$lockfile") || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        sum=$(shasum -a 256 <"$lockfile") || return 1
+    else
+        return 1
+    fi
+    sum=${sum%% *}
+    rest=${sum#????????????}
+    sum=${sum%"$rest"}
+    case $sum in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            printf '%s\n' "$sum" ;;
+        *) return 1 ;;
+    esac
+}
+
+hash=$(lock_hash) || {
+    echo "nh-sync: can't hash $root/server/uv.lock (needs sha256sum or shasum)" >&2
+    exit 1
+}
+venv="$data/venv-$hash"
+
+say() {
+    mkdir -p "${log%/*}" 2>/dev/null
+    printf '%s nh-sync[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" "$*" >>"$log" 2>/dev/null
+}
+
+ready() {
+    [ -f "$venv/.nh-ready" ] && [ -x "$venv/bin/python" ]
+}
+
+lock_holder() {
+    holder=
+    [ -f "$lock/pid" ] && IFS= read -r holder <"$lock/pid"
+    printf '%s\n' "$holder"
+}
+
+lock_held() {
+    holder=$(lock_holder)
+    [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null
+}
+
+# mkdir is the atomic step. A lock whose owner died is moved aside, and taken over only if
+# the lock we moved is the one we judged stale (another process may have taken it first).
+take_lock() {
+    mkdir -p "$data" || return 1
+    if mkdir "$lock" 2>/dev/null; then
+        echo "$$" >"$lock/pid"
+        return 0
+    fi
+    holder=$(lock_holder)
+    if [ -n "$holder" ]; then
+        kill -0 "$holder" 2>/dev/null && return 1
+    elif [ -z "$(find "$lock" -prune -mmin +1 2>/dev/null)" ]; then
+        return 1  # just created: its pid file is on the way
+    fi
+    aside="$lock.stale.$$"
+    mv "$lock" "$aside" 2>/dev/null || return 1
+    moved=
+    [ -f "$aside/pid" ] && IFS= read -r moved <"$aside/pid"
+    rm -rf "$aside"
+    [ "$moved" = "$holder" ] || return 1
+    mkdir "$lock" 2>/dev/null || return 1
+    echo "$$" >"$lock/pid"
+    say "recovered a stale lock left by pid ${holder:-unknown}"
+}
+
+find_uv() {
+    if command -v uv 2>/dev/null; then
+        return 0
+    fi
+    for candidate in "${HOME:-}/.local/bin/uv" "${HOME:-}/.cargo/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Keep the current runtime and the newest other one; older ones belong to past plugin versions.
+prune() {
+    kept=0
+    ls -1dt "$data"/venv-* 2>/dev/null | while IFS= read -r dir; do
+        [ "$dir" = "$venv" ] && continue
+        kept=$((kept + 1))
+        [ "$kept" -gt 1 ] && rm -rf "$dir" && say "removed old runtime $dir"
+    done
+}
+
+sync_now() {
+    trap 'rm -rf "$lock"' EXIT
+    trap 'exit 1' INT TERM
+    ready && return 0
+    if [ -f "$log" ]; then
+        size=$(wc -c <"$log")
+        [ "$((size))" -gt 262144 ] && : >"$log"
+    fi
+    if ! uv=$(find_uv); then
+        say "uv not found (looked on PATH, ~/.local/bin, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin)"
+        echo "nh-sync: uv not found; install it from https://docs.astral.sh/uv/" >&2
+        return 3
+    fi
+    say "building $venv with $uv"
+    rm -f "$venv/.nh-ready"
+    if UV_PROJECT_ENVIRONMENT="$venv" "$uv" sync --project "$root/server" --frozen --no-dev --no-progress >>"$log" 2>&1 &&
+        [ -x "$venv/bin/python" ] &&
+        printf '%s\n' "$hash" >"$venv/.nh-ready.tmp" &&
+        mv -f "$venv/.nh-ready.tmp" "$venv/.nh-ready"; then
+        say "ready: $venv"
+        prune
+        return 0
+    fi
+    say "sync failed"
+    echo "nh-sync: building the runtime failed; see $log" >&2
+    return 1
+}
+
+foreground() {
+    waited=0
+    while :; do
+        ready && return 0
+        if take_lock; then
+            sync_now
+            return $?
+        fi
+        if [ "$waited" -ge "$wait_max" ]; then
+            echo "nh-sync: another sync is still running; see $log" >&2
+            return 75
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+ensure_background() {
+    ready && return 0
+    lock_held && return 0
+    mkdir -p "${log%/*}" || return 1
+    nohup /bin/sh "$self" --foreground </dev/null >/dev/null 2>&1 &
+    say "started background sync (pid $!)"
+}
+
+case ${1:---check} in
+    --check) ready ;;
+    --path) printf '%s\n' "$venv" ;;
+    --foreground) foreground ;;
+    --ensure-background) ensure_background ;;
+    *)
+        echo "usage: nh-sync [--check | --path | --foreground | --ensure-background]" >&2
+        exit 2
+        ;;
+esac

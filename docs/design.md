@@ -1,0 +1,490 @@
+# Notebook Harness v0.1: design and implementation contract
+
+This file is the single source of truth for module boundaries. The product plan it implements is the approved plan (decisions D1–D12). Every module below lists:
+- its owner files;
+- its public functions, with exact signatures;
+- the data shapes it exchanges with other modules.
+
+If you change a contract, change it here first.
+
+## 0. Conventions
+
+**Gateway code** (`plugins/nh/server/src/nh_gateway/**`, except `_shared`):
+- Python ≥ 3.11, async where it touches I/O.
+- No third-party imports outside `backend/`, `exec/`, `app.py` and `tools/`. Allowed: `fastmcp`, `jupyter_nbmodel_client`, `jupyter_kernel_client`, `pycrdt`, `nbformat`, `PIL`, `filelock`, `requests`.
+
+**Shared code** (`_shared/**`):
+- Stdlib only, **Python 3.9 compatible**: `from __future__ import annotations`, no `match`, no `X | Y` at runtime.
+- Imported by hooks and `nhctl`.
+
+**Hooks and nhctl** (`plugins/nh/hooks/nh_hooks/**`, `plugins/nh/scripts/nhctl/**`):
+- Stdlib + `_shared` only, Python 3.9 compatible.
+- Every entry point starts with:
+  ```python
+  import os, sys
+
+  HERE = os.path.dirname(os.path.realpath(__file__))
+  ROOT = os.path.realpath(os.path.join(HERE, "..", ".."))  # plugins/nh
+  sys.path[:0] = [HERE, os.path.join(ROOT, "server", "src")]
+  ```
+
+**Tests:**
+- Tests live in the repo-root `tests/<layer>/`.
+- Run them with `uv run --project plugins/nh/server pytest ../../../tests/<layer>` from `plugins/nh/server`, or `uv run --project plugins/nh/server --directory . pytest tests/...` from the repo root.
+- Tests put `plugins/nh/server/src` on `sys.path` via `tests/conftest.py`.
+
+**User-visible text:**
+- Name cells by title and `[n]`. Never use `nh-` ids or line numbers.
+- Tokens are never logged; `policy.errors.scrub` removes `token=`.
+
+## 1. Already written (read these first)
+
+| File | What it defines |
+|---|---|
+| `_shared/paths.py` | `find_project()`; `Layout(project)` with every `.nh/` path; `atomic_write_json`, `read_json`, `append_jsonl` |
+| `_shared/stamp_spec.py` + `_shared/tool_defaults.py` | `stamp_key(tool, args)`, `stamp_filename(key, tool_use_id)`, `bare_tool_name`, `TOOL_PREFIX` |
+| `_shared/text.py` | `count_words`, `normalize_title`, `normalize_bullet`, `split_notes`, `render_note(title, bullets, level)` |
+| `_shared/tomlread.py` | `load(path)`, `loads(text)` (tomllib or a mini parser) |
+| `_shared/patterns.py` | `shell_notebook_write(cmd)`, `CELL_NOTEBOOK_WRITES`, `CELL_PACKAGE_INSTALL`, `CELL_SEPARATORS` |
+| `config.py` + `defaults.toml` | `load(project) -> Config`; `Config[section][key]`; `Config.rule(key)`; `Config.problems`; `ConfigCache` |
+| `policy/errors.py` | `NhError(code, detail="", **fields)` (a `ToolError`); `CATALOGUE`; `scrub()` |
+| `backend/base.py` | `NotebookBackend` protocol, `NotebookRef`, `CellView`, `NewCell`, `CellPatch`, `ExecResult`, `ErrorInfo`, `KernelStatus`, `Execution`, `CellConflict`, `CellMissing`, `ServerInfo`, `OutputSummary` |
+| `meta.py` | `new_code_id`, `note_id`, `source_sha`, `normalize_source`, `code_metadata`, `note_metadata`, `nh_meta`, `is_agent_code`, `is_note` |
+
+## 2. Probe payloads (kernel → gateway)
+
+Probe sources live in `nh_gateway/probes/<name>.py`. Each is a plain Python script run in the **user's kernel** under these constraints:
+- It sees a dict `_A` with its arguments.
+- It must run on Python 3.10–3.13.
+- It may import only the stdlib.
+- It must bind no names in the user namespace.
+- It ends with exactly one `display({"application/vnd.nh.probe+json": payload}, raw=True)`.
+
+Payloads by probe:
+
+**`attach`**
+```json
+{"python": [3, 12], "prefix": "/…/.venv", "executable": "/…/python", "cwd": "/…/notebooks", "exec_count": 17}
+```
+
+**`vars`**
+- Arguments: `_A = {"names": [...] | null, "max_vars": 40, "budget_s": 0.8, "max_cells": 20000000}`.
+  - `names=null` means every user variable.
+  - Skipped: names starting with `_`, `In`, `Out`, `exit`, `quit`, `get_ipython`, modules, functions and classes.
+- Payload:
+```json
+{"vars": {
+   "df": {"kind": "DataFrame", "lib": "pandas", "shape": [10432, 8], "columns": ["a", ...], "dtypes": {"a": "float64", ...},
+          "nulls": {"price": 312}, "mem": 667648},
+   "s":  {"kind": "Series", "lib": "pandas", "len": 10, "dtype": "int64", "nulls": 0, "name": "x"},
+   "X":  {"kind": "ndarray", "shape": [800, 12], "dtype": "float64"},
+   "n":  {"kind": "scalar", "type": "int", "repr": "42"},
+   "l":  {"kind": "container", "type": "list", "len": 3},
+   "m":  {"kind": "object", "type": "sklearn.linear_model._base.LinearRegression"}},
+ "truncated": false, "packages": {"pandas": "2.2.3", "numpy": null, "sklearn": "1.5.2"}}
+```
+- `packages` holds a version from `importlib.metadata`, or `null` when the package is installed but not imported. A package that is not installed is omitted.
+
+**`var`**
+- Arguments: `_A = {"name": "df", "rows": 5}`.
+- Payload: `{"name": "df", "summary": {<same as the vars entry>}, "head": "<text table>", "text": "<reprlib repr for non-frames>"}`.
+
+**Errors.** When a probe fails, the payload is `{"error": "<type>: <message>"}`.
+
+## 3. Module contracts to implement
+
+### 3.1 `lint/magics.py`, `lint/lint.py`, `dataflow.py`
+
+**`magics.py`**
+```python
+@dataclass
+class Masked:
+    text: str                 # same number of lines; magic lines replaced by "pass" + spaces
+    cell_magic: str | None    # "%%time" -> "time"; the whole cell then skips AST rules
+    magic_lines: set[int]     # 1-based
+
+def mask(source: str) -> Masked
+```
+
+**`lint.py`**
+```python
+@dataclass
+class Issue:
+    rule: str                 # "L004"
+    key: str                  # "notes" (config key for hints; hard rules use their own key)
+    severity: Literal["error", "hint"]
+    message: str              # human sentence, quotes code, never line numbers
+    fix: str                  # one sentence telling the agent what to change
+
+@dataclass
+class LintReport:
+    errors: list[Issue]; hints: list[Issue]
+    code_lines: int; comment_lines: int
+    defs: set[str]; uses: set[str]; parsed: bool
+    title: str | None; bullets: list[str]      # normalised values to write
+
+def lint_cell(code: str, *, title: str | None, notes: list[str] | str | None, intent: str | None,
+              cfg: Config, require_note: bool, require_intent: bool,
+              kernel_python: tuple[int, int] | None, names_above: set[str] | None) -> LintReport
+```
+
+Hard rules (IDs are fixed):
+
+| ID | Rule |
+|---|---|
+| L001 | empty code |
+| L002 | cell separators (COMMENT tokens matching `patterns.CELL_SEPARATORS`) |
+| L003 | title: > `title_max_words`, multi-line, or markdown/HTML (`#`, `<`, `` ` ``, `![`); required when `require_note` |
+| L004 | notes: fewer than `notes_min` or more than `notes_max` bullets; a bullet > `bullet_max_words`; heading, fence, image, HTML or nested list inside a bullet |
+| L005 | missing intent when `require_intent` |
+| L007 | syntax error, only when `kernel_python` is known and ≤ the gateway's own version (`ast.parse(masked, feature_version=kernel_python)`); otherwise a hint |
+| L008 `notebook_write` | notebook writes |
+| L009 `package_install` | package installs |
+| L010 `markdown_output` | `%%markdown`/`%%html` cell magics; `Markdown(`, `HTML(` or `Latex(` called with a string literal of more than `title_max_words` words |
+
+Severity for L008–L010 comes from `cfg.rule(key)`, where `off` drops the rule.
+
+Hints (keys as in `defaults.toml [lint.rules]`; `cfg["lint"]["mode"] == "strict"` promotes every hint to an error):
+
+| IDs | Rules |
+|---|---|
+| L101–L109 | long_line, long_cell, deep_nesting, long_chain (**logical** links across lines > `max_chain`), comment_budget (`0` = no comments; else `max(1, code_lines // ratio)`), commented_out_code, multi_statement, star_import, bare_except |
+| L111–L114 | non_idempotent, apply_lambda, cryptic_name (`df2`, `tmp`, `temp`, `data1`, single letters outside loops or comprehensions), early_def |
+| L116–L119 | no_visible_output, many_outputs (≥ 3 display points), hidden_warnings, prose_print (> 15 words) |
+| L120 | kernel_only_name: needs `names_above`; a use not defined above and not a builtin or IPython name |
+| L122 | intent_too_long (> 200 chars) |
+| L123 | long_bullet (> `bullet_hint_words`) |
+
+**`dataflow.py`**
+```python
+def defs_uses(source: str) -> tuple[set[str], set[str], bool]   # (defs, uses, parsed); unparsable => (set(), {"*"}, False)
+def downstream(cells: list[tuple[str, str]], start: int, tainted: set[str]) -> list[str]
+    # cells = [(cell_id, source)] code cells in notebook order; walk cells[start:], return ids that use a tainted name;
+    # their defs join tainted. A cell with uses {"*"} counts as using everything.
+def defined_names(sources: list[str]) -> set[str]                # union of defs (for L120)
+```
+Defs include:
+- assignment targets, including tuple unpacking, `for`, `with`-as and walrus;
+- `import` aliases, `def`/`class`, `del`;
+- mutation of a base name: `x[...] =`, `x.attr =`, augmented assignment, `x.method(..., inplace=True)`;
+- **expression-statement method calls** `x.m(...)`, and names passed as arguments to a bare call statement.
+
+**Tests:** `tests/unit/test_magics.py`, `test_lint_hard.py`, `test_lint_hints.py`, `test_lint_tokenize_compat.py`, `test_dataflow.py`.
+
+### 3.2 `exec/shaping.py`, `render.py`
+
+**`shaping.py`**
+```python
+@dataclass
+class ShapedImage: data: bytes; mime: str; width: int; height: int; orig: tuple[int, int]
+@dataclass
+class Shaped:
+    text: str                      # ≤ max_chars; sections per output, head+tail truncation, tracebacks keep the tail
+    images: list[ShapedImage]      # ≤ max_images, each ≤ image_max_px on the long side (PNG; JPEG q80 if PNG > 150 KB)
+    dropped_images: int
+    truncated: bool
+    full_path: str | None          # project-relative path of the untruncated copy in .nh/outputs/
+    error: ErrorInfo | None        # from output_type == "error" (ANSI-stripped; line from "Cell In[n], line N" / "line N")
+    summary: OutputSummary
+
+def strip_ansi(text: str) -> str
+def shape_outputs(outputs: list[dict], *, max_chars: int, max_images: int, image_max_px: int,
+                  save_dir: Path | None) -> Shaped
+def summarize_outputs(outputs: list[dict]) -> OutputSummary    # cheap: no base64 decoding
+def redact(text: str) -> str               # FR-14 seam: identity in v0.1
+def prune_outputs_dir(save_dir: Path, max_files: int = 200, max_bytes: int = 50 * 2**20) -> None
+```
+Mime preference: `error`, then `text/plain`, then `text/markdown`, `text/latex`, then images (`image/png`, `image/jpeg`), then `text/html`. HTML becomes text only when there is no `text/plain`; tables become TSV via `html.parser`. Then `application/json` (compact), Plotly as `[plotly figure: N traces]`, widgets as `[widget]`, SVG as `[SVG figure omitted]`. `\r` progress bars keep the text after the last `\r` on each line. Consecutive streams with the same name are coalesced.
+
+**`render.py`**
+```python
+def cell_label(title: str | None, execution_count: int | None, source: str = "") -> str
+    # '"Drop rows with missing price" [14]' ; falls back to the first code line (≤ 40 chars)
+def selfcheck(before: dict, after: dict) -> tuple[list[str], list[str]]
+    # (self_check_lines ≤ 8, check_this_lines) from two `vars` payload dicts
+def next_block(status: str, *, retries_left: int, waits_left: int, cell: str) -> str
+class Result:
+    def __init__(self, first_line: str, machine: str): ...
+    def section(self, name: str, lines: list[str] | str) -> "Result"   # skips empty sections
+    def text(self) -> str
+```
+The `check this` heuristics:
+- rows went to 0;
+- more than 50% of rows removed;
+- rows grew after `merge`/`join` (the code contains `merge(` or `.join(`);
+- a new all-null column;
+- shape unchanged although the code contains `drop`, `dropna` or a boolean filter `[...]`.
+
+**Tests:** `tests/unit/test_shaping.py`, `test_render.py`.
+
+### 3.3 `history.py`, `state.py`, `log.py`
+
+**`history.py`**: append-only JSONL in `.nh/history/<uid>.jsonl`, plus an `_ops.jsonl` index.
+```python
+@dataclass
+class Op:
+    op_id: str; op: Literal["insert", "edit"]; ts: float; notebook: str; session_id: str; turn_id: str
+    uid: str; note_uid: str | None; index: int
+    before: dict | None     # edit: {"source","nh","tags","note_source","note_nh","execution_count"}; insert: None
+    after_sha: str          # source_sha after the last attempt in the turn
+    defs: list[str]; attempts: int; undone: bool
+
+class HistoryStore:
+    def __init__(self, layout: Layout): ...
+    def record(self, *, op: str, notebook: str, session_id: str, turn_id: str, uid: str, note_uid: str | None,
+               index: int, before: dict | None, after_source: str, defs: set[str]) -> Op
+        # FOLDS: if an op for (turn_id, uid) exists, update after_sha/defs/attempts+1 and keep the ORIGINAL before/op
+    def last_ops(self, notebook: str, session_id: str, turn_ids: list[str]) -> list[Op]   # newest first, not undone
+    def ops_for(self, uid: str) -> list[Op]
+    def mark_undone(self, op: Op, *, turn_id: str) -> None
+```
+
+**`state.py`**
+```python
+class StaleStore:     # .nh/state/stale.json {notebook: {uid: {"reason","by","turn_id","exec_count"}}}
+    def mark(self, notebook, uids: list[str], *, reason, by, turn_id, exec_counts: dict[str, int | None]) -> None
+    def clear(self, notebook, uids) -> None
+    def get(self, notebook) -> dict[str, dict]
+class DriftStore:     # .nh/state/kernel_drift.json {notebook: {"kernel_id","since","names":{name: why}}}
+    def add(self, notebook, kernel_id, names: dict[str, str]) -> None
+    def get(self, notebook) -> dict | None
+    def clear(self, notebook, names: set[str] | None = None) -> None   # None = all
+def write_last_cell(layout, **fields) -> None   # {v, session_id, notebook, cell_id, title, exec, status, turn_id, retries_left, finished_at}
+def read_last_cell(layout) -> dict | None
+```
+
+**`log.py`**
+```python
+class EventLog:
+    def __init__(self, layout: Layout, max_bytes: int = 5 * 2**20): ...
+    def emit(self, event: str, **fields) -> None   # envelope {"v":1,"ts","event",...}; scrubs tokens; rotates to log.1.jsonl
+```
+
+**Tests:** `tests/unit/test_history.py`, `test_state.py`, `test_log.py`.
+
+### 3.4 Backend: `backend/discovery.py`, `rest.py`, `rtc.py`, `kernel.py`; `exec/runner.py`, `exec/flusher.py`, `exec/probes.py`; `probes/*.py`; `backend/fake.py`
+
+`RtcBackend(layout, cfg_cache)` implements `NotebookBackend` against a live JupyterLab, per plan §4.4. Key points:
+
+**Discovery**
+- `discover(project, cfg) -> ServerInfo`, raising `NhError` E130/E138.
+- Order: env, config, `lab.json`, then a jpserver scan over four runtime dirs. Pid alive, `/api/status` with the token, reject jupyter_server < 2.
+- `resolve_notebook(project, server, rel_or_none, cfg) -> NotebookRef`, raising E132.
+
+**REST** (`requests`, run in a small dedicated `ThreadPoolExecutor`):
+- sessions: GET/POST
+- kernel model: GET `/api/kernels/{id}`
+- `contents_exists`
+- `collab_session` (PUT)
+- `status`
+- `extensions`
+- **`NO_PROXY` is set before import.**
+
+**RTC**
+- `NhNbModelClient(NbModelClient)`: awareness messages are applied.
+- `RtcDocument.ensure()`: a `run()` task plus `wait_until_synced()` with an 8 s cap, else E135. A reconnect bumps `generation`.
+- **Inside `with nb._lock:` touch only `nb._doc.ycells`, `ycell[...]`, `nb._doc._ymeta` and `len(nb)`. Never a public `NotebookModel` method.**
+- Insert = `create_ycell(nbformat.v4.new_*_cell(..., id=, metadata=))` + ONE `nb._doc._ydoc.transaction(origin=nb._changes_origin)`.
+- Update = difflib opcodes applied right to left on the `Text` in one transaction, checking `base_source` first.
+
+**Kernel**
+- Attach per call: sessions lookup (UUID race wait, most connections), POST if missing (501 fallback).
+- Clients: `JupyterKernelClient(server_url=, token=, kernel_id=, username="nh-agent")`. If `has_kernel` is false, raise E134. Assert `channels_running`. Stop with `stop(shutdown_kernel=False)`. **Two clients per kernel: exec and probe.**
+- Do NOT use `execute_interactive`. Use our own request loop on the client's channels:
+  1. flush with `client.iopub_channel.get_msgs()`;
+  2. `msg_id = client.execute(code, silent=, store_history=, allow_stdin=False, stop_on_error=False)`;
+  3. loop `client.iopub_channel.get_msg(timeout=0.25)`; skip messages whose `parent_header.msg_id` isn't ours; set `started` on our `status: busy` or `execute_input`;
+  4. check `client.connection_ready`, the abort flag and the deadline on every iteration;
+  5. stop on our `status: idle`;
+  6. then read the shell reply with the same filter.
+
+**Runner and flusher**
+- `start_execution` runs that loop on a daemon `threading.Thread`, forwarding messages with `loop.call_soon_threadsafe`.
+- The flusher applies `jupyter_kernel_client.client.output_hook` semantics to a local list, then every 200 ms writes changed outputs into the ycell **resolved by id** (sanitized and capped), with `execution_state` running/idle and `execution_count` from the reply.
+- Lost detection: REST poll every 2 s.
+
+**Probes**
+- `exec/docsafe.py` (backend-owned; used by the flusher and FakeBackend):
+  - `sanitize_for_doc(value) -> Any`: NaN/±Inf become None; ints outside int64 become str; lone surrogates become U+FFFD; applied recursively.
+  - `cap_outputs_for_doc(outputs) -> list[dict]`: stream text keeps the last 1 MB; a mime bundle over 5 MB becomes a text notice; 8 MB per cell.
+- `exec/probes.py`: `run_probe(client, name, args, timeout) -> dict` runs `exec(base64 source, {"_A": args})` with `silent=True, store_history=False`, and reads the `application/vnd.nh.probe+json` output.
+
+**FakeBackend** (`backend/fake.py`)
+- In-memory cells (nbformat dicts).
+- Executes code with `exec` in one persistent namespace (`display` supported via a shim that appends `display_data`), producing nbformat outputs.
+- Probes run the real probe sources against that namespace.
+- Knobs: `kernel_busy`, `fail_open`, `exec_delay_s`, `python_version`.
+
+**Tests**
+- `tests/unit/test_discovery.py` (fake runtime dirs)
+- `tests/integration/*` (real JupyterLab fixture in `tests/integration/conftest.py`)
+- `tests/unit/test_fake_backend.py`
+
+### 3.5 Turn gate and tools: `policy/stamps.py`, `policy/turn.py`, `tools/*.py`, `app.py`
+
+**`stamps.py`**: `claim(layout, tool, raw_args, *, my_cc_pid, ttl) -> Stamp | None`, following plan §4.3.
+
+**`turn.py`**: `TurnState`, `TurnLedger`, a per-notebook `asyncio.Lock` plus `filelock`.
+
+**Tools:**
+- `inspect.py`, `write.py` (add and edit), `run.py`, `undo.py`.
+- Each is an async function taking `(services: Services, turn: TurnContext | None, **params) -> ToolResult`.
+
+**`app.py`**: `create_server(project: Path | None, backend: NotebookBackend | None = None) -> FastMCP`, with:
+- the instructions;
+- the middleware from plan §4.3;
+- tool `meta` from `_meta_rules.tool_meta(project, cfg)`.
+
+**Tests:** `tests/gateway/*` use the real hook script to stamp calls (`tests/fakes/turns.py`).
+
+### 3.6 Plugin packaging: hooks, libexec, nhctl, skills, evals
+
+This is plan §§5–7:
+- `plugins/nh/hooks/{hooks.json, nh-hook, nh_hooks/*.py}`
+- `plugins/nh/libexec/{nh-mcp, nh-sync, nh-python}`
+- `plugins/nh/bin/nhctl` + `plugins/nh/scripts/nhctl/*.py` + `_shared/scaffold/*`
+- `plugins/nh/skills/**`
+- `plugins/nh/agents/*.md`, `plugins/nh/workflows/qa-cell.js` (§3.7)
+- `plugins/nh/evals/**`
+
+**Tests:** `tests/hooks/*`, `tests/nhctl/*`.
+
+### 3.7 Cell QA workflow (v0.1.1): `_shared/turn_record.py`, `hooks/nh_hooks/post_tool.py`, `agents/*.md`, `workflows/qa-cell.js`
+
+Under ultracode (the model sees a system reminder), or on `/nh:qa-cell <ask>`, the main agent launches the `nh:qa-cell` workflow instead of writing. `nh:cell-writer` writes and runs the message's one cell; `nh:cell-qa` live-checks it (code, real output, self-check, kernel variables; it never runs code); on `revise` a new writer edits the same cell. The invariant is unchanged: at most one new or changed cell per human message, enforced by the gateway, failing closed. The skill side is `skills/notebook/reference/qa-workflow.md`.
+
+**Turn record v2** (`.nh/state/turns/<session>.json`; the UserPromptSubmit hook is its only writer):
+```python
+{"v": 2, "session_id", "prompt_id",   # the latest prompt id seen
+ "turn_id",                            # the human turn; None for an orphan
+ "aliases": [...],                     # notification prompt ids; reset per human turn, at most 1000
+ "human": bool, "ts",                  # when the turn opened
+ "alias_ts",
+ "earlier": {alias: turn_id}}          # aliases of earlier turns, at most 1000
+```
+- `turn_record.read()` reads a v1 record as `turn_id = prompt_id`. `canonical(record, pid)` maps the turn id or any alias to `turn_id`; an unknown `pid` comes back unchanged, so v0.1's E102 still applies. `opened()`, `aliased()` and `orphan()` build records. A new human turn moves the previous turn's aliases into `earlier`, so a late call from an earlier notification's prompt still counts against that message's budget (or gets E102).
+- `notification_blocks(prompt)` is strict: the whole prompt must be complete `<task-notification>…</task-notification>` blocks, each with `<task-id>` and `<status>`. Other inner elements (`<tool-use-id>`, `<output-file>`, `<summary>`, `<result>`, `<diagnostics>`, `<usage>`) are allowed; any text outside the blocks makes it a human prompt. It returns `{task_id, tool_use_id, status}` per block.
+- A notification fires UserPromptSubmit with a new `prompt_id`. The hook marks the runs it names done, then writes an alias of the open human turn, or an orphan (`turn_id: None`, so writes get E102) when none is open (session start, after `/clear`). The reminder says one of: the report of nh's own qa-cell run (`is_own_run`) for this message ("reply from it; write no new cell unless its writer wrote none"), such a report for an earlier message (report it, change no cell), or any other background task, a foreign workflow named qa-cell included (not a user message; write no new cell). A human prompt is unchanged: `RULE` is byte-identical and there is no effort-based nudge.
+- `TurnContext.prompt_id` carries the canonical turn id, so the ledger, locks, metadata `turn_id`, history fold, `_rebuild_claims`, `last_cell`, events and undo recency need no other change. `stamps.claim` compares canonical ids; two fresh stamps with the same key and different `agent_id`, of the same turn and at most 60 s apart, are ambiguous (a leftover from an earlier message, such as a call rejected at its permission prompt, is not): all are moved to `stamps/ambiguous/`, and each of their calls within 60 s gets E101 with the detail "Two identical calls arrived together (one from a subagent)…" and "Next: Retry this call once."
+
+**Runs file** (`.nh/state/workflows/<session>.json`, the last 20 runs; `stamps.gc_runs` deletes a session's whole runs file once it is untouched for 24 h):
+- PostToolUse `^Workflow$` (`nh-hook post-tool workflow`, main conversation only) records each `async_launched` result: `{run_id, task_id, tool_use_id, name, launched_by, transcript_dir, turn_id (canonical), prompt_id, ts, done_ts: None, status: None}`. It makes no decision.
+- The model calls `Workflow {name: "nh:qa-cell", args}`; `/nh:qa-cell <ask>` goes through the same tool call with `args` as the raw string. `tool_response.workflowName` is `qa-cell`; both names count.
+- `launched_by`: PostToolUse's `tool_input` is `{name, args, script}`, with the resolved script text injected (for a `scriptPath` launch too). `"name"` when the sha256 of `script` (CRLF → LF, outer whitespace stripped) equals the same of the plugin's `workflows/qa-cell.js` and the launch guard saw it (launched as `nh:qa-cell`, by `scriptPath`, or inline with no name); `"script"` when the script differs or runs under another name (a copy among the project's workflows). With no script: `"name"` for `nh:qa-cell` and no `scriptPath`, else `"scriptPath"` or `"script"`. A resume (`resumeFromRunId`, same run id) stays `"name"` only when the resumed run was recorded as one. Only `"name"` runs may write.
+- PostToolUse `^TaskStop$` (`nh-hook post-tool task-stop`): a stopped workflow sends no task notification, so the hook marks the run with the stopped `task_id` (`tool_response.task_id`, else `tool_input.task_id` or `shell_id`) done with status `killed`.
+- Helpers: `record_run`, `find_runs`, `mark_done(tool_use_id, task_id=, status=)` (a notification names the run by its launching `tool_use_id` or its `task_id`; it sets `done_ts` and the notification's `status`), `open_runs(turn_id)` (open means no `done_ts` and under 1 h old), `run_open`, `is_own_run` and `run_for_agent(agent_id)`.
+- PreToolUse `^Workflow$` (`nh-hook pre-tool workflow`; it sees only the call's own fields, not the resolved script) acts on nh's launches: `name` `nh:qa-cell` (a bare `qa-cell` names a project or user workflow, never the plugin's), nh's script inline or by a `scriptPath` whose file hashes to it (the launch result offers its saved copy), or a `resumeFromRunId` of one of nh's own runs. It denies such a launch from a subagent (only the main conversation launches it), when `[approval] approve_before_run = true` (the workflow can't ask the user; skipped when `NH_HEADLESS=1`, as the gateway's own approval check), or when this human turn already has an nh qa-cell run, open or done.
+
+**Writer binding and the gate**
+- `pre_tool.py` stamp: a call with an `agent_id` whose `agent_type` is not `nh:cell-writer` is denied (`SUBAGENT_REASON`); the writer's `nh_undo` is denied. Writer stamp bodies carry `agent_id` and `agent_type`; main-conversation bodies are unchanged. There is no SubagentStart hook.
+- Writer payloads carry the launching turn's `prompt_id` and the session's effort, so neither identifies the run. By the writer's first PreToolUse, `<transcript_dir>/agent-<agent_id>.meta.json` exists with `{"agentType": "nh:cell-writer", "workflowPhase", "spawnDepth": 1, …}`. The gateway resolves the run as the one recorded run of this session whose `transcript_dir` holds that file, re-reading for up to 2 s (the PostToolUse race).
+- Gate order: E105, E101 (no stamp, or an ambiguous one), E106 as before; `_writer_turn()` when `agent_id` is set; E104 (a writer's with `RETURN_TO_WORKFLOW`); E102 against the canonical turn (an orphan's with "A background task finished; no user message is open."); E108 for the main conversation only; then `TurnContext(..., agent_type, run_id)`.
+- `_writer_turn` refusals (but E103 for an agent that isn't the writer) carry `next_step = RETURN_TO_WORKFLOW`: "Return this refusal to the workflow as your final answer; don't retry or reply to the user." Inside a tool, `_guarded` adds `WRITER_LINE` ("Writer: return this refusal to the workflow; don't retry or reply to the user.") after `Next:` to every writer refusal that doesn't already say that, except E120 (fix and call again). Writer E107, E110, E112 (no revisions left, or no OK run to revise), E141 and E144 use `RETURN_TO_WORKFLOW` as their Next line, so a writer never reads "ask the user" or "fix it with nh_edit_cell":
+
+| Check | Refusal |
+|---|---|
+| `agent_type` is not `nh:cell-writer` | E103 (catalogue text) |
+| `nh_undo` | E103 "- nh:cell-writer can't undo; only the main conversation can." |
+| `nh_run` with a mode other than `wait` | E103 "- nh:cell-writer may only wait for its cell (mode="wait"); writing a cell runs it." |
+| no run, or several, hold the agent's meta file | E103 "- This agent is not inside nh's qa-cell workflow: no nh:qa-cell run of this session, or more than one, lists it." |
+| the run's name is not qa-cell, or `launched_by` is not `"name"` | E103 "- Only nh's own nh:qa-cell workflow, launched by name, may write; this run's script is not nh's." |
+| the run is done, was launched over 1 h ago, or its `turn_id` is not the record's `turn_id` (the user wrote since) | **E107** |
+| otherwise | the run's `turn_id` |
+
+- **E108**: a main-conversation add, edit, `nh_run(mode="run")` or undo while an open qa-cell run belongs to this turn. `wait` and `interrupt` pass. First line "Not {verb}: the nh:qa-cell workflow is writing this message's cell."; Next "Tell the user it is still writing and checking the cell; reply when its report arrives. To change course, stop it first." A stopped workflow sends no notification; the PostToolUse `^TaskStop$` hook marks its run done, so after TaskStop the main conversation writes again. A run stopped from the task panel, or one that never reports, holds only its own message, for at most 1 h.
+- **E107** (writers only): "Not {verb}: this nh:qa-cell run belongs to an earlier user message, already reported, or started over an hour ago."
+- E103 now reads "Only the main conversation, or nh's cell writer inside the nh:qa-cell workflow, may change the notebook; other subagents are read-only."
+
+**Revisions** (`[turn] max_revisions`, default 2)
+- `TurnState.revisions` ({uid: n}) and `TurnState.writer_run`: the first run that writes owns the turn; any other run gets E110 "another nh:qa-cell run owns this message's cell".
+- Writer `nh_edit_cell`: `base_sha` is ignored; a cell the user wrote is E144 and a user change since nh's write is E141, both terminal. On an `ok` cell the edit is a revision while `revisions[uid] < max_revisions`, else E112 with the detail "- No revisions left (n of max used; [turn] max_revisions)."; the main conversation keeps E112. RETRYABLE statuses share the normal retries; any other status is E112 for a writer, whose first line reads "{cell} has no OK run to revise and no failed run to retry".
+- Every writer write sets `metadata.nh.agent` (the writer's agent type); a revision also writes `metadata.nh.revision = {"turn": turn_id, "n": k}`; the rollback restores both, and `_rebuild_claims` rebuilds `revisions` from them. The writer's add and its revisions share `(uid, notebook, canonical turn)`, so history folds them into one op and one undo restores the state from before the message.
+- Writer results only: the machine line gains ` revisions=n/max`, `render.next_block(..., audience="writer")` says to return the whole result to the workflow, and `nh_run(mode="wait")` with nothing running says to return the last result to the workflow instead of waiting for the user. Main-conversation results stay byte-identical.
+
+**Workflow and agents**
+- `workflows/qa-cell.js`: `meta.name` is `qa-cell`. `args` is the ask as a string, or `{ask, context, cell, notebook}`; an empty ask returns `no_ask` without spawning an agent. Writer, then QA, then revise-and-QA rounds while QA says `revise` with a blocker or major finding and the writer's `revisions=n/max` has room (`MAX_QA_ROUNDS = 5` is only a safety cap). QA verdicts: `pass`, `revise`, `fail`, `unchecked`.
+- It returns data only: `{outcome, status, cell{title, exec, notebook}, result, changes[], revisions, qa{final_version_checked, verdict, summary, open_findings, earlier_findings, numbers_checked, rounds}, lead_lines, notes}`. `result` drops nh's `--- next ---` section and a refusal's `Next:`/`Writer:` lines. `qa.final_version_checked` is true only when QA checked the last version written with a verdict other than `unchecked`. When QA never saw that version, `verdict` is `unchecked` and its findings move to `earlier_findings`. `outcome`: `checked`, `not_checked`, `not_written`, `refused`, `writer_failed` or `no_ask`.
+- `agents/cell-writer.md` (tools `nh_inspect`, `nh_add_cell`, `nh_edit_cell`, `nh_run`) and `agents/cell-qa.md` (`nh_inspect`, `Read`), both with `skills: [nh:notebook]`. Neither the agents, the script nor the skills set `model` or `effort`: the session's own apply.
+
+**Events**: `turn_alias` (`session_id`, `turn_id`, `prompt_id`, `prompt_chars`, `tasks`: the notified task ids) replaces `turn_open` for notifications, so `nhctl metrics` doesn't count them as turns. `cell_added` and `cell_edited` gain `agent` (the writer's agent type, or null) and `revision` (the revision number, or null).
+
+**Tests:** `tests/unit/test_turn_record.py`, `tests/gateway/test_qa_workflow.py`, the hook tests, the `qa-cell.js` stub harness in `tests/unit/test_qa_cell_workflow.py` (it also checks the stubs against the gateway's real machine line, writer Next block and refusals), and `tests/unit/test_skill_files.py` for the agents, the workflow and the skill texts.
+
+## 4. Deviations from the PRD (v0.1)
+
+- **No Datalayer jupyter-mcp-server proxy.** Its 2.2.x releases depend on non-open "Datalayer License" packages, and its insert tool can't write metadata. We use Datalayer's BSD client libraries directly.
+- **JupyterLab ≥ 4.6 with jupyter-collaboration ≥ 5 only.** VS Code notebooks are unsupported; the seam is `NotebookBackend`.
+- **Lint runs in the gateway before writing, not in a PostToolUse hook.** Readability hints arrive with the result, after the run. Only the hard rules block before it.
+- **No ≤ 3-line chat reply rule.** The user asked for budgets on notebook content only.
+- **The ≤ 8-word header becomes a note** (title ≤ 8 words plus 2–5 bullets). The PRD's "median prose ≤ 25 words/cell" metric becomes words per note and per bullet.
+- **`nh_edit_cell` is added**, for user-requested changes and same-turn retries.
+- **A turn ends when the next user prompt arrives**, not on Stop, which doesn't fire on interrupts.
+
+## 5. Contract changes made during implementation
+
+These supersede the sections above where they differ.
+
+| Area | Change |
+|---|---|
+| `NotebookBackend` | Adds `resolve_notebook(rel)`, `describe(ref)` (status lines, no tokens) and `take_notices(ref)` (one-time notes such as "started a kernel session" or "upgraded to nbformat 4.5"). `RtcBackend` lives in `backend/rtc_backend.py` and is re-exported from `backend/rtc.py`. `kernel_status()` may create a kernel session; `probe()` never does. |
+| `exec/docsafe.py` | Backend-owned. `sanitize_for_doc` turns ints beyond ±(2⁵³−1) into strings, because Yjs stores them as BigInt, which JupyterLab can't serialize. |
+| `render.selfcheck` | `selfcheck(before, after, *, code="")`. The merge/join and drop/filter checks need the cell source. `Result.text()` orders sections as in plan §4.2; unknown sections go just before `next`. |
+| `history` | Folds on `(notebook, turn_id, uid)`. `ops_for(uid)` returns oldest first. `record()` raises `OSError` on disk failure, and the tools then warn that undo is unavailable for the cell. |
+| `state` | `StaleStore(layout)` and `DriftStore(layout)` use `state.file_lock` (fcntl). `last_cell.json` `status` can be `ok`, `error`, `running`, `aborted`, `timeout`, `interrupted`, `lost` or `undone`. |
+| Events (`.nh/log.jsonl`, epoch-seconds `ts`) | `turn_open` comes from the UserPromptSubmit hook, with `prompt_chars`; a task notification logs `turn_alias` instead (§3.7). The gateway writes: `cell_added` and `cell_edited` (fields `note_words`, `bullet_words[]`, `code_lines`, `comment_lines`, `hints[]`, `exec{status,ms,exec_count}`, `harness_ms`, `source_sha`, and since v0.1.1 `agent` and `revision`); `cell_rerun`; `cell_rejected` (field `reason`, a list of rule ids); `cell_undone`; `cell_review` (fields `unedited`, `deleted`; written once per earlier nh cell, at the first write of a new message); and `history_failed`. `nhctl` writes `fresh_run` (fields `nb`, `ok`, `failing_cell_uid`, `n_cells`, `ms`, `via`). |
+| Tool metadata | `_meta_rules.tool_meta(project, approve_before_run)`. `plugins/nh/server/tools.snapshot.json` and `evals/mocks/nh/_tools.json` are generated by `scripts/dump_tools.py`, and `tests/contract/test_tool_contract.py` fails when they are stale. |
+| Hooks | Python runs with `-I -S -X pycache_prefix=$CLAUDE_PLUGIN_DATA/pycache` because the system 3.9 ships no bytecode. `nh-sync --path` prints the versioned venv. `NH_PYTHON` overrides the interpreter (tests). |
+| `nhctl` | Has its own problem codes (`D1xx`). `env.json` is `{manager, prefix, python, jupyterlab, jupyter_collaboration, synced_at}`. `lab.json` is `{pid, url, runtime_file, env_prefix, notebook, started_at}` and never holds a token. `scaffold --add-dev-deps` applies the dev-dependency diff to an existing env file after the user says yes. |
+| Linter | `dataflow.defined_names` may return `"*"` (star import, `%run`, `exec`), which disables L120. Hard-rule keys: `empty_code`, `cell_separator`, `title`, `notes`, `intent`, `syntax`, `notebook_write`, `package_install`, `markdown_output`. |
+| pytest | One config, in the repo-root `pytest.ini`. Run with `uv run --project plugins/nh/server pytest`, adding `-m integration` for the real-JupyterLab tests. |
+
+
+### 5.1 Changes after the adversarial review
+
+| Area | Change |
+|---|---|
+| Turn budget | `NotebookLocks.hold(notebook, turn)` serializes each turn first and each notebook second. The one-cell check and the claim can't race across notebooks. The file lock is polled, so a cancelled call can't leak it. |
+| Running cells | Nothing is written while nh runs a cell in the notebook's kernel (E133, before any write). If `start_execution` fails after a write, the write is rolled back and the claim released. `last_cell.json` is written with status `running`/`queued` when a call returns before the cell finishes. Finished runs stay in `Services.finished` until reported, so `nh_run(mode="wait")` after the finish still shows the output. |
+| Statuses | `queued`: not started, waiting behind another cell. `deleted`: the user removed the cell while it ran. `interrupted` is no longer retryable: the user stopped it, so nh asks first. `last_cell.json` `status` can also be `queued`, `deleted` (also written when undo finds nh's cell already deleted) and `conflict` (the user typed into nh's cell before it started, so it did not run). The UserPromptSubmit reminder has a text for each (`STATUS_TEXT`): `queued` is "QUEUED behind a running cell; add nothing", `interrupted` says to ask before re-running or changing it, `deleted` "a no; don't re-add it", `conflict` "not run (the user typed into it first; ask before running it)". The notebook skill, `reference/tools.md`, `reference/replies.md` and instruction 7 treat `queued` like RUNNING and say what to do for `interrupted` (ask first, E117), `deleted`, `lost` and `conflict`. |
+| Copies | `normalize_uids(cells)`: a copy of an nh cell (same `metadata.nh.uid`, new id) is treated as the user's own cell with `copied_from`. |
+| User edits | The E141 check also applies to same-turn retries. Editing a cell the user wrote requires `base_sha` (**E144**). Notes carry their own `source_sha`: nh refuses to overwrite a note the user edited, and undo keeps it. E141 diffs against the code nh last wrote (`Op.after_source`). Undo refusals say "Not undone". |
+| Notes on edit | Only `title` or only `notes` fills the other half from the existing note. A code-only edit adds a "Note unchanged" notice. The original `intent` is kept, and later asks go to `metadata.nh.edit_intents[]`. |
+| Kernel identity | `KernelStatus.incarnation` changes when the kernel process restarts. The gateway records `kernel_id:incarnation` per notebook in `.nh/state/kernels.json`. A change clears `kernel_drift.json` for the notebook and adds a lead line "NEW kernel: earlier variables are gone…". A kernel prefix outside `env.json`'s prefix gives a line in `--- kernel ---`. |
+| Drift | Undo records only names the kernel still holds (vars probe). Every before-probe and every inspect overview/vars view asks about the drift names and drops those gone. Drift lines are lead lines (`Result.lead`), above the first line. |
+| Errors | `NhError(code, detail, next_step=…, **fields)`. `{detail}` fills the first line when the head has the slot. `cell_id` goes on the machine line, never the human line. New codes: **E144** (a human cell needs `base_sha`), **E145** (a markdown cell). E142 is a normal result, not an error: nothing is undone, the cell is named, and the next undo moves on. E110 points at `nh_edit_cell` when this message's cell failed. E120 has its own Next lines for L009 (ask first) and L002 (first step only). |
+| Server URLs | `discovery.clean_url(url)` rebuilds every Jupyter URL as `scheme://host[:port]/path` (no user info, query or fragment) and returns None for a URL with a backslash, whitespace, a control or non-ASCII character, a host that isn't a plain DNS name or IP address, or a host that `urllib.parse` and urllib3 (what `requests` sends through) read differently (`http://evil.example\@127.0.0.1:8888/`). `is_loopback`, `local_url`, `_same_server` and the `[jupyter].url` check all go through it, and `check()` puts the rebuilt URL into `ServerInfo.url`, the only form REST calls and websockets use. A runtime file's token is lent (`_token_for`) only to exactly its own host and port. An unusable URL gives "…isn't a plain http(s) address…" (E130 detail), or "harness.toml [jupyter].url is not a plain URL, so nh ignored it" in status. |
+| Data URLs | `split_secret_url` sends a data URL to `.env` as `DATA_URL` when it has user info, a query or a fragment, an `@` anywhere in its path, or a path segment that looks like a token (a `:`, a UUID, or a piece between `-_.~` of 16+ characters mixing letters and digits, or of 24+). The committed record is `scheme://host[:port]/path` with those segments shown as `…`. For database URLs (SQLAlchemy reads a password up to its `@`, so it may hold `/`, `?` or `#`), everything up to the last `@` is cut, and the record starts `scheme://…@` when the cut text held one of those. Scaffold's ignore lines add `.jupyter/` (jupyter-collaboration writes `.jupyter/collaboration_sessions.json` into the server root). |
+| `nhctl lab` | `lab start` adopts a live JupyterLab the user started that already serves the project instead of starting a second one: `lab.json` then has `"adopted": true` and `env_prefix: null`. `lab start` `status` is `started`, `running` or `adopted`, and `log` is null when adopted (the init skill treats `adopted` like `running`). `lab status` adds `registered`. `lab stop` on an adopted server whose root is a parent folder returns `{stopped: false, adopted: true, root_dir}` and leaves it running. |
+| `nhctl` reports | doctor's `jupyter.servers[]` adds `usable`, and its `lab` may include `registered: false`. The scaffold report adds `data.path_from_notebook` (the data path as the kernel sees it from the notebook). `metrics` `by_reason` is keyed by rule id. |
+| Hook matchers | Files: `^(Write\|Edit\|MultiEdit\|NotebookEdit)$` (variant `file`, no text filter: Python always checks and resolves symlinks) and `^Read$` (variant `read`, keeps the shim's cheap text filter). Foreign MCP tools: `^mcp__(?!plugin_nh_nh__).+__.+$`, and Python decides, case-insensitively with camelCase split into words: a tool counts when its name holds notebook, kernel, ipynb, ipython or jupyter, its server's name holds jupyter or ipython, or a word starts or ends with "cell"; a first word list/read/get/describe/search/find/inspect/show/view is allowed; exec/execute/run counts only with code, python, python3 or snippet. In shell commands only nhctl's own words are exempt: its redirections and any command inside `$(...)`, `(...)` or backticks are still checked. |
+| SessionStart | When `lab.json` is missing or its server is gone, the hook scans the gateway's four runtime dirs (stdlib only) for a live jupyter_server ≥ 2 whose root contains the project, in the gateway's order (root equal to the project, deepest root, newest file), and never prints the token. Otherwise it says "JupyterLab: no running server found for this project. Before notebook work, call mcp__plugin_nh_nh__nh_inspect(view="status"); only if it reports no JupyterLab (E130), ask the user whether to start it, then run `nhctl lab start`." Setup and SessionStart skip nh-sync (and SessionStart the "installing… /mcp" line) when `CLAUDE_CODE_EVAL_CONFINED` is set and not "0"/"false". |
+| Other | `[stale] mark = "clear-count"` blanks downstream counts. `nh_inspect(rows=None)` uses `[inspect].head_rows`. Read-only calls don't change the active notebook. Results name the notebook when it isn't the configured one. `cell_rejected.reason` is a list of rule ids. |
+
+
+### 5.2 Changes after the second verification round
+
+| Area | Change |
+|---|---|
+| Turn state | `TurnState.claim_notebooks` (uid → notebook) records where each claim lives; refusals label this message's cell from its own notebook and name that notebook ("… [1] in notebooks/eda.ipynb"). `TurnState.undo_next` holds the step an "already deleted" undo offered. |
+| Refusal texts | E110: "one new cell per message, and this message's cell is {cell}". E114 no longer names a cell. New **E117** "Not {verb}: {cell} was stopped before it finished, so nh asks before changing or re-running it", used by `nh_edit_cell` and `nh_run` on a cell the user interrupted (E112 "already ran OK" is only for cells that ran ok). |
+| Cell labels | An untitled cell is ``the cell `<first code line, ≤40 chars>` [n]`` (no nested quotes); `next_block` capitalises a label that opens a sentence. Outline note rows show the heading unescaped (`$`, not `\$`). |
+| Edit writes | `nh_edit_cell` writes source and metadata only; the run clears outputs and `[n]` when it starts (`begin_run`). A rollback after a failed start therefore leaves the previous outputs and `[n]` in place. |
+| Conflict at start | When the user types into nh's cell between the write and the run (`CellConflict`), the history op is still recorded and `last_cell.json` gets status `conflict`, so undo targets that cell (E141 without `force`, because the user changed it). |
+| Stale `base_sha` | A `base_sha` (or metadata `source_sha`) that doesn't match is accepted while the cell holds nh's last write, or what an undo of that write restored (`write.nh_wrote`). E141 is raised only for a real user change, always with its diff. |
+| Already deleted (E142 result) | The leftover reason reads "from the deleted {name}"; `last_cell.json` gets status `deleted`. The Next line asks whether to undo the step before; a plain `nh_undo()` in the same message or the user's next one undoes exactly that step, even outside the 3-turn window. The offer lapses after that next message and is cleared once used. |
+| Title/notes-only edit undo | When the restored code equals the current code, undo restores title, notes and metadata only: outputs and `[n]` stay, nothing is marked stale and no Kernel ≠ notebook drift is added ("Restored the previous title and notes of …; its code was unchanged"). |
+| First lines and notices | The error first line ends with "." unless the message was cut ("…"). "Note unchanged" quotes `metadata.nh.rationale[0]` (raw) clipped to 80 characters and is skipped on same-message retries of the cell that failed. |
+| Self-check | Names with no visible change are listed as "same shape and nulls: …" (frames, series), "same type: …" or "unchanged: …". The vars probe adds `sums` (a crc32 fingerprint of numeric column sums) for frames and series within `max_cells`, and the self-check says "…; values changed" when only values differ. `RunRecord.probe_names` keeps the cell's uses and defs, so `nh_run(mode="wait")` lists variables a long cell created. |
+| Check this | Row filters are read with `ast`: `.drop*`/`.query`/`.filter` calls, or a subscript keyed by a condition, a `~`/`&`/`\|` expression, a call, or a name the probe lists as a Series or array. Column names and column lists don't count. A new name "lost rows" only when it keeps the source's columns and isn't an aggregation or reshape (`df.loc[mask, "date"]` is a look, not a loss). Merge growth compares with the primary (left) frame. The headline prefers the name the last line shows, else the last one bound. |
+| Stream outputs | Stream text written to the notebook has no `\r` or `\b` (progress lines are resolved first), so JupyterLab's local copy and the shared text stay identical. Only the last output grows in place; a changed earlier output is rewritten together with every output after it (JupyterLab re-appends replaced outputs at the end). When the outputs shrink (`clear_output(wait=True)`) or the first rewritten output is a stream, every output is rewritten: JupyterLab keeps the name of the last stream it added, even a deleted one, and merges a new stream of that name into the output before it. The final flush trims only the last output to exactly its cap; an earlier stream may keep up to cap + `STREAM_SLACK_CHARS`. |
+| Interrupts | `interrupted` means a KeyboardInterrupt after nh's own interrupt, or one from SIGINT (JupyterLab's stop): its chained traceback holds SIGINT's KeyboardInterrupt, which has no message (a cell that catches the stop and raises again with a message), or it has no message itself and its last frame is not a `raise KeyboardInterrupt` line in a cell. A KeyboardInterrupt the code raises itself, with or without a message, is an ordinary `error`. |
+| Kernel identity | `kernel_status(ref, *, create=True)` in the protocol and every backend; `create=False` never starts a session. `KernelStatus.incarnation=None` means unknown (kernel busy, attach probe skipped or failed), never a new kernel: "NEW kernel" means the `kernel_id` changed, or both incarnations are known and differ. A known identity in `kernels.json` is never overwritten by an unknown one. `RtcBackend.kernel_status` uses the double-checked `_busy()` before skipping the attach probe. Every `nh_inspect` view except `status` runs the same check (with `create=False`). |
+| Lead lines on refusals | `kernel_notes` also records the call's lead lines in the ContextVar `common.CALL_LEAD`, which `app._guarded` sets per call; any refusal (including E199) is prefixed with them. The call that detects a new kernel always carries the notice, whatever its outcome, and no later call repeats it. |
+| Drift | `kernel_drift.json` entries gain `exec_counts` ({name: the notebook's highest execution count at undo}); a code cell with a higher count whose run did not fail and that binds the name afresh (not `df = df.x()`, `+=` or a mutation: `dataflow` fresh bindings minus uses) means the user re-ran it, and the name is cleared. `names` is oldest first; a name recorded again moves to the end. Before-probes ask about drift names in their own probe (`drift_args`, never cut by `max_vars`); `prune_drift` drops only names it sent, and nothing on a truncated payload. Undo's leftover probe uses `drift_args` too. The lead groups names by reason, newest first, at most 6, then "+N more"; the reminder says "(as of nh's last check)". |
+| Foreign running records | `live_run` trusts another process's `running/<cell>.json` only while the notebook marks that cell running, the record is under 5 s old (`RECORD_GRACE_S`), or nh has no synced copy of the notebook; otherwise the record is deleted. |
+| Refusals (round 3) | New **E118** "Not {verb}: the user typed into {cell} before it ran, so nh asks before running or changing it", for `nh_run`/`nh_edit_cell` on a cell whose status is `conflict`. E133 on a queued nh cell reads "The kernel is busy with another cell; X is queued behind it" with a "has not started" Next line. |
+| What nh last left | `write.nh_last_source` is nh's newest write still in place, or what the oldest of the undos since then restored (undos are newest first per cell). The stale-`base_sha` acceptance and E141's "the user changed" diff both compare with it. |
+| Already deleted, round 3 | Every not-undone op of the deleted cell is marked undone, and the offered "step before" skips that cell's own older steps, looking back over every message the ledger remembers (5) when the 3-message window has none. The offer carries its notebook (`TurnState.undo_next_notebook`), so a plain `nh_undo()` follows it there; the first line names a non-default notebook. An untitled cell reads ``the cell `…` `` there and "from the undone cell `…` [n]" in leftovers. Undoing a title/notes-only edit whose note the user rewrote reports "Nothing to restore … nh kept theirs". |
+| Self-check, round 3 | Closing labels say what was compared: "same shape and nulls" only when both summaries carry null counts, "same shape" otherwise (frames over `max_cells`, arrays), "same length" for containers. "N% removed/lost" is floored and at most 99% while rows remain. A frame the cell binds again after a name is that name's source only as it was before the run (else no origin). A Series taken from a frame by an explicit `.drop*`/`.query`/`.filter` call counts as rows lost. The vars probe shows bools as True/False. |
+| Discovery, round 3 | A loopback `[jupyter].url` spelled with another loopback name than a scanned runtime file (127.0.0.1 vs localhost, same port and base path) uses that file's own URL and token, so the token still goes only to its exact host. A 401/403 when nh sent no token says "needs a token nh doesn't have (set NH_JUPYTER_TOKEN, or remove [jupyter].url …)". Host names may contain "_". `nh_inspect(view="status")` adds a `reason` line with the E130 details. |
+| Scaffold, round 3 | When `.env` is tracked by git, a secret data URL is not written there: the report lists `.env` as `skipped`, `data.secret_in_env` is false, and a warning says to `git rm --cached .env` and run /nh:init again. |

@@ -1,0 +1,42 @@
+name: drift
+
+# Nightly: do nh's pinned upstreams (Jupyter client libraries, collaboration, FastMCP) still work at
+# their latest releases, and does the plugin still validate on the latest Claude Code?
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upstream-latest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: upgrade upstream pins in a scratch lock
+        run: |
+          cd plugins/nh/server
+          sed -i.bak -E 's/"(fastmcp|jupyter-nbmodel-client|jupyter-kernel-client|pillow)==[^"]*"/"\1"/; s/"(jupyterlab|jupyter-collaboration|nbclient)==[^"]*"/"\1"/' pyproject.toml
+          uv lock --upgrade
+          uv sync --all-groups
+          uv tree --depth 1 | head -40
+          cd ../../..
+      - run: uv run --project plugins/nh/server pytest -q tests/contract tests/gateway tests/unit/test_fake_backend.py
+      - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300
+
+  claude-code-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g @anthropic-ai/claude-code@latest && claude --version
+      - run: claude plugin validate --strict plugins/nh && claude plugin validate --strict .

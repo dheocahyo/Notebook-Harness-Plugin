@@ -1,0 +1,44 @@
+[project]
+name = "nh-gateway"
+version = "0.1.0"
+description = "Notebook Harness gateway: one reviewed Jupyter cell per turn for Claude Code"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastmcp==4.0.9",
+    "jupyter-nbmodel-client==1.5.1",
+    "jupyter-kernel-client==1.0.2",
+    "jupyter-ydoc>=4.1.1,<5",
+    "pillow==12.3.0",
+    "filelock>=3.16",
+    "nbformat>=5.10",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "pytest-timeout>=2.4",
+    "inline-snapshot>=0.35",
+    "hypothesis>=6.150",
+    "ruff>=0.16",
+    "pyright>=1.1.414",
+]
+integration = [
+    "jupyterlab==4.6.4",
+    "jupyter-collaboration==5.0.4",
+    "ipykernel>=6.29",
+    "nbclient==0.11.0",
+    "pandas>=2.2",
+    "matplotlib>=3.9",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.10"
+
+[tool.pyright]
+include = ["src"]
+exclude = ["src/nh_gateway/probes"]  # run inside the user's kernel, where _A/display/get_ipython exist
+typeCheckingMode = "standard"
+pythonVersion = "3.11"

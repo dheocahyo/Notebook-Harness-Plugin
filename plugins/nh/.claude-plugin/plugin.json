@@ -1,0 +1,13 @@
+{
+  "name": "nh",
+  "displayName": "Notebook Harness",
+  "version": "0.1.1",
+  "description": "One reviewed Jupyter cell per turn: works in your live JupyterLab kernel, writes a short intent note above each cell, supports undo, and scaffolds projects with /nh:init.",
+  "author": { "name": "Dheo Cahyo" },
+  "license": "Apache-2.0",
+  "keywords": ["jupyter", "jupyterlab", "notebook", "ipynb", "data-science", "pandas", "mcp", "human-in-the-loop"],
+  "metadata": {
+    "minClaudeCode": "2.1.282",
+    "requires": ["uv>=0.10", "jupyterlab>=4.6,<5 (per project)", "jupyter-collaboration>=5,<6 (per project)"]
+  }
+}

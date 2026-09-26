@@ -1,0 +1,9 @@
+Notebook Harness (nh)
+Copyright 2026 Dheo Cahyo
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on, but does not bundle, the following third-party projects:
+- jupyter-nbmodel-client and jupyter-kernel-client (BSD-3-Clause, Datalayer, Inc.)
+- FastMCP (Apache-2.0, Prefect Technologies, Inc.)
+- nbformat, jupyter-ydoc, pycrdt (BSD-3-Clause / MIT)

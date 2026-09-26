@@ -1,0 +1,98 @@
+#!/bin/sh
+# nh-hook <event> [variant]: the command behind every entry in hooks.json.
+#
+# Hooks are advisory (the gateway enforces every rule), so this always exits 0 and prints
+# only a decision or context JSON. Outside an nh project (no .nh/ found walking up from
+# the project dir, stopping at $HOME and /) it does nothing apart from keeping the plugin
+# runtime synced on Setup and SessionStart.
+#
+# `claude plugin eval` sets CLAUDE_CODE_EVAL_CONFINED=1 in every eval case's session. The nh
+# tools are mocked there, so Setup and SessionStart don't build the runtime into each
+# case's temporary plugin data dir.
+event=${1:-}
+variant=${2:-}
+input=
+buffered=
+case ${CLAUDE_CODE_EVAL_CONFINED:-} in
+    '' | 0 | false) eval_run= ;;
+    *) eval_run=1 ;;
+esac
+
+case $0 in */*) hooks_dir=${0%/*} ;; *) hooks_dir=. ;; esac
+root=$(CDPATH= cd -- "$hooks_dir/.." && pwd -P) || exit 0
+
+# The shim's parent is Claude Code; stamps carry this pid so the gateway can match them.
+NH_CC_PID=$PPID
+export NH_CC_PID
+
+case $event in
+    setup)
+        [ -n "$eval_run" ] || /bin/sh "$root/libexec/nh-sync" --foreground </dev/null >/dev/null 2>&1
+        exit 0
+        ;;
+    session-start)
+        [ -n "$eval_run" ] || /bin/sh "$root/libexec/nh-sync" --ensure-background </dev/null >/dev/null 2>&1
+        ;;
+esac
+
+start=${NH_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}
+dir=$(CDPATH= cd -P -- "$start" 2>/dev/null && pwd -P) || exit 0
+home=$(CDPATH= cd -P -- "${HOME:-/}" 2>/dev/null && pwd -P) || home=/
+project=
+while [ "$dir" != "$home" ] && [ "$dir" != / ]; do
+    if [ -d "$dir/.nh" ]; then
+        project=$dir
+        break
+    fi
+    dir=${dir%/*}
+    [ -n "$dir" ] || dir=/
+done
+[ -n "$project" ] || exit 0
+NH_PROJECT_DIR=$project
+export NH_PROJECT_DIR
+
+# Cheap pre-filter: skip Python for calls whose JSON can't name a notebook, .nh/ or a
+# notebook tool. Each pattern is a superset of what the Python guard acts on. Writes
+# (variant file) always run Python: a symlink's own name may hide a notebook or .nh/.
+# Workflow launches reach Python only when they can be nh's qa-cell (the user's own
+# workflows go through these hooks too); a launch by path or a resume can run nh's script
+# under any file name, so the launch guard reads it.
+case $event:$variant in
+    pre-tool:read | pre-tool:shell | pre-tool:foreign-mcp | pre-tool:workflow | post-tool:workflow)
+        input=$(cat) || exit 0
+        buffered=1
+        case $variant:$input in
+            read:*[iI][pP][yY][nN][bB]*) ;;
+            shell:*[iI][pP][yY][nN][bB]* | shell:*.[nN][hH]*) ;;
+            shell:*[jJ][uU][pP][yY][tT]* | shell:*[nN][bB][sS][tT][rR][iI][pP]*) ;;
+            shell:*[pP][aA][pP][eE][rR][mM][iI][lL][lL]* | shell:*[nN][bB][qQ][aA]*) ;;
+            shell:*[nN][bB][fF][oO][rR][mM][aA][tT]*) ;;
+            foreign-mcp:*[nN][oO][tT][eE][bB][oO][oO][kK]* | foreign-mcp:*[kK][eE][rR][nN][eE][lL]*) ;;
+            foreign-mcp:*[iI][pP][yY][nN][bB]* | foreign-mcp:*[jJ][uU][pP][yY][tT][eE][rR]*) ;;
+            foreign-mcp:*[cC][eE][lL][lL]* | foreign-mcp:*[pP][yY][tT][hH][oO][nN]*) ;;
+            foreign-mcp:*[cC][oO][dD][eE]* | foreign-mcp:*[sS][nN][iI][pP][pP][eE][tT]*) ;;
+            workflow:*qa-cell*) ;;
+            workflow:*scriptPath* | workflow:*resumeFromRunId*) [ "$event" = pre-tool ] || exit 0 ;;
+            *) exit 0 ;;
+        esac
+        ;;
+esac
+
+py=$(/bin/sh "$root/libexec/nh-python") || exit 0
+data=${CLAUDE_PLUGIN_DATA:-}
+# -I drops PYTHON* variables, so bytecode goes to the plugin's data dir via -X (the system
+# Python ships without stdlib .pyc files); without a data dir, write none at all.
+if [ -n "$data" ]; then
+    set -- -I -S -X "pycache_prefix=$data/pycache"
+else
+    set -- -I -S -B
+fi
+main="$root/hooks/nh_hooks/main.py"
+if [ -n "$buffered" ]; then
+    "$py" "$@" "$main" "$event" "$variant" <<EOF
+$input
+EOF
+else
+    "$py" "$@" "$main" "$event" "$variant"
+fi
+exit 0

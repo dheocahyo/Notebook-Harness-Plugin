@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+plugins/nh/libexec/* text eol=lf
+plugins/nh/hooks/nh-hook text eol=lf
+plugins/nh/bin/nhctl text eol=lf

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*jupyter_ystore.db
+
+# Local Claude Code state
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# Test and spike artifacts
+spikes/out/
+plugins/nh/evals/results/
+dev/sandbox/.nh/state/
+dev/sandbox/.nh/history/
+dev/sandbox/.nh/outputs/
+dev/sandbox/.nh/logs/
+dev/sandbox/.nh/tmp/
+dev/sandbox/.nh/log*.jsonl
+dev/sandbox/.venv/
+
+.DS_Store
+
+.env
+
+#Claude
+CLAUDE.md
+.claude/
+graphify-out/
