@@ -18,7 +18,7 @@ import pytest
 TOKEN = "tok-s3cret-4f2a"
 
 FAKE_JUPYTER = r"""
-import http.server, json, os, signal, sys
+import faulthandler, http.server, json, os, signal, socketserver, sys
 
 args = sys.argv[1:]
 runtime = os.environ["JUPYTER_RUNTIME_DIR"]
@@ -37,6 +37,8 @@ log("ENV " + json.dumps({k: os.environ.get(k) for k in names}))
 if os.environ.get("FAKE_LAB_FAIL"):
     print("boom: address already in use")
     sys.exit(1)
+# If startup hangs, the stack lands in the lab log, whose tail nhctl's D146 reports.
+faulthandler.dump_traceback_later(8)
 # Like jupyter_server's IdentityProvider: JUPYTER_TOKEN, then JUPYTER_TOKEN_FILE, else a
 # generated token, which is the only kind it prints.
 generated = False
@@ -91,7 +93,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sessions.append(session)
         self.send(201, session)
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # Skips HTTPServer's reverse DNS lookup (socket.getfqdn), which can stall for longer
+        # than nhctl waits on CI's macOS runners.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+server = Server(("127.0.0.1", 0), Handler)
 root = next(a.split("=", 1)[1] for a in args if a.startswith("--ServerApp.root_dir="))
 pid = os.getpid()
 info_file = os.path.join(runtime, "jpserver-%d.json" % pid)
@@ -111,6 +120,7 @@ with open(open_file, "w") as handle:
 with open(info_file + ".tmp", "w") as handle:
     json.dump({"url": url, "token": TOKEN, "pid": pid, "root_dir": root, "version": "2.17.0"}, handle)
 os.replace(info_file + ".tmp", info_file)
+faulthandler.cancel_dump_traceback_later()
 print("[I ServerApp] %slab?token=%s" % (url, TOKEN if generated else "..."), flush=True)
 server.serve_forever()
 """
@@ -152,7 +162,8 @@ def user_lab(env, lab_project):
 
     def start(root, **extra):
         jupyter = lab_project / ".venv/bin/jupyter"
-        cmd = f'"{sys.executable}" "{jupyter}" lab "--ServerApp.root_dir={root}" >/dev/null 2>&1 &'
+        log = env.tmp / f"user-lab-{len(started)}.log"
+        cmd = f'"{sys.executable}" "{jupyter}" lab "--ServerApp.root_dir={root}" >"{log}" 2>&1 &'
         out = subprocess.run(
             ["/bin/sh", "-c", cmd + " echo $!"], env=dict(env.vars, **extra),
             capture_output=True, text=True, check=True,
@@ -163,7 +174,7 @@ def user_lab(env, lab_project):
         deadline = time.time() + 10
         while not info.exists() and time.time() < deadline:
             time.sleep(0.05)
-        assert info.exists(), "the user's fake JupyterLab didn't start"
+        assert info.exists(), f"the user's fake JupyterLab didn't start:\n{log.read_text()}"
         return pid
 
     yield start
