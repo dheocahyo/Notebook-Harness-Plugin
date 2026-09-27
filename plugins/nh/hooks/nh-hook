@@ -19,7 +19,7 @@ case ${CLAUDE_CODE_EVAL_CONFINED:-} in
 esac
 
 case $0 in */*) hooks_dir=${0%/*} ;; *) hooks_dir=. ;; esac
-root=$(CDPATH= cd -- "$hooks_dir/.." && pwd -P) || exit 0
+root=$(CDPATH='' cd -- "$hooks_dir/.." && pwd -P) || exit 0
 
 # The shim's parent is Claude Code; stamps carry this pid so the gateway can match them.
 NH_CC_PID=$PPID
@@ -36,8 +36,8 @@ case $event in
 esac
 
 start=${NH_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}
-dir=$(CDPATH= cd -P -- "$start" 2>/dev/null && pwd -P) || exit 0
-home=$(CDPATH= cd -P -- "${HOME:-/}" 2>/dev/null && pwd -P) || home=/
+dir=$(CDPATH='' cd -P -- "$start" 2>/dev/null && pwd -P) || exit 0
+home=$(CDPATH='' cd -P -- "${HOME:-/}" 2>/dev/null && pwd -P) || home=/
 project=
 while [ "$dir" != "$home" ] && [ "$dir" != / ]; do
     if [ -d "$dir/.nh" ]; then

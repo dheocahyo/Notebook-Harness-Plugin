@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import socket
 import sys
 import threading
 import time
@@ -263,9 +264,12 @@ async def test_kernel_websocket_drop_reconnects(backend: RtcBackend, helpers):
         (await backend.start_execution(ref, "nh-0000000019", hard_timeout=60)).future, 60
     )
     assert first.status == "ok"
-    handle = next(iter(backend._kernels.values()))
-    await asyncio.to_thread(handle.exec_kc._manager.client.stop_channels)  # the socket drops
-    assert not handle.exec_kc._manager.client.channels_running
+    client = next(iter(backend._kernels.values())).exec_kc._manager.client
+    # The connection drops under the client, as when the network or the server fails. A clean
+    # stop_channels() is not the same: on Linux its reader thread can miss the close and leave
+    # channels_running set.
+    client.kernel_socket.sock.sock.shutdown(socket.SHUT_RDWR)
+    await helpers.eventually(lambda: not client.channels_running)
     second = await asyncio.wait_for(
         (await backend.start_execution(ref, "nh-0000000019", hard_timeout=60)).future, 60
     )

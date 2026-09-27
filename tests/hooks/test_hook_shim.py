@@ -15,6 +15,7 @@ from hookenv import (
     NH_HOOK,
     PLUGIN,
     SYSTEM_PYTHON,
+    SYSTEM_VERSION,
     HookRun,
     Sandbox,
     command_line,
@@ -104,10 +105,12 @@ def test_unusable_python_fails_open(sandbox: Sandbox) -> None:
     assert (run.returncode, run.stdout) == (0, "")
 
 
-def test_hooks_run_on_python_39_with_bytecode_in_plugin_data(sandbox: Sandbox) -> None:
+def test_hooks_run_on_system_python_with_bytecode_in_plugin_data(sandbox: Sandbox) -> None:
+    """/usr/bin/python3 is 3.9 on macOS and newer on Linux, so the bytecode tag follows it."""
     assert edit_notebook(sandbox).decision == "deny"
     compiled = {path.name for path in (sandbox.data / "pycache").rglob("*.pyc")}
-    assert "common.cpython-39.pyc" in compiled
+    major, minor = SYSTEM_VERSION or (0, 0)  # the module is skipped without a system Python
+    assert f"common.cpython-{major}{minor}.pyc" in compiled
     assert not list((PLUGIN / "hooks").rglob("__pycache__"))
 
 

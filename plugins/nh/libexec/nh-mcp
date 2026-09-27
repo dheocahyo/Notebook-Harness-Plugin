@@ -13,7 +13,7 @@ case $(uname -s 2>/dev/null) in
 esac
 
 case $0 in */*) libexec=${0%/*} ;; *) libexec=. ;; esac
-libexec=$(CDPATH= cd -- "$libexec" && pwd -P) || exit 1
+libexec=$(CDPATH='' cd -- "$libexec" && pwd -P) || exit 1
 root=${libexec%/*}
 data=${CLAUDE_PLUGIN_DATA:-}
 if [ -z "$data" ]; then
