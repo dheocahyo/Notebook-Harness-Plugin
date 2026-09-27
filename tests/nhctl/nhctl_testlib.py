@@ -1,16 +1,20 @@
 """Shared helpers for the nhctl tests (imported by conftest.py and the test modules).
 
 Every CLI test runs the real ``bin/nhctl`` in a subprocess with a hermetic environment:
-PATH = a per-test fake bin dir + /usr/bin:/bin, HOME inside tmp, no conda/venv vars.
+PATH = a per-test fake bin dir + /usr/bin and /bin without uv, conda or mamba, HOME inside tmp,
+nh's absolute fallback dirs moved into tmp (``NH_FALLBACK_ROOT``), no conda/venv vars.
 """
 
 from __future__ import annotations
 
+import atexit
+import functools
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -22,6 +26,22 @@ NHCTL = PLUGIN / "bin" / "nhctl"
 SERVER = PLUGIN / "server"
 VENV_PYTHON = SERVER / ".venv" / "bin" / "python"
 SYSTEM_PYTHON = "/usr/bin/python3"
+# The tools a test fakes or removes. A runner's own copies must stay out of sight: GitHub's
+# Ubuntu image has conda in /usr/bin.
+HIDDEN_TOOLS = frozenset({"uv", "uvx", "conda", "mamba", "micromamba"})
+
+
+@functools.cache
+def system_bin() -> str:
+    """/usr/bin and /bin as one dir of symlinks, without HIDDEN_TOOLS."""
+    farm = tempfile.mkdtemp(prefix="nh-sysbin-")
+    atexit.register(shutil.rmtree, farm, ignore_errors=True)
+    for folder in ("/usr/bin", "/bin"):
+        for entry in os.scandir(folder):
+            link = os.path.join(farm, entry.name)
+            if entry.name not in HIDDEN_TOOLS and not os.path.lexists(link):
+                os.symlink(entry.path, link)
+    return farm
 
 
 def _system_python_ok() -> bool:
@@ -59,8 +79,9 @@ class Env:
         self.runtime = tmp / "jupyter-runtime"
         self.runtime.mkdir()
         self.vars = {
-            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "PATH": f"{self.bin}:{system_bin()}",
             "HOME": str(self.home),
+            "NH_FALLBACK_ROOT": str(tmp / "root"),
             "NH_PYTHON": python,
             "JUPYTER_RUNTIME_DIR": str(self.runtime),
             "JUPYTER_DATA_DIR": str(tmp / "jupyter-data"),

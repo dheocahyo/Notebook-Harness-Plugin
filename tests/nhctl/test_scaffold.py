@@ -340,6 +340,37 @@ def test_env_detection_from_path(env, project, fake, expect):
     assert (project / env_file).is_file()
 
 
+def test_uv_off_path_is_found_in_its_install_locations(env, project):
+    brew = Path(env.vars["NH_FALLBACK_ROOT"], "opt", "homebrew", "bin")
+    brew.mkdir(parents=True)
+    uv = env.script("uv", "exit 0").rename(brew / "uv")
+    report = env.json("scaffold", "--data-mode", "in-place", cwd=project)
+    assert (report["env"]["manager"], report["env"]["tool"]) == ("uv", str(uv))
+
+
+@pytest.mark.parametrize(
+    ("name", "where"),
+    [
+        ("uv", "~/.local/bin"),
+        ("uv", "/usr/local/bin"),
+        ("conda", "~/miniforge3/bin"),
+        ("conda", "/opt/conda/bin"),
+        ("mamba", "/opt/homebrew/Caskroom/miniforge/base/bin"),
+    ],
+)
+def test_find_tool_looks_in_the_install_locations(tmp_path, name, where):
+    home, root = tmp_path / "home", tmp_path / "root"
+    folder = home / where[2:] if where.startswith("~") else Path(f"{root}{where}")
+    folder.mkdir(parents=True)
+    tool = folder / name
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    env = {"PATH": str(tmp_path / "empty"), "HOME": str(home), "NH_FALLBACK_ROOT": str(root)}
+    assert core.find_tool(name, env) == str(tool)
+    tool.chmod(0o644)
+    assert core.find_tool(name, env) is None
+
+
 def test_conda_scaffold_template(tmp_path):
     yaml = pytest.importorskip("yaml")
     (tmp_path / "book.xlsx").write_bytes(b"x")

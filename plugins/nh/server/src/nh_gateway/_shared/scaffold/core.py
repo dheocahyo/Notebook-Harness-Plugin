@@ -100,7 +100,11 @@ class ScaffoldError(Exception):
 
 
 def find_tool(name: str, env: Mapping[str, str] | None = None) -> str | None:
-    """Find uv/conda/mamba on PATH, then in the usual install locations."""
+    """Find uv/conda/mamba on PATH, then in the usual install locations.
+
+    ``NH_FALLBACK_ROOT`` (for tests) is put in front of the absolute install locations, so a
+    machine's own /opt/homebrew/bin or /usr/local/bin can't leak into a test.
+    """
     env = os.environ if env is None else env
     found = shutil.which(name, path=env.get("PATH", os.defpath))
     if found:
@@ -110,11 +114,14 @@ def find_tool(name: str, env: Mapping[str, str] | None = None) -> str | None:
         candidates.append(env["CONDA_EXE"])
     dirs = UV_FALLBACK_DIRS if name == "uv" else CONDA_FALLBACK_DIRS
     home = env.get("HOME", "")
+    root = env.get("NH_FALLBACK_ROOT", "")
     for folder in dirs:
         if folder.startswith("~"):
             if not home:
                 continue
             folder = home + folder[1:]
+        else:
+            folder = root + folder
         candidates.append(os.path.join(folder, name))
     for candidate in candidates:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
