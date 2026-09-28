@@ -655,18 +655,29 @@ def test_scaffolded_harness_toml_matches_the_documented_form(tmp_path: Path):
     assert "\nmax_retries = 2" not in text and "\n[turn]" in text
 
 
-def test_install_docs_use_the_local_marketplace_until_published():
+def test_install_docs_point_at_the_published_repo():
+    marketplace = json.loads(_read(REPO / ".claude-plugin" / "marketplace.json"))
+    install = f"nh@{marketplace['name']}"
     for readme in (REPO / "README.md", PLUGIN / "README.md"):
         text = _read(readme)
-        assert "OWNER" not in text, readme
-        assert "claude plugin marketplace add <path-to-clone>" in text
-        assert "/plugin marketplace add <path-to-clone>" in text
-        assert "`<github-owner>/notebook-harness`" in text
+        assert "OWNER" not in text and "<github-owner>" not in text, readme
+        assert "/plugin marketplace add dheocahyo/Notebook-Harness-Plugin\n" in text, readme
+        assert "claude plugin marketplace add dheocahyo/Notebook-Harness-Plugin\n" in text, readme
+        assert f"/plugin install {install}\n" in text and f"plugin install {install} " in text
+        assert "claude plugin marketplace add <path-to-clone>" in text, readme  # working on nh
     ci = _read(REPO / ".github" / "workflows" / "ci.yml")
     guard = ci.split("release guard (install placeholders)", 1)[1].split("\n\n", 1)[0]
     assert "OWNER/" in guard and "pull_request" not in guard
     assert "github.ref == 'refs/heads/master'" in guard and "refs/tags/" in guard
     assert 'tags: ["v*"]' in ci
+
+
+def test_plugin_and_gateway_versions_match():
+    import tomllib
+
+    plugin = json.loads(_read(PLUGIN / ".claude-plugin" / "plugin.json"))
+    gateway = tomllib.loads(_read(PLUGIN / "server" / "pyproject.toml"))["project"]
+    assert plugin["version"] == gateway["version"]
 
 
 def test_readme_matches_ci_for_tests_and_evals():

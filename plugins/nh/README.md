@@ -39,26 +39,29 @@ project's own environment. A global JupyterLab is never used.
 
 ## Install
 
-nh ships in the `notebook-harness` marketplace (the Notebook Harness
-repository). Until that repository is published on GitHub, add it from a local
-clone.
+nh ships in the `notebook-harness` marketplace, on GitHub at
+[dheocahyo/Notebook-Harness-Plugin](https://github.com/dheocahyo/Notebook-Harness-Plugin).
 
 In Claude Code:
 
 ```
-/plugin marketplace add <path-to-clone>
+/plugin marketplace add dheocahyo/Notebook-Harness-Plugin
 /plugin install nh@notebook-harness
 ```
 
 Or from a shell:
 
 ```sh
-claude plugin marketplace add <path-to-clone>
+claude plugin marketplace add dheocahyo/Notebook-Harness-Plugin
 claude plugin install nh@notebook-harness --scope project
 ```
 
-Once the repository is published, use `<github-owner>/notebook-harness` in
-place of `<path-to-clone>`.
+To work on nh itself, add your clone instead. Claude Code then loads the plugin
+straight from the clone at each session start:
+
+```sh
+claude plugin marketplace add <path-to-clone>
+```
 
 Restart Claude Code. The first session builds nh's Python runtime (about a
 minute) in `~/.claude/plugins/data/nh-notebook-harness/`; `claude --init-only`

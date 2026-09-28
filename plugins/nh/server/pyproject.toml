@@ -1,6 +1,6 @@
 [project]
 name = "nh-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "Notebook Harness gateway: one reviewed Jupyter cell per turn for Claude Code"
 license = "Apache-2.0"
 requires-python = ">=3.11,<3.14"

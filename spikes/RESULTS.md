@@ -7,8 +7,8 @@ Date: 2026-09-25.
 
 The regression tests for these rows live in `tests/integration/test_rtc_document.py`,
 `tests/integration/test_kernel_exec.py` (run with `-m integration`), `tests/unit/test_probes.py` and
-`tests/unit/test_discovery.py`. Browser checks (S1 m1–m7, S2 UI observations) and S3–S5 are still
-manual and are not recorded here.
+`tests/unit/test_discovery.py`. The S1 browser checks (m1–m7), S4, S5 and S6 #6 and #7 are recorded
+under "v0.1.1 acceptance" at the end. S2 UI observations and S3 are still manual and are not recorded here.
 
 ## S1: RTC persistence
 
@@ -72,4 +72,36 @@ and a spike-only hook logger (removed afterwards). Date: 2026-09-26.
 | 9: `claude plugin validate --strict` | Passes for `plugins/nh` (with `agents/` and `workflows/`) and the marketplace root | — |
 | TaskStop | `TaskStop {task_id}` answers `{message, task_id, task_type: "local_workflow", command}`; the stopped run sends no task notification in `-p` | PostToolUse `^TaskStop$` marks the run done with status `killed`; verified: the main conversation's write then passes (no E108) |
 | End to end, after implementation (scratch copy of the sandbox, real JupyterLab, `NH_HEADLESS=1`) | `/nh:qa-cell <ask>`: the writer is bound to the run, adds one cell (`cell_added agent=nh:cell-writer`), QA passes it with `nh_inspect` only, and the report arrives as a `turn_alias` of the same human turn. `--settings '{"ultracode": true}'` with a plain message: the model launches `nh:qa-cell` by itself. A plain message at normal effort stays single-agent | — |
-| 6, 7 | Not reached headlessly: background permission prompts need an interactive session, and QA never needed Read (the outputs were short) | Check in an interactive run; the launch guard covers `approve_before_run`, and QA falls back to `nh_inspect(view="cell")` if Read prompts |
+| 6, 7 | Not reached headlessly: background permission prompts need an interactive session, and QA never needed Read (the outputs were short) | Check in an interactive run; the launch guard covers `approve_before_run`, and QA falls back to `nh_inspect(view="cell")` if Read prompts. Answered under "v0.1.1 acceptance" |
+
+## v0.1.1 acceptance (Claude Code 2.1.282)
+
+Run on the final 0.1.1 code in a scratch copy of `dev/sandbox`, with the notebook trimmed to its title and a
+real JupyterLab on 127.0.0.1. The headless runs used `NH_HEADLESS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+claude -p … --plugin-dir plugins/nh --allowedTools "Skill,Workflow,TaskStop,Read,mcp__plugin_nh_nh"`, and
+the browser checks used a JupyterLab tab on the same server. The manual run (the last five rows) used an
+interactive `claude` in a separate scratch project, with nh installed from GitHub at project scope and
+`/effort ultracode`. macOS, 2026-09-28.
+
+| Check | Result | Decision |
+|---|---|---|
+| qa-cell end to end | With `--settings '{"ultracode": true}'` and a plain "load sales.csv", the model launches `nh:qa-cell` by itself. The writer adds one cell (`cell_added agent=nh:cell-writer`). QA passes it with no revision, and the report arrives as a `turn_alias` of the same human turn. A second run with a follow-up question gave the same result | — |
+| E107: the user writes while the workflow runs | A `--input-format stream-json` driver sent a second message as soon as the launching turn ended, about 6 s before the writer's `nh_add_cell`. The add was refused: "Not written: this nh:qa-cell run belongs to an earlier user message…" (E107). No cell was added. The report arrived as a `turn_alias` of the second turn, and the reply told the user the cell wasn't written and why | As designed. Turn-gate refusals are not logged, so `nhctl metrics summarize` doesn't count them (its `rejections` are linter rules only) |
+| Undo after a qa-cell turn | `--resume <session> "undo"`: `nh_undo` with no cell id removed the qa-cell's note and code cell. One `cell_undone` was logged, and the notebook matched its state before that message. The next `nh_inspect` warned that the kernel still held `ax`, `fig` and `region_price` from the undone cell, and said how to rebuild | — |
+| Background Bash notification | The prompt starts `sleep 5` with `run_in_background` (this needs `Bash(sleep:*)` allowed) and asks for a cell. The turn logged one `turn_open` and one `cell_added`. The task notification was logged as a `turn_alias`, and its reply wrote no cell | — |
+| S4: gateway overhead | `harness_ms` over the 3 `cell_added` events: p50 70 ms, p95 97 ms (budget 700 ms) | — |
+| S4: hooks | Timed as `/bin/sh nh-hook <event> [variant]` with a warm runtime, 20 runs per case. SessionStart, UserPromptSubmit, PreToolUse (nh, file write, notebook Read, notebook Bash, foreign MCP, Workflow) and PostToolUse TaskStop: p95 61–103 ms, max 122 ms (SessionStart). Read or Bash that doesn't touch a notebook exits on the shell fast path: p95 17–18 ms. An earlier run had one 266 ms SessionStart outlier (budget 300 ms) | — |
+| S4: runtime build (`nh-sync`) | Check with the runtime present: about 22 ms. Build into an empty plugin-data dir: 0.68 s with a warm uv cache, 2.7 s with an empty one | — |
+| S5: install | With `CLAUDE_CONFIG_DIR` set to a scratch dir, `claude plugin marketplace add <clone>` then `claude plugin install nh@notebook-harness`. The cached `nh/0.1.1/` keeps the exec bit on `bin/nhctl`, `hooks/nh-hook` and `libexec/*`. `nhctl doctor --json` runs from the cache: `ok: true`, with D120 until the first `nh-sync` and the D160 advisory | — |
+| S1 m1: live cells | nh's note and code cells appear in the open tab as they are added, with no reload | — |
+| S1 m2: edit in the UI | Editing an nh cell and saving keeps its id and `metadata.nh`. `nh_inspect` shows it as `agent*` | — |
+| S1 m3: move, cut/paste, copy/paste | Move and cut/paste keep the id and `metadata.nh`. Copy/paste gives the copy a new id (a UUID) with the same `metadata.nh`, and nh treats it as the user's cell: `human+nh` | As designed (`normalize_uids`) |
+| S1 m4: Restart Kernel and Run All | Ids and `metadata.nh` are unchanged on disk, and execution counts restart at 1 | — |
+| S1 m5: close, wait 70 s, reopen | The room is cleaned, then dropped from memory 60 s later. On reopen it loads from the ystore and saves back with the same 5 cells, ids and `metadata.nh` | — |
+| S1 m6: page reload | Same 5 cells, no duplicates, and the UI edit is kept | — |
+| S1 m7: the file on disk | Every nh cell has `"nh"` metadata (`uid`, `pair_uid`, `role`, `turn_id`, `source_sha`…), and the notebook is nbformat 4.5 | — |
+| Install from GitHub | `/plugin marketplace add dheocahyo/Notebook-Harness-Plugin` failed with "Permission denied (publickey)". Claude Code clones over SSH with no terminal to ask for a passphrase, and this machine's GitHub key has one, is used only through a `github.com-personal` host alias, and wasn't loaded in the SSH agent. After `ssh-add --apple-use-keychain`, adding the marketplace by the alias URL (`git@github.com-personal:dheocahyo/Notebook-Harness-Plugin.git`) and `/plugin install nh@notebook-harness` worked | No README change: git credentials aren't nh-specific |
+| S6 #6, auto mode | No prompts. The auto-mode classifier checked the writer's `nh_add_cell` and approved it, and the workflow finished normally | — |
+| S6 #6, default mode | `claude --permission-mode default`, answering each prompt with plain "Yes". The workflow agents have `requestNonInteractive: false` here (it is `true` under `-p`). The prompt for the writer's `nh_add_cell` reached the user while the workflow ran in the background: the call waited 11.9 s for a cell that ran in 0.0 s. After approval the workflow carried on and QA passed the cell. `nh_run` never came up, because `nh_add_cell` runs the cell itself | As designed: this is Claude Code's default mode asking for a tool that isn't allowed, not nh's `approve_before_run`. That setting's docs say QA doesn't start because "its agents can't ask you", which holds under `-p` only. v0.2: re-test `approve_before_run = true` with QA in an interactive session |
+| S6 #7: QA reads `.nh/outputs` | In both runs the cell's output was longer than `[output] max_chars` (2,000), so the result ended with `[full output: .nh/outputs/<hash>.txt]` and QA Read that file. No prompt in either mode: auto mode's classifier doesn't check Read, and in default mode the Read took 43 ms | QA keeps using Read; the `nh_inspect` fallback isn't needed |
+| Other default-mode prompts | Inferred from wait times, not reported separately: the `Workflow` launch (30.2 s, against 2.9 s in auto mode), and `nh_inspect` in the turn that delivers the workflow's report (24.4 s, against 0.06 s in the first turn, where loading the nh:notebook skill allows it) | v0.2 candidate: stop `nh_inspect` asking in the report turn, for example with an allow rule offered by `/nh:init` |
