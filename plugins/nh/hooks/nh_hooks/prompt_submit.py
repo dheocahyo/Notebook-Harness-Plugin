@@ -7,6 +7,11 @@ with its status, and whether the kernel still holds results the notebook no long
 A background task's completion (a prompt made only of ``<task-notification>`` blocks) opens
 no turn: its prompt id becomes an alias of the open human turn, so it shares that message's
 one cell, or an orphan with no turn when none is open. Its runs are marked as reported.
+
+A human message is classified (``intent.classify``: mode, request, answer; never its text).
+One typed while Claude works arrives with the running turn's prompt id (``turn_record.running``:
+the human turn's own, or a notification's alias): it opens no turn and only tightens the
+running one (``turn_record.absorbed``), so the reminder skips ``RULE``.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from typing import Any
 
 from common import Payload, context, text_field
 
-from nh_gateway._shared import turn_record
+from nh_gateway._shared import intent, turn_record
 from nh_gateway._shared.paths import Layout, append_jsonl, atomic_write_json, read_json
 
 REMINDER_MAX_CHARS = 400
@@ -60,32 +65,65 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
     prompt = payload.get("prompt")
     blocks = turn_record.notification_blocks(prompt) if isinstance(prompt, str) else None
     if blocks is not None:
-        head = notification(layout, session_id, prompt_id, len(prompt), blocks, now)
+        head = [notification(layout, session_id, prompt_id, len(prompt), blocks, now)]
     else:
-        head = RULE
-        if session_id:
-            previous = turn_record.read(layout, session_id)
-            record = turn_record.opened(session_id, prompt_id, now, previous)
-            atomic_write_json(layout.turn_file(session_id), record)
-            append_jsonl(
-                layout.log_file,
-                {
-                    "v": 1,
-                    "ts": now,
-                    "event": "turn_open",
-                    "session_id": session_id,
-                    "turn_id": prompt_id or None,
-                    "prompt_chars": len(prompt) if isinstance(prompt, str) else None,
-                },
-            )
+        head = human_message(layout, session_id, prompt_id, prompt, now)
 
     last = read_json(layout.last_cell)
     parts = [NO_PROMPT_ID] if not prompt_id else []
-    parts.append(head)
+    parts.extend(head)
     parts.append(last_cell_line(last, now) or "")
     notebook = last.get("notebook") if isinstance(last, dict) else None
     parts.append(drift_line(read_json(layout.drift_json), notebook) or "")
-    return context("UserPromptSubmit", clip(" ".join(part for part in parts if part)))
+    text = clip(" ".join(part for part in parts if part))
+    return context("UserPromptSubmit", text) if text else None
+
+
+def human_message(
+    layout: Layout, session_id: str, prompt_id: str, prompt: Any, now: float
+) -> list[str]:
+    """Open the turn (or tighten the running one, for a message typed mid-turn) and return
+    the reminder's head."""
+    if not session_id:
+        return human_head(None, absorbed=False)
+    previous = turn_record.read(layout, session_id)
+    absorbed = turn_record.running(previous, prompt_id)
+    # The human turn the message belongs to (None when absorbed into an orphan).
+    turn_id = previous["turn_id"] if previous is not None and absorbed else prompt_id or None
+    try:
+        classified = intent.classify(prompt)
+    except Exception:
+        classified = intent.empty()
+        log_event(layout, now, "classify_failed", session_id=session_id, turn_id=turn_id)
+    fields: dict[str, Any] = {"session_id": session_id, "turn_id": turn_id}
+    if previous is not None and absorbed:
+        record = turn_record.absorbed(previous, prompt_id, classified)
+        fields["prompt_id"] = prompt_id
+    else:
+        record = turn_record.opened(session_id, prompt_id, now, previous, classified)
+    atomic_write_json(layout.turn_file(session_id), record)
+    log_event(
+        layout,
+        now,
+        "turn_absorbed" if absorbed else "turn_open",
+        **fields,
+        prompt_chars=len(prompt) if isinstance(prompt, str) else None,
+        mode=classified["mode"],
+        request=classified["request"],
+        answer=classified["answer"],
+    )
+    return human_head(record, absorbed=absorbed)
+
+
+def human_head(record: dict[str, Any] | None, *, absorbed: bool) -> list[str]:
+    """The reminder's head for a human message: the one-cell rule for a new turn, nothing for
+    a message folded into the running turn (it has no budget of its own). The mode parts
+    (explain, ask, approved batch) go here, after RULE."""
+    return [] if absorbed else [RULE]
+
+
+def log_event(layout: Layout, now: float, event: str, **fields: Any) -> None:
+    append_jsonl(layout.log_file, {"v": 1, "ts": now, "event": event, **fields})
 
 
 def notification(

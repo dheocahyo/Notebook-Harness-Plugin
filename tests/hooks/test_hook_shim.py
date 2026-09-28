@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -329,6 +330,7 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
     def recorded(run: HookRun) -> bool:
         return run.stdout == "" and (sandbox.nh / "state" / "workflows" / "sess-2.json").is_file()
 
+    messages = itertools.count(1)
     launch = {"name": "nh:qa-cell", "args": "go"}
     launched = {
         "status": "async_launched",
@@ -343,7 +345,12 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
         "prompt-submit": (
             "UserPromptSubmit",
             None,
-            sandbox.payload("UserPromptSubmit"),
+            # A new message each run: the same prompt id again is one typed mid-turn.
+            lambda: sandbox.payload(
+                "UserPromptSubmit",
+                prompt_id=f"prompt-{next(messages)}",
+                prompt="Load the sales data, then run the next 3 steps of the plan.",
+            ),
             has_context,
         ),
         "file": ("PreToolUse", "Edit", sandbox.tool_payload("Edit", {"file_path": nb}), denied),
@@ -388,9 +395,13 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
     report = {}
     for name, (event, tool, payload, check) in cases.items():
         argv = command_line(sandbox.handlers(event, tool)[0])
+
+        def run(argv=argv, payload=payload) -> HookRun:
+            return sandbox.run_argv(argv, payload() if callable(payload) else payload, env)
+
         for _ in range(3):  # warm the bytecode cache and the OS file cache
-            assert check(sandbox.run_argv(argv, payload, env)), name
-        samples = [sandbox.run_argv(argv, payload, env).seconds for _ in range(20)]
+            assert check(run()), name
+        samples = [run().seconds for _ in range(20)]
         report[name] = round(p95(samples) * 1000)
     print("hook p95 ms:", report)
     assert not (sandbox.nh / "logs" / "hooks.log").exists()

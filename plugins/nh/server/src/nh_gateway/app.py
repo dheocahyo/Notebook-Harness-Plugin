@@ -39,6 +39,12 @@ from .tools.common import CALL_LEAD, Services
 log = logging.getLogger("nh_gateway")
 
 CALL_DEADLINE_S = 105.0  # stay under Claude Code's 120 s auto-background
+# D1's E102 (design §6.1): the user must resend, so the model must tell them.
+MISSED_DETAIL = "- nh missed this message; send it again."
+MISSED_NEXT = (
+    "Tell the user nh missed their last message and ask them to send it again; write "
+    "nothing until they do."
+)
 
 INSTRUCTIONS = """\
 Notebook Harness (nh): you pair with a data scientist in their live Jupyter notebook. They watch cells appear in JupyterLab and must understand each one. The tools enforce these rules; when a tool refuses, follow its "Next:" line.
@@ -199,6 +205,17 @@ class TurnGate(Middleware):
             raise NhError("E104", next_step=RETURN_TO_WORKFLOW if run_id else None)
         if turn_id is None:
             raise NhError("E102", detail="- A background task finished; no user message is open.")
+        if (
+            not stamp.agent_id
+            and record
+            and record["human"]
+            and not turn_record.known(record, stamp.prompt_id)
+            and stamp.ts >= record["ts"]
+        ):
+            # D1 (design §6.1): a prompt id the hook never recorded, newer than the record, is
+            # a message nh missed, whose mode would otherwise escape it. An older unknown id
+            # gets v0.1's E102 below.
+            raise NhError("E102", detail=MISSED_DETAIL, next_step=MISSED_NEXT)
         if record and record["ts"] > stamp.ts and turn_id != record["turn_id"]:
             raise NhError("E102")
         if (

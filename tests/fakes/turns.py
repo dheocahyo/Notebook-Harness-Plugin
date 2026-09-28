@@ -46,7 +46,11 @@ class Turns:
         out = proc.stdout.decode().strip()
         return json.loads(out) if out else None
 
-    def prompt(self, prompt_id: str, session_id: str | None = None) -> dict[str, Any] | None:
+    def prompt(
+        self, prompt_id: str, session_id: str | None = None, text: str = "…"
+    ) -> dict[str, Any] | None:
+        """A human message ``text``; the same ``prompt_id`` as the open turn is one typed
+        mid-turn (spike V16)."""
         return self._hook(
             "prompt-submit",
             payload={
@@ -55,7 +59,7 @@ class Turns:
                 "cwd": str(self.project),
                 "hook_event_name": "UserPromptSubmit",
                 "permission_mode": "default",
-                "prompt": "…",
+                "prompt": text,
             },
         )
 

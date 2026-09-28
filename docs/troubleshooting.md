@@ -45,6 +45,8 @@ Find the code below.
 |---|---|---|
 | **E110** "one new cell per message" | by design: the agent tried a second cell | answer with **go** (or pick a step) to get the next cell |
 | **E112**, **E113** | by design: the message's cell already ran, or is another cell | review the result; ask for the change in your next message |
+| **E102** "belongs to an earlier message" | by design: the call came from a message you've since replied to, or from a background task that finished while no message of yours was open (a message you type while the agent handles that task joins the task's turn, which has no cell) | nothing to do: the agent stops and waits for your next message; send again anything you typed while it handled the task |
+| **E102** "nh missed this message; send it again." | nh's prompt hook didn't record your latest message (it failed or timed out), so nh can't tell what that message asked for and writes nothing for it | the agent asks you to send the message again; do so. If it keeps happening, see `.nh/logs/hooks.log` and run `/nh:status` |
 | **E108** "the nh:qa-cell workflow is writing this message's cell" | by design: while the workflow writes and checks the cell, the main agent writes nothing | wait for its report, or stop the workflow to change course. A run that never reports holds only its own message, for at most an hour |
 | The nh:qa-cell launch is refused: "approve_before_run = true" | the workflow runs in the background and can't ask you to approve its cell | nothing to do: the agent writes the cell itself. Set `[approval] approve_before_run = false` to use the workflow |
 | The nh:qa-cell launch is refused: "already had its nh:qa-cell run" | one run per message | the agent replies from its report; ask again in your next message |

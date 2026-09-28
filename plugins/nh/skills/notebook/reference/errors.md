@@ -64,7 +64,7 @@ but E120 to the workflow instead of asking the user. The most common:
 | Code | Meaning | Do |
 |---|---|---|
 | E101 | nh's hooks didn't stamp this call, or two identical calls (one from a subagent) arrived together | tell the user; suggest `/nh:status`. Retry at most once (for two identical calls, just retry once) |
-| E102 | the call belongs to an earlier message | stop and wait |
+| E102 | the call belongs to an earlier message; or, with "nh missed this message", nh never recorded the user's latest message | stop and wait; for a missed message, first ask the user to send it again |
 | E103 | only the main conversation, or nh's cell writer inside the nh:qa-cell workflow, may change the notebook; other subagents are read-only | return findings to the main conversation |
 | E104 | plan mode | describe the cell instead |
 | E105 | not an nh project | suggest `/nh:init` |

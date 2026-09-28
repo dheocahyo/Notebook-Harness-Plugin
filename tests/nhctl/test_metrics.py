@@ -105,6 +105,24 @@ def test_background_task_notifications_are_not_turns(env, project):
     assert summary["max_cells_per_turn"] == 1
 
 
+def test_messages_typed_mid_turn_are_not_turns(env, project):
+    """A message folded into the running turn logs turn_absorbed (design §6.1): no turn."""
+    (project / ".nh").mkdir()
+    events = [
+        ev("turn_open", "t1", 1000.0, mode="ask", request={"batch": True, "n": 3}, answer=None),
+        ev("turn_absorbed", "t1", 1001.0, prompt_id="t1", prompt_chars=3, answer="yes"),
+        ev("turn_alias", "t1", 1002.0, prompt_id="n1", prompt_chars=420, tasks=["b7"]),
+        ev("turn_absorbed", "t1", 1003.0, prompt_id="n1", prompt_chars=9, mode="explain"),
+        ev("cell_added", "t1", 1004.0, cell_uid="nh-a", note_words=20),
+        ev("turn_absorbed", None, 1005.0, prompt_id="o1", prompt_chars=12),  # an orphan's turn
+        ev("turn_absorbed", "t9", 1006.0, prompt_id="t9", prompt_chars=4),  # open rotated out
+    ]
+    (project / ".nh/log.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    summary = env.json("metrics", "summarize", cwd=project)
+    assert summary["turns"] == 1
+    assert summary["cells_per_turn"] == {"1": 1}
+
+
 def test_summarize_human_and_empty(env, project):
     (project / ".nh").mkdir()
     empty = env.run("metrics", "summarize", cwd=project)

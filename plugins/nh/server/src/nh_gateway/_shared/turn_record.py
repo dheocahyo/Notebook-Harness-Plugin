@@ -7,6 +7,11 @@ as an orphan (``turn_id`` None) when no human message is open, so writes get E10
 human message keeps the earlier aliases in ``earlier`` (alias -> its human turn), so a late
 call from an earlier notification's prompt still counts against that message's budget.
 
+Since v0.2 a record also carries the opening message's ``mode``, ``request`` and ``answer``
+(``intent.classify``) and the previous record's ``prev_turn_id`` and ``prev_request``. A
+message typed while Claude works resubmits the running turn's prompt id (``running()``):
+``absorbed()`` lets it only tighten the turn (design §6.1).
+
 ``.nh/state/workflows/<session>.json`` holds the last Workflow launches of the session and
 tells the gateway which run a cell writer works for.
 
@@ -20,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from . import intent
 from .paths import Layout, atomic_write_json, read_json, safe_name
 
 RECORD_VERSION = 2
@@ -37,6 +43,8 @@ MAX_RUNS = 20
 RUN_OPEN_TTL_S = 3600.0  # a run that never reported stops counting as open
 META_WAIT_S = 2.0  # the writer can call before PostToolUse has recorded its run
 META_POLL_S = 0.1
+# v0.2's fields (design §6.1): the opening message's intent and what the previous turn asked.
+INTENT_FIELDS = ("mode", "request", "answer", "prev_turn_id", "prev_request")
 
 BLOCK = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
 
@@ -69,7 +77,8 @@ def _number(value: Any) -> float:
 def read(layout: Layout, session_id: str) -> dict[str, Any] | None:
     """The session's turn record in v2 shape, or None when missing or unreadable.
 
-    A v1 record (``{v:1, prompt_id, ts}``) is its own turn: ``turn_id = prompt_id``.
+    A v1 record (``{v:1, prompt_id, ts}``) is its own turn: ``turn_id = prompt_id``. The
+    v0.2 fields are whitelisted: absent, invalid or from a v1 record, they read as None.
     """
     data = read_json(layout.turn_file(session_id))
     if not isinstance(data, dict):
@@ -93,6 +102,8 @@ def read(layout: Layout, session_id: str) -> dict[str, Any] | None:
         if isinstance(raw, dict)
         else {}
     )
+    v2 = data.get("v") == RECORD_VERSION
+    mode, answer = data.get("mode"), data.get("answer")
     return {
         "v": RECORD_VERSION,
         "session_id": _text(data.get("session_id")) or session_id,
@@ -103,6 +114,11 @@ def read(layout: Layout, session_id: str) -> dict[str, Any] | None:
         "ts": _number(data.get("ts")),
         "alias_ts": _number(alias_ts) if alias_ts is not None else None,
         "earlier": earlier,
+        "mode": mode if v2 and mode in intent.MODES else None,
+        "request": intent.valid_request(data.get("request")) if v2 else None,
+        "answer": answer if v2 and answer in intent.ANSWERS else None,
+        "prev_turn_id": _text(data.get("prev_turn_id")) if v2 else None,
+        "prev_request": intent.valid_request(data.get("prev_request")) if v2 else None,
     }
 
 
@@ -120,6 +136,32 @@ def canonical(record: dict[str, Any] | None, prompt_id: str | None) -> str | Non
     return prompt_id
 
 
+def known(record: dict[str, Any] | None, prompt_id: str | None) -> bool:
+    """Whether ``record`` has seen ``prompt_id``: its turn, an alias of it or of an earlier
+    turn, or the previous turn. An unknown id in a human turn is a message nh missed (D1)."""
+    if record is None or not prompt_id:
+        return False
+    earlier = record.get("earlier")
+    return (
+        prompt_id == record.get("turn_id")
+        or prompt_id in (record.get("aliases") or ())
+        or (isinstance(earlier, dict) and prompt_id in earlier)
+        or prompt_id == record.get("prev_turn_id")
+    )
+
+
+def running(record: dict[str, Any] | None, prompt_id: str | None) -> bool:
+    """Whether a human message with ``prompt_id`` was typed into the running turn (spike V16:
+    Claude Code resubmits that turn's prompt id). The running turn is the human turn itself,
+    or a turn a background task's notification started: an alias, of the human turn or of an
+    orphan. A human message never reuses a prompt id otherwise."""
+    if record is None or not prompt_id:
+        return False
+    if record.get("human") and prompt_id == record.get("turn_id"):
+        return True
+    return prompt_id in (record.get("aliases") or ())
+
+
 def _remember(record: dict[str, Any], aliases: list[str]) -> dict[str, str | None]:
     """``record``'s earlier aliases plus ``aliases`` (of its turn), newest last, at most
     MAX_EARLIER."""
@@ -130,13 +172,31 @@ def _remember(record: dict[str, Any], aliases: list[str]) -> dict[str, str | Non
     return dict(list(earlier.items())[-MAX_EARLIER:])
 
 
+def _intent(classified: dict[str, Any] | None) -> tuple[str | None, Any, str | None]:
+    """``intent.classify``'s mode, request and answer, each None unless valid."""
+    if not isinstance(classified, dict):
+        return None, None, None
+    mode, answer = classified.get("mode"), classified.get("answer")
+    return (
+        mode if mode in intent.MODES else None,
+        intent.valid_request(classified.get("request")),
+        answer if answer in intent.ANSWERS else None,
+    )
+
+
 def opened(
     session_id: str,
     prompt_id: str | None,
     now: float,
     previous: dict[str, Any] | None = None,
+    classified: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """A human message: a new turn with no aliases (``previous``'s are kept in ``earlier``)."""
+    """A human message: a new turn with no aliases (``previous``'s are kept in ``earlier``).
+
+    ``classified`` is ``intent.classify``'s result for the message; ``prev_turn_id`` and
+    ``prev_request`` come from ``previous``, so a "yes" can find the question it answers.
+    """
+    mode, request, answer = _intent(classified)
     return {
         "v": RECORD_VERSION,
         "session_id": session_id,
@@ -147,7 +207,30 @@ def opened(
         "ts": now,
         "alias_ts": None,
         "earlier": _remember(previous, previous.get("aliases") or []) if previous else {},
+        "mode": mode,
+        "request": request,
+        "answer": answer,
+        "prev_turn_id": _text(previous.get("turn_id")) if previous else None,
+        "prev_request": intent.valid_request(previous.get("request")) if previous else None,
     }
+
+
+def absorbed(
+    record: dict[str, Any], prompt_id: str, classified: dict[str, Any] | None
+) -> dict[str, Any]:
+    """A message typed while Claude works: Claude Code folds it into the running turn and
+    resubmits that turn's prompt id (spike V16; see ``running()``). It opens no turn and can
+    only tighten one: its mode holds for the rest of the turn and its request waits for the
+    next reply, but its yes or no is never an answer. The turn (an orphan stays one), its
+    aliases, ``earlier``, ``ts``, ``answer``, ``prev_turn_id`` and ``prev_request`` are kept."""
+    mode, request, _answer = _intent(classified)
+    return dict(
+        record,
+        v=RECORD_VERSION,
+        prompt_id=prompt_id,
+        mode=mode or record.get("mode"),
+        request=request or record.get("request"),
+    )
 
 
 def aliased(record: dict[str, Any], prompt_id: str, now: float) -> dict[str, Any]:
@@ -177,6 +260,11 @@ def orphan(session_id: str, prompt_id: str, now: float) -> dict[str, Any]:
         "ts": now,
         "alias_ts": now,
         "earlier": {},
+        "mode": None,
+        "request": None,
+        "answer": None,
+        "prev_turn_id": None,
+        "prev_request": None,
     }
 
 

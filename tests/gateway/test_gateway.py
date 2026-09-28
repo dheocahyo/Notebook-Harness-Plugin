@@ -161,6 +161,131 @@ async def test_stamp_from_an_earlier_message_is_refused(nh: Harness) -> None:
     assert "nh: E102" in text(result)
 
 
+# --- D1: a message nh missed fails closed (design §6.1) -------------------------------------
+
+MISSED = "- nh missed this message; send it again."
+MISSED_NEXT = (
+    "Next: Tell the user nh missed their last message and ask them to send it again; write "
+    "nothing until they do."
+)
+
+
+async def test_a_message_nh_missed_is_refused(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    # p2's UserPromptSubmit hook never ran (failed or timed out): its call is newer than p1's.
+    result = await nh.call("nh_add_cell", "p2", **LOAD)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body, body
+    assert body.splitlines()[:4] == [
+        "This call belongs to an earlier message, so nh wrote nothing.",
+        "nh: E102",
+        MISSED,
+        MISSED_NEXT,  # the user must resend, so the model must say so (not just wait)
+    ]
+    assert not nh_cells(nh)
+    nh.turns.prompt("p2")  # sent again: the hook records it
+    assert not (await nh.call("nh_add_cell", "p2", **LOAD)).is_error
+
+
+async def test_a_missed_message_cannot_wait_either(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    result = await nh.call("nh_run", "p9", mode="wait")
+    assert result.is_error and MISSED in text(result)
+
+
+async def test_no_turn_record_is_allowed(nh: Harness) -> None:
+    # The /nh:init message: its hook ran before .nh/ existed, so there is no record.
+    result = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert not result.is_error, text(result)
+
+
+async def test_known_ids_pass_d1(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    nh.turns.notification("note-1")
+    result = await nh.call("nh_add_cell", "note-1", **LOAD)  # an alias of p1
+    assert not result.is_error, text(result)
+    nh.turns.prompt("p2", text="yes")
+    nh.turns.notification("note-2")
+    nh.turns.prompt("p2", text="explain the parse")  # typed mid-turn: absorbed, still p2
+    result = await nh.call("nh_add_cell", "note-2", **DROP)
+    assert not result.is_error, text(result)
+    later = await nh.call("nh_add_cell", "note-1", **dict(DROP, title="Late"))  # earlier alias
+    assert later.is_error and "nh: E110" in text(later)  # p1's budget, not D1
+    assert MISSED not in text(later)
+
+
+async def test_a_message_typed_into_a_notifications_turn_gets_no_budget(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    nh.turns.notification("note-1")
+    # Typed while Claude handles note-1: Claude Code resubmits note-1, an alias of p1.
+    nh.turns.prompt("note-1", text="yes, add the drop step too")
+    result = await nh.call("nh_add_cell", "note-1", **DROP)
+    assert result.is_error and "nh: E110" in text(result)  # still p1's one cell
+    assert MISSED not in text(result)
+
+
+def _stamp_and_record_ts(nh: Harness, offset: float) -> None:
+    """Set the turn record's ts to the one waiting stamp's ts + ``offset``."""
+    (stamp_file,) = (nh.project / ".nh" / "state" / "stamps").glob("*--*.json")
+    stamp_ts = json.loads(stamp_file.read_text())["ts"]
+    turn_file = nh.project / ".nh" / "state" / "turns" / "sess-1.json"
+    record = json.loads(turn_file.read_text())
+    turn_file.write_text(json.dumps(dict(record, ts=stamp_ts + offset)))
+
+
+@pytest.mark.parametrize(("offset", "missed"), [(0.0, True), (0.001, False)])
+async def test_d1_starts_at_the_records_own_time(nh: Harness, offset: float, missed: bool) -> None:
+    """A stamp exactly as new as the record is a missed message; a hair older is v0.1's
+    earlier-message E102."""
+    nh.turns.prompt("p1")
+    nh.turns.stamp("nh_add_cell", LOAD, "p2")
+    _stamp_and_record_ts(nh, offset)
+    result = await nh.client.call_tool("nh_add_cell", LOAD, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body, body
+    assert (MISSED in body, MISSED_NEXT in body) == (missed, missed)
+
+
+# v0.1's E102 (not D1): an unknown id older than the record is an earlier message's call.
+
+
+async def test_v01_an_old_unknown_call_gets_the_plain_e102(nh: Harness) -> None:
+    nh.turns.stamp("nh_add_cell", LOAD, "p0")  # stamped before any message was recorded
+    await asyncio.sleep(0.05)
+    nh.turns.prompt("p1")
+    result = await nh.client.call_tool("nh_add_cell", LOAD, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body and MISSED not in body
+
+
+async def test_v01_a_call_from_two_messages_back_gets_the_plain_e102(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    nh.turns.stamp("nh_add_cell", LOAD, "p1")
+    await asyncio.sleep(0.05)
+    nh.turns.prompt("p2")
+    nh.turns.prompt("p3")  # p1 is neither the turn nor the previous one
+    result = await nh.client.call_tool("nh_add_cell", LOAD, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body and MISSED not in body
+
+
+async def test_after_an_orphan_an_unknown_call_keeps_v01s_rule(nh: Harness) -> None:
+    # A background task can finish during the /nh:init message: the record is an orphan.
+    nh.turns.notification("note-1")
+    result = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert not result.is_error, text(result)
+
+
+async def test_the_writers_calls_skip_d1(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    nh.turns.workflow_launched("p1")
+    # A workflow agent's stamp may carry a prompt id the turn record never saw.
+    result = await nh.turns.writer_call(nh.client, "w-1", "wf_run-1", "nh_add_cell", LOAD, "p-w1")
+    assert not result.is_error, text(result)
+    assert nh_cells(nh)[-1]["metadata"]["nh"]["turn_id"] == "p1"
+
+
 async def test_error_retry_then_done(nh: Harness) -> None:
     nh.turns.prompt("p1")
     broken = dict(
