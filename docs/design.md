@@ -488,3 +488,123 @@ These supersede the sections above where they differ.
 | Self-check, round 3 | Closing labels say what was compared: "same shape and nulls" only when both summaries carry null counts, "same shape" otherwise (frames over `max_cells`, arrays), "same length" for containers. "N% removed/lost" is floored and at most 99% while rows remain. A frame the cell binds again after a name is that name's source only as it was before the run (else no origin). A Series taken from a frame by an explicit `.drop*`/`.query`/`.filter` call counts as rows lost. The vars probe shows bools as True/False. |
 | Discovery, round 3 | A loopback `[jupyter].url` spelled with another loopback name than a scanned runtime file (127.0.0.1 vs localhost, same port and base path) uses that file's own URL and token, so the token still goes only to its exact host. A 401/403 when nh sent no token says "needs a token nh doesn't have (set NH_JUPYTER_TOKEN, or remove [jupyter].url …)". Host names may contain "_". `nh_inspect(view="status")` adds a `reason` line with the E130 details. |
 | Scaffold, round 3 | When `.env` is tracked by git, a secret data URL is not written there: the report lists `.env` as `skipped`, `data.secret_in_env` is false, and a warning says to `git rm --cached .env` and run /nh:init again. |
+
+## 6. v0.2 (FR-9..FR-14)
+
+v0.2 adds explain mode (FR-9), /nh:plan with an approved batch (FR-10), /nh:review (FR-11), guardrails that ask before risky steps (FR-12), junior/senior presets (FR-13) and secrets hygiene (FR-14), plus the v0.1.1 carry-overs (§6.12; a7 and a8 in §6.13) and two additions the user asked for: `nhctl fresh-run --via server` (§6.11) and drift issue filing (§6.13).
+The decisions of the approved v0.2 build plan (D0–D13) are binding; this section records them as contracts.
+§6.0 is the contract every chunk shares. Each of §6.1–§6.13 is written by the chunk that implements it, before that chunk's code.
+Paths: gateway files are relative to `nh_gateway/`; `hooks/`, `scripts/nhctl/` and `skills/` are under `plugins/nh/`.
+
+| Section | Mechanism | Plan | Chunk |
+|---|---|---|---|
+| 6.1 | Turn record, classifier, ledger v2 and fail-closed E102 | D0 a–b, D1 | C1 |
+| 6.2 | Explain-only turns | D2 | C2 |
+| 6.3 | /nh:plan and the approved batch | D3 | C6 |
+| 6.4 | Cell approvals: package install, network, outside writes | D4 | C5 |
+| 6.5 | Multi re-run | D5 | C7 |
+| 6.6 | Native dialog hooks | D6 | C8 |
+| 6.7 | Secret lint rules (L011, L014, E125) | D7 | C4 |
+| 6.8 | Redaction of what Claude sees | D8 | C3 |
+| 6.9 | Junior/senior presets | D9 | C9 |
+| 6.10 | /nh:review | D10 | C10 |
+| 6.11 | `nhctl fresh-run --via server` | D11 | C11 |
+| 6.12 | nh_inspect allow rule and `approve_before_run` | D12 | C11 |
+| 6.13 | a7, a8 and drift issue filing | D13 | C12 |
+
+### 6.0 Shared contract
+
+**a. Turn record fields and the classifier** (D0 a)
+- `hooks/nh_hooks/prompt_submit.py` `handle` passes every human message to a new pure module, `_shared/intent.py` (Python 3.9, stdlib, shared by hooks and gateway). The result goes into the turn record (`_shared/turn_record.py`: `opened()` and the `read` whitelist) as optional fields:
+
+| Field | Values |
+|---|---|
+| `mode` | `explain` \| `plan` \| `ask` \| None |
+| `request` | `{batch, n}` \| `{rerun_stale}` \| None |
+| `answer` | `yes` \| `no` \| None |
+| `prev_turn_id` | defined in 6.1 |
+| `prev_request` | defined in 6.1 |
+
+- `RECORD_VERSION` stays 2. Absent keys read as None, `aliased()` keeps the fields and `orphan()` clears them.
+- The classifier matches whole words, case-insensitive:
+
+| Result | Message |
+|---|---|
+| mode `explain` | first word "explain", or starts with "/nh:explain"; and no change verb (fix, change, add, update, rewrite, refactor, make). "explain the fixed-width parse" is explain; "explain and fix" is not |
+| mode `plan` | starts with "/nh:plan" |
+| request `{batch, n}`, mode `ask` | "run (the) next N" or "run steps a-b", with n ≥ 2 |
+| request `{rerun_stale}`, mode `ask` | "re-run (all) (the) stale (cells)" |
+| `answer` | the whole trimmed message matches a small yes set or no set (defined in 6.1); "go" is yes only when it is the whole message |
+
+- On a classifier exception the fields are None, the record is still written, and a `classify_failed` event is logged. Prompt text is never stored.
+- A message absorbed mid-turn resubmits the running turn's prompt_id (V16); 6.1 defines how it is classified and whether it can answer a pending question (user decision pending).
+
+**b. Pending question and one-shot grant** (D0 b, in the gateway)
+- **Ledger v2.** `policy/turn.py` `TurnLedger` is stored as `{"v": 2, "turns", "pending"}` and still loads v1. `pending` is `{kind: cell|rerun, key: sha256(raw text), turn_id, ts}`: hashes only, never the question. A cell's key is defined in 6.4, a re-run's (`sha(notebook|ids)`) in 6.5.
+- **First ask wins.** One question at a time: a second ask in the same turn gets E122 "already waiting for the user's answer".
+- **Clearing.** A successful gated write in that turn clears `pending`.
+- **Next human turn.** If `answer == "yes"` and `pending.turn_id == prev_turn_id`, the call with the exact matching key is accepted once. Any other answer drops `pending`.
+- **Batch and re-run-stale requests** are granted when `answer == "yes"` and `prev_request` is set. The grant lives in new `TurnState` fields:
+
+| Field | Holds |
+|---|---|
+| `batch_total` | `min(n, [turn] max_batch)`, set by the first gated call of the grant turn (6.3) |
+| `batch_stop` | set by `report_run` on status != ok (running and queued included), a non-empty `check_this`, or any E12x; after that, new cells and retries get E123 (6.3) |
+| `rerun_plan` | the approved call's `then`; each accepted `nh_run(cell_id=rerun_plan[0])` pops the head (6.5) |
+| `rerun_stop` | set by a non-ok status or `check_this`; later re-runs get E123 (6.5) |
+| `rerun_stale` | the granted "re-run the stale cells" request (defined in 6.5) |
+
+- **Locking.** Every grant check and slot use happens inside `svc.locks.hold`.
+- **Headless** (`-p` / `NH_HEADLESS`): no yes can arrive, so E122 stands and the gate fails closed (6.4).
+- **Trust boundary.** The gateway trusts the hook-written record against a model that follows instructions; it is not an adversarial boundary. `file_guard` already denies `.nh/`, and `SHELL_NH_STATE_WRITE` (`_shared/patterns.py`) gains a Python `open('.nh/…','w'|'a')` pattern (6.6).
+
+**c. E110 exceptions** (D0 c). E110 gets exactly two explicit, gateway-enforced exceptions, each needing a grant from (b): an approved batch (6.3) and an approved re-run list (6.5). §0 states them from C2 on.
+
+**d. New codes** (D0 d; all grep-verified free at HEAD). Each gets a `docs/troubleshooting.md` row in its chunk.
+
+| Code | Meaning |
+|---|---|
+| E109 | No notebook change in an explain, plan or ask turn |
+| E122 | Needs the user's yes; Next = the exact question to ask |
+| E123 | Approved batch or re-run stopped at step k; report and wait |
+| E124 | Re-run list or order mismatch |
+| E125 | Code contains nh's `[redacted:` marker |
+| L011 | secret_print (hard) |
+| L012 | network (ask) |
+| L013 | outside_write (ask) |
+| L014 | secret_name (hint) |
+| D153 | Review timed out; partial report |
+| D154 | Flagged cells need a yes (exit 2) |
+| D155 | `--via server`: no JupyterLab |
+| D156 | Review kernel died |
+| D162 | nh_inspect allow rule missing |
+| D171 | Unknown preset level |
+| D172 | harness.toml not safely editable |
+
+The existing E102 gains the detail "nh missed this message; send it again" (6.1).
+
+**e. Config** (D9, D3, D4, D6)
+- **Precedence:** defaults < preset overlay < explicit `harness.toml` keys < `NH_*`.
+- **Preset overlay:** `comment_ratio` 8 for junior (today's default), 16 for senior. The budget is advisory; an explicit `[lint] comment_ratio` overrides it, and `[lint] mode = "strict"` makes it hard, as today. "preset" leaves `RESERVED_SECTIONS`, one definition shared by `config.py` and `doctor.py` (6.9).
+- **New keys:**
+
+| Key | Default | Values |
+|---|---|---|
+| `[preset] level` | `"junior"` | `junior` \| `senior`; any other value reads as junior with a config warning, and the doctor reports D171. `/nh:init` doesn't ask; `nhctl preset senior\|junior [--json]` edits it (6.9) |
+| `[turn] max_batch` | `5` | the most steps one approved batch runs (6.3) |
+| `[lint.rules]` level `ask` | — | joins `off` \| `hint` \| `error` in `config.load` validation; `LintReport` gains `asks` (6.4) |
+| `[guard] shell_install`, `network`, `outside_write`, `harness_toml` | `"ask"` | `ask` \| `warn` \| `off`; one parser covers them and `foreign_mcp` (6.6) |
+
+- **Rule keys:** `package_install` (L009) moves from error to ask; new `network` (L012) and `outside_write` (L013) are ask rules (6.4); `secret_print` (L011) and `secret_name` (L014) are defined in 6.7.
+
+**f. Model-facing text** (D0 e)
+- **INSTRUCTIONS** (`app.py`): 2017 → 1987 chars, cap 2048.
+  - Rule 1 adds "Only exception: a batch or re-run list the user approved when nh asked."
+  - Rule 5 is tightened (defined in 6.2).
+  - Rule 7 becomes "RUNNING or QUEUED… ask before re-running".
+  - Rule 9 adds "…or print env vars or credentials. Ask before installing packages or writing outside the project."
+  - Rule 10 and the pinned lines stay unchanged.
+- **Reminder** order: `[NO_PROMPT_ID]` + head + mode part + `drift_line` + `last_cell_line`. The mode parts are an explain part (6.2), an ask-turn part ("ask one question, write nothing") and an approved-batch part (6.3). `RULE` and `QA_REPORT` stay byte-identical.
+- **Explanation depth** for the preset goes in the SessionStart context, not the per-turn reminder (6.9).
+- **Skills:** new `skills/explain` (6.2), `skills/plan` (6.3) and `skills/review` (6.10). `skills/notebook/SKILL.md` stays ≤ 150 lines; detail moves to a new `reference/asks.md` and the existing `reference/planning.md`. The skill-set pin (`test_skill_files.py:118`) grows to six.
+- **Tools:** the count stays 5.
