@@ -30,8 +30,10 @@ CASES = sorted(p.parent for p in EVALS.glob("*/prompt.md"))
 NH_TOOLS = set(TOOL_DEFAULTS)
 NOT_TOOLS = {"nh_enabled"}  # `nhctl doctor --json` field named in the init skill
 
+# Mock expect regexes use `claude plugin eval`'s small dialect (no groups, few quantifiers), so the
+# title guard only checks one line of at most 80 characters; a grader checks the eight words.
 ADD_CELL_EXPECT = {
-    "title": r"/^\W*(?:\S+\s+){0,7}\S+\W*$/",
+    "title": r"/^[^\n]{1,80}$/",
     "intent": r"/\S/",
     "code": "string",
 }
@@ -233,7 +235,13 @@ def test_mocks_use_known_keys_and_the_planned_expect_guard():
             assert expect == ADD_CELL_EXPECT, mock
     title = re.compile(ADD_CELL_EXPECT["title"][1:-1])
     assert title.match("Load raw data and check schema")
-    assert not title.match("one two three four five six seven eight nine")
+    assert not title.match("Load raw data\nand check schema")
+    assert not title.match("x" * 81)
+    # The word count lives in note-shape's grader, whose regex has no dialect limits.
+    grader, _ = split_frontmatter(EVALS / "note-shape" / "graders" / "title-eight-words.md")
+    words = re.compile(grader["pattern"])
+    assert words.search('"title": "one two three four five six seven eight nine"')
+    assert not words.search('"title": "one two three four five six seven eight"')
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c.name for c in CASES])

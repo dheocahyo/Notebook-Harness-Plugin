@@ -1,6 +1,6 @@
 ---
 expect:
-  title: /^\W*(?:\S+\s+){0,7}\S+\W*$/
+  title: /^[^\n]{1,80}$/
   intent: /\S/
   code: string
 ---
