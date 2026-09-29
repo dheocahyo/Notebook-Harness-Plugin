@@ -344,6 +344,67 @@ def test_a_second_launch_in_one_message_is_denied(sandbox: Sandbox, turns: Turns
     assert launch(sandbox, prompt_id="p2", session_id="sess-2").stdout == ""
 
 
+# Design §6.2's text, pinned: the model reads it in place of a launch.
+WORKFLOW_MODE_REASON = (
+    "nh: this user message only asks to explain, plan or ask, so no cell is written in it. "
+    "Don't launch nh:qa-cell: answer in chat (a numbered walkthrough, the numbered plan or the "
+    "one question) and write nothing."
+)
+
+
+def assert_mode_denied(run: HookRun) -> None:
+    assert (run.returncode, run.decision, run.reason) == (0, "deny", WORKFLOW_MODE_REASON), (
+        run.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["explain the load cell", "/nh:explain [1]", "/nh:plan a churn model", "run the next 3"],
+)
+def test_an_explain_plan_or_ask_message_denies_the_launch(
+    sandbox: Sandbox, turns: Turns, message: str
+) -> None:
+    """Design §6.2: advisory, the gateway's E109 refuses the writer anyway."""
+    turns.prompt("p1", text=message)
+    assert_mode_denied(launch(sandbox, prompt_id="p1"))
+    turns.notification("note-1")  # an alias of p1: still p1's mode
+    assert_mode_denied(launch(sandbox, prompt_id="note-1"))
+    turns.prompt("p2", text="go")  # the next message has no mode
+    assert launch(sandbox, prompt_id="p2").stdout == ""
+
+
+def test_a_mode_typed_mid_message_denies_the_launch(sandbox: Sandbox, turns: Turns) -> None:
+    turns.prompt("p1", text="drop the rows with missing price")
+    assert launch(sandbox, prompt_id="p1").stdout == ""
+    turns.prompt("p1", text="explain what you will do first")  # absorbed into p1
+    assert_mode_denied(launch(sandbox, prompt_id="p1"))
+
+
+def test_the_mode_is_checked_before_one_run_per_message(sandbox: Sandbox, turns: Turns) -> None:
+    """Deny order (design §6.2): the mode, then one run per message. A message that had its
+    run and then turned explain hears "answer in chat", not "reply from its report"."""
+    turns.prompt("p1", text="drop the rows with missing price")
+    turns.workflow_launched("p1")
+    again = launch(sandbox, prompt_id="p1")
+    assert again.decision == "deny" and "already had its nh:qa-cell run" in again.reason
+    turns.prompt("p1", text="explain what it is doing")  # absorbed into p1
+    assert_mode_denied(launch(sandbox, prompt_id="p1"))
+
+
+def test_a_message_without_a_mode_launches_as_before(sandbox: Sandbox, turns: Turns) -> None:
+    for prompt_id, message in (("p1", "yes"), ("p2", "explain and fix the parse")):
+        turns.prompt(prompt_id, text=message)
+        assert launch(sandbox, prompt_id=prompt_id).stdout == "", message
+
+
+def test_other_workflows_pass_in_an_explain_message(sandbox: Sandbox, turns: Turns) -> None:
+    turns.prompt("p1", text="explain the load cell")
+    payload = sandbox.tool_payload("Workflow", {"name": "code-review", "args": "x"}, prompt_id="p1")
+    run = sandbox.run("PreToolUse", payload, tool_name="Workflow")
+    assert (run.returncode, run.stdout) == (0, "")
+
+
 def test_only_nhs_own_runs_use_up_the_message(sandbox: Sandbox, turns: Turns) -> None:
     turns.prompt("p1")
     turns.workflow_launched("p1", "wf_inline", launched_by="script")

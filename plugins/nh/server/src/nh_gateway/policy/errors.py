@@ -17,6 +17,12 @@ RETURN_TO_WORKFLOW = (
 )
 # Added after Next: to a refusal of a writer's tool call (E120 excepted: fix and call again).
 WRITER_LINE = "Writer: return this refusal to the workflow; don't retry or reply to the user."
+# E109's Next line, by the turn's mode (design §6.2): what to do in chat instead of writing.
+E109_NEXT = {
+    "explain": "Answer in chat with a numbered walkthrough; write nothing this message.",
+    "plan": "Reply with the numbered plan; write nothing this message.",
+    "ask": "Ask the user the one question; write nothing until they reply.",
+}
 
 CATALOGUE: dict[str, tuple[str, str]] = {
     # code: (first line, next step)
@@ -54,6 +60,10 @@ CATALOGUE: dict[str, tuple[str, str]] = {
         "Not {verb}: the nh:qa-cell workflow is writing this message's cell.",
         "Tell the user it is still writing and checking the cell; reply when its report arrives. "
         "To change course, stop it first.",
+    ),
+    "E109": (
+        "Not {verb}: no notebook change in an explain, plan or ask message.",
+        E109_NEXT["explain"],
     ),
     "E110": (
         "Not written (by design): one new cell per message, and this message's cell is {cell}.",

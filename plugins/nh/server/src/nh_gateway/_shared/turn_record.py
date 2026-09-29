@@ -150,6 +150,16 @@ def known(record: dict[str, Any] | None, prompt_id: str | None) -> bool:
     )
 
 
+def no_write_mode(record: dict[str, Any] | None, turn_id: str | None) -> str | None:
+    """The mode (explain, plan or ask) under which ``turn_id`` changes nothing in the notebook
+    (E109, design §6.2): the record's mode when ``turn_id`` is the record's turn, else None.
+    The gateway and the workflow guard pass the call's canonical turn."""
+    if record is None or not turn_id or turn_id != record.get("turn_id"):
+        return None
+    mode = record.get("mode")
+    return mode if mode in intent.MODES else None
+
+
 def running(record: dict[str, Any] | None, prompt_id: str | None) -> bool:
     """Whether a human message with ``prompt_id`` was typed into the running turn (spike V16:
     Claude Code resubmits that turn's prompt id). The running turn is the human turn itself,

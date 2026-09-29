@@ -106,8 +106,8 @@ as its review:
   "Kernel ≠ notebook" line names the variables): they keep their values until
   the kernel is rebuilt (select the last good cell, then Kernel → Restart
   Kernel and Run Up to Selected Cell). Name the later cells now outdated.
-- **explain**: walk through the cell in chat, quoting its code piece by piece.
-  Never write the explanation into the notebook; change nothing.
+- **explain** / `/nh:explain`: a numbered walkthrough in chat, quoting its code
+  piece by piece. Never in the notebook; change nothing unless asked (E109).
 - **tidy**: apply the readability hints with `nh_edit_cell`; this is the
   message's cell.
 

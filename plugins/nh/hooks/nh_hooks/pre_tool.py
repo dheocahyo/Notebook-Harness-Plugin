@@ -11,7 +11,8 @@ Variants (the second argument in hooks.json):
   code-execution tools get a decision.
 - ``workflow``: a launch of nh's qa-cell workflow (by its name ``nh:qa-cell``, or its script
   inline, by path or as a resume of one of its runs); denied when harness.toml asks to approve
-  each cell (its writer can't ask), from a subagent, or when this message already had a run.
+  each cell (its writer can't ask), from a subagent, in an explain, plan or ask message, or
+  when this message already had a run.
 """
 
 from __future__ import annotations
@@ -87,6 +88,11 @@ WORKFLOW_APPROVAL_REASON = (
 WORKFLOW_SUBAGENT_REASON = (
     "nh: only the main conversation launches the nh:qa-cell workflow. Return your findings "
     "to the main agent instead."
+)
+WORKFLOW_MODE_REASON = (
+    "nh: this user message only asks to explain, plan or ask, so no cell is written in it. "
+    "Don't launch nh:qa-cell: answer in chat (a numbered walkthrough, the numbered plan or the "
+    "one question) and write nothing."
 )
 WORKFLOW_AGAIN_REASON = (
     "nh: this user message already had its nh:qa-cell run (one per message). Reply from its "
@@ -302,6 +308,8 @@ def workflow_guard(layout: Layout, payload: Payload) -> Payload | None:
         return None
     record = turn_record.read(layout, session_id)
     turn = turn_record.canonical(record, text_field(payload, "prompt_id") or None)
+    if turn_record.no_write_mode(record, turn):  # design §6.2; the gateway's E109 enforces it
+        return deny(WORKFLOW_MODE_REASON)
     runs = turn_record.find_runs(layout, session_id)
     if turn and any(run.get("turn_id") == turn and turn_record.is_own_run(run) for run in runs):
         return deny(WORKFLOW_AGAIN_REASON)

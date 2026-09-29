@@ -37,6 +37,13 @@ If you change a contract, change it here first.
 - Name cells by title and `[n]`. Never use `nh-` ids or line numbers.
 - Tokens are never logged; `policy.errors.scrub` removes `token=`.
 
+**One new cell per user message (E110):**
+- It has exactly two exceptions, both enforced by the gateway (§6.0 c):
+  - an approved batch (§6.3);
+  - an approved re-run list (§6.5).
+- Each needs the user's yes to the question nh asked (the one-shot grant, §6.0 b). Nothing else lifts E110.
+- The batch is enforced from C6, the re-run list from C7. Until then E110 has no exception.
+
 ## 1. Already written (read these first)
 
 | File | What it defines |
@@ -558,7 +565,7 @@ Paths: gateway files are relative to `nh_gateway/`; `hooks/`, `scripts/nhctl/` a
 - **Headless** (`-p` / `NH_HEADLESS`): no yes can arrive, so E122 stands and the gate fails closed (6.4).
 - **Trust boundary.** The gateway trusts the hook-written record against a model that follows instructions; it is not an adversarial boundary. `file_guard` already denies `.nh/`, and `SHELL_NH_STATE_WRITE` (`_shared/patterns.py`) gains a Python `open('.nh/…','w'|'a')` pattern (6.6).
 
-**c. E110 exceptions** (D0 c). E110 gets exactly two explicit, gateway-enforced exceptions, each needing a grant from (b): an approved batch (6.3) and an approved re-run list (6.5). §0 states them from C2 on.
+**c. E110 exceptions** (D0 c). E110 gets exactly two explicit, gateway-enforced exceptions, each needing a grant from (b): an approved batch (6.3) and an approved re-run list (6.5). §0 states them from C2 on (done).
 
 **d. New codes** (D0 d; all grep-verified free at HEAD). Each gets a `docs/troubleshooting.md` row in its chunk.
 
@@ -598,7 +605,7 @@ The existing E102 gains the detail "nh missed this message; send it again" (6.1)
 - **Rule keys:** `package_install` (L009) moves from error to ask; new `network` (L012) and `outside_write` (L013) are ask rules (6.4); `secret_print` (L011) and `secret_name` (L014) are defined in 6.7.
 
 **f. Model-facing text** (D0 e)
-- **INSTRUCTIONS** (`app.py`): 2017 → 1987 chars, cap 2048.
+- **INSTRUCTIONS** (`app.py`): 2017 → 2017 chars, cap 2048 (the plan estimated 1987; 6.2 has the per-line counts).
   - Rule 1 adds "Only exception: a batch or re-run list the user approved when nh asked."
   - Rule 5 is tightened (defined in 6.2).
   - Rule 7 becomes "RUNNING or QUEUED… ask before re-running".
@@ -676,7 +683,7 @@ Chunk C1 (plan D0 a, D0 b storage, D1). Files: `_shared/intent.py` (new), `_shar
 | `turn_absorbed` (new) | `session_id`, `turn_id` (the running human turn; None for an orphan), `prompt_id` (the message's), `prompt_chars`, and the absorbed message's own `mode`, `request`, `answer` (its answer is logged, never applied). `nhctl metrics` doesn't count it as a turn |
 | `classify_failed` (new) | `session_id`, `turn_id` (as its `turn_open` or `turn_absorbed` event) |
 
-- **Reminder:** `[NO_PROMPT_ID]` + head + `last_cell_line` + `drift_line`, clipped at `REMINDER_MAX_CHARS` (400) as before. The head is `human_head(record, absorbed)`: `[RULE]` for a new turn, nothing for an absorbed message; C2 and C6 add their mode parts there, after `RULE`. With nothing to say (an absorbed message, no last cell, no drift) the hook prints nothing. C1 keeps v0.1's order of the last two parts; §6.0 f lists `drift_line` first, and the chunk that adds the first mode part settles it. `test_hook_prompt.py` pins the exact order (a new turn, an absorbed message, and which part the clip cuts), so a change to it is deliberate.
+- **Reminder:** `[NO_PROMPT_ID]` + head + `drift_line` + `last_cell_line`, clipped at `REMINDER_MAX_CHARS` (400) as before. The head is `human_head(record, absorbed)`: `[RULE]` for a new turn, nothing for an absorbed message; C2 and C6 add their mode parts there, after `RULE`. With nothing to say (an absorbed message into a turn with no mode part, no last cell, no drift) the hook prints nothing. C1 kept v0.1's order of the last two parts (`last_cell_line`, then `drift_line`); C2 settled it as §6.0 f lists it, `drift_line` first (6.2). `test_hook_prompt.py` pins the exact order (a new turn, an absorbed message, and which part the clip cuts), so a change to it is deliberate.
 
 **Ledger v2** (`policy/turn.py`)
 - `TurnLedger` saves `{"v": 2, "turns": {...}, "pending": <dict or null>}` and loads v1 (no pending) and v2. Every write, `save()` or a pending helper, keeps only the `KEEP_TURNS` (5) newest turns by `opened_at`.
@@ -705,7 +712,7 @@ Chunk C1 (plan D0 a, D0 b storage, D1). Files: `_shared/intent.py` (new), `_shar
 - Batch and re-run-stale grants (`answer == "yes"` with `prev_request`) and their `TurnState` fields are C6's and C7's (6.3, 6.5).
 
 **Fail-closed E102** (D1, `TurnGate.on_call_tool`)
-- Gate order after `_writer_turn` and E104: E102 for an orphan's turn (as §3.7), then D1, then v0.1's E102 for an older stamp (which also refuses an unknown id older than the record), then E108.
+- Gate order after `_writer_turn` and E104: E102 for an orphan's turn (as §3.7), then D1, then v0.1's E102 for an older stamp (which also refuses an unknown id older than the record), then E108. C2 inserts E109 before E108 (6.2).
 - **D1.** A main-conversation call (no `agent_id`), a turn record of a human message, and a stamp `prompt_id` the record doesn't know (`known()` is False):
 
 | Stamp | Refusal |
@@ -722,3 +729,111 @@ Chunk C1 (plan D0 a, D0 b storage, D1). Files: `_shared/intent.py` (new), `_shar
 - V16 found no false D1 hit: an absorbed message keeps the turn's prompt_id, and a new message's record is written before its first tool call. V16 typed into a turn a human message started; a turn a notification started is absorbed by the same rule (its prompt id is an alias, which `known()` accepts).
 
 **Tests:** `tests/unit/test_intent.py` (the classifier table, 60+ phrases), `tests/unit/test_turn_record.py`, `tests/unit/test_ledger.py` (v1 load, v2 save, pending, the `grant()` table), `tests/hooks/test_hook_prompt.py` (fields, `classify_failed`, mid-turn absorption; `RULE` and `QA_REPORT` pins unchanged), `tests/gateway/test_gateway.py` (D1), `tests/nhctl/test_metrics.py` (`turn_absorbed` is not a turn). `tests/fakes/turns.py` gains `Turns.prompt(prompt_id, session_id=None, text="…")`.
+
+### 6.2 Explain-only (FR-9)
+
+Chunk C2 (plan D2, D0 c, D0 e). Files: `policy/errors.py`, `app.py`, `_shared/turn_record.py`, `hooks/nh_hooks/pre_tool.py`, `hooks/nh_hooks/prompt_submit.py`, `skills/explain/SKILL.md` (new), `skills/notebook/SKILL.md`, `skills/notebook/reference/errors.md`, `skills/notebook/reference/replies.md`, `docs/troubleshooting.md`, both READMEs, and the eval cases `explain-only` and `slash-explain`. It is the first reader of the record's `mode` (6.1). The mode that 6.1's classifier sets, `explain`, `plan` or `ask`, means the same here for all three. So a `/nh:plan` message (C6's skill) and a "run next 3" message (C6's batch ask) are no-write turns from C2 on.
+
+**`no_write_mode(record, turn_id)`** (`_shared/turn_record.py`)
+- Returns the record's mode (`explain`, `plan` or `ask`) when `turn_id` is the record's `turn_id`.
+- Else None: no record, no turn, another turn, an orphan's None turn, a v1 record, or no mode.
+- The gateway and the workflow guard both pass the call's canonical turn (`canonical()`), so a notification's alias counts as its human turn.
+
+**E109** (`policy/errors.py`)
+- First line: "Not {verb}: no notebook change in an explain, plan or ask message." (`{verb}` as for E107/E108: written, run or undone). §6.0 d's "Meaning" becomes this line in the `Not {verb}:` shape of E107 and E108, and says "message" as the other user-facing refusals do.
+- Next: `E109_NEXT[mode]`, the turn's mode:
+
+| Mode | Next |
+|---|---|
+| `explain` | "Answer in chat with a numbered walkthrough; write nothing this message." |
+| `plan` | "Reply with the numbered plan; write nothing this message." |
+| `ask` | "Ask the user the one question; write nothing until they reply." |
+
+- A writer's E109 (below) takes `RETURN_TO_WORKFLOW` as its Next instead.
+
+**Main conversation** (`TurnGate.on_call_tool`)
+- A call is refused with E109 when all of these hold:
+  - no `agent_id` (the main conversation);
+  - `_is_write(name, args)`: `nh_add_cell`, `nh_edit_cell`, `nh_undo`, or `nh_run` in mode `run` (the default);
+  - a turn record exists, and the call's canonical turn is the record's `turn_id`;
+  - the record's `mode` is `explain`, `plan` or `ask`.
+- Allowed as before:
+  - `nh_inspect` (never gated);
+  - `nh_run` in mode `wait` or `interrupt`: they only follow a running cell;
+  - any call with no turn record (the `/nh:init` message);
+  - a turn with no mode, a "yes" or "go" turn included: E109 never outlives its message;
+  - a call of an earlier turn that got past E102 (a known id, 6.1): the record's mode belongs to the newer message.
+- **Gate order:** E105, E101, E106, `_writer_turn` (E103, E107, the writer's E109), E104, E102 for an orphan, D1's E102, v0.1's E102, **E109**, E108, then the tool.
+  - After E102: a missed or older message still gets "send it again" or "wait", which is the stronger answer.
+  - Before E108: an explain message typed while nh:qa-cell writes is told to answer in chat, not to wait for a report.
+- **Tighten-only.** The gate reads the mode at call time. A mode absorbed mid-turn (6.1) therefore refuses every later write of that turn, including a retry of a cell written before the message arrived. The cell itself stays: E109 only stops changes.
+
+**nh:cell-writer** (`_writer_turn`)
+- After the run checks (E103, E107): when the record's mode is `explain`, `plan` or `ask`, the writer's `nh_add_cell` and `nh_edit_cell` get E109 with Next `RETURN_TO_WORKFLOW` (so `_for_writer` adds no `WRITER_LINE`).
+- `nh_run` in mode `wait` passes, so the writer can still follow a cell it wrote before the mode arrived. Its other calls were already E103.
+- A run of an earlier turn still ends with E107.
+
+**Workflow launch** (`pre_tool.workflow_guard`, advisory)
+- Deny order: a subagent, `approve_before_run`, **the mode**, then one run per message.
+- The mode check: an nh:qa-cell launch is denied with `WORKFLOW_MODE_REASON` when its prompt's canonical turn is the record's `turn_id` (`canonical(record, prompt_id) == record["turn_id"]`) and the record's mode is `explain`, `plan` or `ask`. The reason reads: "nh: this user message only asks to explain, plan or ask, so no cell is written in it. Don't launch nh:qa-cell: answer in chat (a numbered walkthrough, the numbered plan or the one question) and write nothing."
+- Other launches are unchanged. The deny is advisory; the gateway's writer E109 is the enforcement.
+
+**Reminder** (`prompt_submit`)
+- **Order, settled here** (§6.0 f): `[NO_PROMPT_ID]` + head + `drift_line` + `last_cell_line`, clipped at 400. The clip now cuts the tail of `last_cell_line` first.
+- **Head:** `human_head(record, absorbed)` = `[RULE]` for a new turn (nothing for an absorbed message), then `mode_parts(record)`.
+- **Notification head:** `notification()` returns its first line (`QA_REPORT`, `QA_EARLIER` or `BACKGROUND`, each byte-identical), then `mode_parts` of the record it joins (`aliased()` keeps the mode). In an explain turn the writer's add got E109, so `QA_REPORT`'s "unless its writer wrote none" must not read as leave to write.
+- **`mode_parts(record)`:** `[EXPLAIN]` when the record's mode is `explain`, else nothing. This is the seam for C6: its ask-turn part (mode `ask`) and approved-batch part (`answer == "yes"` with `prev_request`) go here.
+- **`EXPLAIN`:** "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; change nothing."
+- **Cases:**
+
+| Message | Head |
+|---|---|
+| a new explain message | `RULE EXPLAIN` |
+| a message absorbed into a turn whose mode is now `explain` | `EXPLAIN` |
+| a background task's notification in a turn whose mode is `explain` | its first line, then `EXPLAIN` |
+| any other message | as in 6.1 |
+
+- `RULE`, `QA_REPORT` and `NO_PROMPT_ID` stay byte-identical.
+
+**Skill** `skills/explain/SKILL.md` (`/nh:explain`)
+- Frontmatter: `name: explain`, a description, `argument-hint`, `disable-model-invocation: true`, `allowed-tools: [mcp__plugin_nh_nh__nh_inspect]`.
+- Body:
+  - find the cell with `nh_inspect(view="outline")`, and read it with `view="cell"`. With no cell named: the last cell the reminder names or, when the clip cut that line (a long drift line comes first), the last code cell nh wrote (author `agent` or `agent*` in the outline);
+  - give a numbered walkthrough in chat, one line group at a time, quoting the code and the real values from its outputs;
+  - never write the explanation into the notebook, and change nothing (the gateway refuses with E109 when the message names no change; the rule holds either way);
+  - end by offering the next step;
+  - plain, junior-level depth by default. C9 adds the preset's depth line through SessionStart (6.9).
+- The skill doesn't enforce anything. `/nh:explain <text>` reaches UserPromptSubmit as its raw text (spike V1), so the classifier sets mode `explain` and E109 applies even if the skill never loads, as long as the text names no change verb (6.1: fix, change, add, update, rewrite, refactor, make, even as a noun).
+- With a change verb ("/nh:explain the add step", "/nh:explain how to make it faster") the message has no mode: no E109, and the reminder carries `RULE`, not `EXPLAIN`. Only the skill's "change nothing" guards it, so the explain skill says to change nothing either way, both READMEs say nh blocks changes unless the message names one, and `skills/notebook/SKILL.md` and `reference/replies.md` let an explain reply change something only when the message asks for it ("explain and fix …"). Making a leading `/nh:explain` always set mode `explain` would be a classifier change (plan D0 a), not C2's.
+- `skills/notebook/SKILL.md`: the **explain** reply names `/nh:explain`, the numbered walkthrough and E109. It stays at 150 lines.
+
+**INSTRUCTIONS** (`app.py`): 2017 → 2017 chars (cap 2048, 31 to spare).
+
+| Line | Chars before → after | Change |
+|---|---|---|
+| Rule 1 | 177 → 249 | adds "Only exception: a batch or re-run list the user approved when nh asked." (§0) |
+| Rule 5 | 191 → 173 | "named intermediate results" → "named intermediates"; "end with something visible to check" → "end with a visible check" |
+| Rule 7 | 305 → 217 | the same statuses and actions, in the reminder's short form: "RUNNING or QUEUED cell: tell the user, add nothing. Interrupted: ask before re-running or changing it. Deleted by the user: a no. Lost (kernel gone) or not run (the user typed into it first): tell the user and ask." |
+| Rule 9 | 132 → 166 | adds ", or print env vars or credentials" after ".ipynb files" (C4's L011 enforces it) |
+| Others | unchanged | rule 10 stays byte-identical (`test_qa_workflow.py`) |
+
+- Rules 1, 5 and 9 alone would reach 2105, over the cap. Rule 7 is the other line §6.0 f changes, so C2 tightens it to fit.
+- No explain clause: it wouldn't fit without cutting more. The reminder's `EXPLAIN` part and E109 carry the rule instead.
+
+**Docs:** an E109 row in `skills/notebook/reference/errors.md` and in `docs/troubleshooting.md`. `/nh:explain` goes in `plugins/nh/README.md` (Commands) and in the root README's review step.
+
+**Evals** (authored in C2, not run):
+- `explain-only`: "explain …" about cell [1] of the shared fixture;
+- `slash-explain`: the same ask as "/nh:explain …".
+- Both expect a numbered walkthrough in chat, with no `nh_add_cell`, `nh_edit_cell`, `nh_run` or `nh_undo` call and no `.ipynb` edit.
+
+**Tests:**
+- `tests/gateway/test_explain_only.py`: E109's first line and the three Next lines as literals; E109 for add, edit, run and undo in an explain turn, each with the right Next; wait and interrupt allowed (no refusal, their own machine line); plan and ask turns refused; the next plain turn allowed; a mid-turn explain refusing a later retry in the same turn; the mode keyed on the call's canonical turn (an explain turn's notification alias gets E109, an earlier turn's alias its own E110); the writer's E109 with its wait still allowed; add, run, edit and undo with no record allowed.
+- `tests/unit/test_turn_record.py`: the `no_write_mode` table.
+- `tests/gateway/test_gateway.py`: `test_known_ids_pass_d1` absorbs a plain message instead of an explain one, since an explain one now blocks the write it checks.
+- `tests/hooks/test_hook_workflow.py`: the mode deny (its reason pinned) in explain, plan and ask turns, for an alias and a mode typed mid-message; the mode checked before one run per message; other launches are allowed.
+- `tests/hooks/test_hook_prompt.py`: the new order and clip, the `EXPLAIN` pin, the absorbed-explain head, and a notification's head in an explain turn.
+- `tests/unit/test_skill_files.py`: the skill set gains `explain`; the explain skill's frontmatter; both cases' `nh_inspect` mocks match the real gateway's cell view byte for byte (their graders read its numbers); every §6.0 d code the gateway has gets its `errors.md` and `troubleshooting.md` rows.
+- INSTRUCTIONS pins (in `test_explain_only.py`): rules 1, 5, 7 and 9 as changed here, rules 1-10 in order, and at most 2048 chars.
+
+**Perf** (50 interleaved runs, d1cc942 vs C2 after its review, p50/p95 in ms; prompt-submit on an explain message, workflow on a plain message's launch): system 3.9 prompt-submit 117.4/125.7 → 117.5/127.4, workflow 121.2/132.1 → 119.9/129.2; server venv 3.13 prompt-submit 83.0/91.1 → 83.9/90.6, workflow 87.4/97.4 → 86.7/102.8. All under the 150 ms budget.

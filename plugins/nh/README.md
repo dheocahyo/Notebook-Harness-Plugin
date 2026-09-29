@@ -97,7 +97,7 @@ distinct values. On the uv path this takes under 10 minutes.
 | **go** | the proposed next cell |
 | **edit** … | changes that cell and re-runs it |
 | **undo** | removes the cell; tells you what is still in the kernel |
-| **explain** | walks through the cell in chat; the notebook stays as is |
+| **explain** … | walks through the cell step by step in chat; nh blocks notebook changes in that message unless it also names one ("fix", "add", "make", …) |
 | **tidy** | applies the readability hints to that cell |
 
 If a cell fails, the agent fixes it in place, at most twice, then explains the
@@ -109,6 +109,7 @@ error in plain words.
 |---|---|
 | `/nh:init` | set up a project in this folder, or adopt an existing notebook |
 | `/nh:status` | check every part of the setup, with fixes |
+| `/nh:explain [cell]` | a numbered walkthrough of a cell (the last one by default) in chat, changing nothing; nh enforces it unless the text names a change ("fix", "add", "make", …) |
 | `/nh:qa-cell <ask>` | one agent writes this message's cell, another QA-checks it (automatic under ultracode) |
 | `nhctl lab start`, `status`, `stop` | the project's JupyterLab |
 | `nhctl doctor` | the same checks as `/nh:status`, from a shell |

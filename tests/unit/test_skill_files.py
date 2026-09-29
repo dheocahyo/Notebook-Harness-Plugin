@@ -115,7 +115,7 @@ def is_model_invoked(front: dict) -> bool:
 
 
 def test_every_skill_has_name_and_short_description():
-    assert {path.parent.name for path in SKILLS} == {"notebook", "init", "status"}
+    assert {path.parent.name for path in SKILLS} == {"notebook", "init", "status", "explain"}
     for path in SKILLS:
         front, body = split_frontmatter(path)
         assert front["name"] == path.parent.name
@@ -143,6 +143,22 @@ def test_model_invoked_skills_preapprove_no_nh_write_tool_or_settings():
             ), rule
         if is_model_invoked(front):
             assert not [rule for rule in rules if any(tool in rule for tool in WRITE_TOOLS)], path
+
+
+def test_explain_skill_is_user_invoked_and_read_only():
+    """/nh:explain (design §6.2): typed by the user, inspect only, E109 guards the rest."""
+    front, body = split_frontmatter(PLUGIN / "skills" / "explain" / "SKILL.md")
+    assert front["name"] == "explain"
+    assert front["disable-model-invocation"] is True
+    assert front["allowed-tools"] == [TOOL_PREFIX + "nh_inspect"]
+    assert "/nh:explain" in front["description"]
+    assert "E109" in body and "numbered walkthrough" in body
+    for view in ('view="outline"', 'view="cell"'):
+        assert view in body
+    # E109 holds only when the message names no change (intent's change verbs), and the
+    # reminder's last-cell line can be clipped away: the skill says both (design §6.2).
+    assert "when the message names no change" in body and "the rule holds either way" in body
+    assert "if it names none, the last code cell nh wrote" in " ".join(body.split())
 
 
 def test_init_skill_follows_the_plan():
@@ -355,7 +371,20 @@ MOCK_SCENARIOS: dict[str, tuple[dict[str, str], list[tuple[str, str, dict[str, A
         {},
         [("p1", "nh_edit_cell", {"cell_id": "title", "code": "# Sales analysis"})],
     ),
+    "explain-only/mocks/nh/nh_inspect.md": (
+        {},
+        [("p1", "nh_inspect", {"view": "cell", "cell_id": FIXTURE_LOADER})],
+    ),
+    "slash-explain/mocks/nh/nh_inspect.md": (
+        {},
+        [("p1", "nh_inspect", {"view": "cell", "cell_id": FIXTURE_LOADER})],
+    ),
 }
+
+
+# `type: fixed` mocks whose graders check the real values in them (the explain cases' 43 rows,
+# 37 prices, 14% missing), so they must match the gateway byte for byte, not only in shape.
+EXACT_MOCKS = {"explain-only/mocks/nh/nh_inspect.md", "slash-explain/mocks/nh/nh_inspect.md"}
 
 
 def _plot_backend(project: Path):
@@ -485,6 +514,8 @@ async def test_mock_matches_the_real_gateway_result(name: str):
     front, body = split_frontmatter(mock)
     real = await run_mock_scenario(name)
     assert result_shape(body) == result_shape(real), f"{name} drifted from the gateway:\n{real}"
+    if name in EXACT_MOCKS:  # its graders read the numbers, which result_shape leaves out
+        assert body.strip() == real.strip(), f"{name} drifted from the gateway:\n{real}"
     assert bool(front.get("error")) == bool(re.search(r"^nh: E\d{3}", real, flags=re.MULTILINE))
 
 
@@ -561,7 +592,7 @@ def test_skill_rules_match_the_gateway_refusals():
     # base_sha is enforced for the user's cells (E144); markdown cells are refused (E145).
     assert "`base_sha` is REQUIRED" in skill and "E144" in skill
     assert "REQUIRED for a cell the user wrote" in tools_md
-    for code in ("E144", "E145", "E107", "E108"):
+    for code in ("E144", "E145", "E107", "E108", "E109"):
         assert f"| {code} |" in errors_md and f'"{code}"' in _read(GATEWAY / "policy" / "errors.py")
     # Inside nh:qa-cell only nh:cell-writer writes; the main conversation waits for its report.
     assert "nh:cell-writer` inside `nh:qa-cell` may" in skill
@@ -586,6 +617,19 @@ def test_skill_rules_match_the_gateway_refusals():
     for text in (skill, errors_md, tools_md, _read(REPO / "docs" / "harness-toml.md")):
         assert "L121" not in text and "intent_repeats_title" not in text
         assert "not a copy of the title" not in text
+
+
+def test_every_new_v02_code_in_the_gateway_is_documented():
+    """Design §6.0 d: each new code gets its rows in the chunk that adds it to the gateway."""
+    design = _read(REPO / "docs" / "design.md")
+    table = design.split("**d. New codes**", 1)[1].split("**e. Config**", 1)[0]
+    new_codes = re.findall(r"^\| (E\d{3}) \|", table, flags=re.MULTILINE)
+    assert "E109" in new_codes
+    errors_md = _read(NOTEBOOK_REFS / "errors.md")
+    troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
+    for code in [code for code in new_codes if code in CATALOGUE]:
+        assert f"| {code} |" in errors_md, code
+        assert f"| **{code}** " in troubleshooting, code
 
 
 def test_inspect_rows_default_is_the_configured_head_rows():

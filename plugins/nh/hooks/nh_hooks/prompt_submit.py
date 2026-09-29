@@ -1,8 +1,9 @@
 """UserPromptSubmit: open the turn for the gateway and remind Claude of the one-cell rule.
 
 Writes ``.nh/state/turns/<session>.json`` (a human message opens a new turn and closes the
-previous one) and adds a reminder of at most 400 characters: the last cell by title and [n]
-with its status, and whether the kernel still holds results the notebook no longer has.
+previous one) and adds a reminder of at most 400 characters: the one-cell rule and the
+message's mode part, whether the kernel still holds results the notebook no longer has, and
+the last cell by title and [n] with its status (design §6.2 settles the order).
 
 A background task's completion (a prompt made only of ``<task-notification>`` blocks) opens
 no turn: its prompt id becomes an alias of the open human turn, so it shares that message's
@@ -11,7 +12,9 @@ one cell, or an orphan with no turn when none is open. Its runs are marked as re
 A human message is classified (``intent.classify``: mode, request, answer; never its text).
 One typed while Claude works arrives with the running turn's prompt id (``turn_record.running``:
 the human turn's own, or a notification's alias): it opens no turn and only tightens the
-running one (``turn_record.absorbed``), so the reminder skips ``RULE``.
+running one (``turn_record.absorbed``), so the reminder skips ``RULE``. An explain message
+(or one absorbed into a turn that became explain, or a notification of such a turn) gets
+``EXPLAIN``: the gateway refuses its writes (E109).
 """
 
 from __future__ import annotations
@@ -35,6 +38,12 @@ NO_PROMPT_ID = (
     "to write. Ask the user to run `claude update` (2.1.196 or newer)."
 )
 RULE = "[nh] One new cell this turn; go/next/y = do the proposed step."
+EXPLAIN = (
+    "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; "
+    "change nothing."
+)
+# The reminder part for a turn's mode (design §6.2). C6 adds the ask-turn part here.
+MODE_PARTS = {"explain": EXPLAIN}
 QA_REPORT = (
     "[nh] The nh:qa-cell report for this message arrived (not a new user message): reply "
     "from it; write no new cell unless its writer wrote none."
@@ -65,16 +74,17 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
     prompt = payload.get("prompt")
     blocks = turn_record.notification_blocks(prompt) if isinstance(prompt, str) else None
     if blocks is not None:
-        head = [notification(layout, session_id, prompt_id, len(prompt), blocks, now)]
+        head = notification(layout, session_id, prompt_id, len(prompt), blocks, now)
     else:
         head = human_message(layout, session_id, prompt_id, prompt, now)
 
     last = read_json(layout.last_cell)
+    notebook = last.get("notebook") if isinstance(last, dict) else None
     parts = [NO_PROMPT_ID] if not prompt_id else []
     parts.extend(head)
-    parts.append(last_cell_line(last, now) or "")
-    notebook = last.get("notebook") if isinstance(last, dict) else None
+    # Drift before the last cell (design §6.2): the clip cuts the last cell's tail first.
     parts.append(drift_line(read_json(layout.drift_json), notebook) or "")
+    parts.append(last_cell_line(last, now) or "")
     text = clip(" ".join(part for part in parts if part))
     return context("UserPromptSubmit", text) if text else None
 
@@ -117,9 +127,18 @@ def human_message(
 
 def human_head(record: dict[str, Any] | None, *, absorbed: bool) -> list[str]:
     """The reminder's head for a human message: the one-cell rule for a new turn, nothing for
-    a message folded into the running turn (it has no budget of its own). The mode parts
-    (explain, ask, approved batch) go here, after RULE."""
-    return [] if absorbed else [RULE]
+    a message folded into the running turn (it has no budget of its own), then the turn's
+    mode parts."""
+    return ([] if absorbed else [RULE]) + mode_parts(record)
+
+
+def mode_parts(record: dict[str, Any] | None) -> list[str]:
+    """What the turn's record asks of this reply: ``EXPLAIN`` for an explain turn (a mode
+    absorbed mid-turn included), else nothing. The seam for C6's ask-turn part (mode ask)
+    and approved-batch part (a yes to the previous turn's request)."""
+    mode = record.get("mode") if record else None
+    part = MODE_PARTS.get(mode) if isinstance(mode, str) else None
+    return [part] if part else []
 
 
 def log_event(layout: Layout, now: float, event: str, **fields: Any) -> None:
@@ -133,11 +152,13 @@ def notification(
     prompt_chars: int,
     blocks: list[dict[str, Any]],
     now: float,
-) -> str:
+) -> list[str]:
     """Alias a background task's prompt to the open human turn (an orphan when none is open),
-    mark the runs it reports as done, and return the reminder's first line."""
+    mark the runs it reports as done, and return the reminder's head: its first line, then
+    the turn's mode parts, as for a message typed into it (in an explain turn nh:qa-cell's
+    writer wrote nothing, and the main agent may not either: E109, design §6.2)."""
     if not session_id:
-        return BACKGROUND
+        return [BACKGROUND]
     current = turn_record.read(layout, session_id)
     runs: list[dict[str, Any]] = []
     for block in blocks:
@@ -171,8 +192,12 @@ def notification(
     )
     qa_turns = [run.get("turn_id") for run in runs if turn_record.is_own_run(run)]
     if turn_id and turn_id in qa_turns:
-        return QA_REPORT
-    return QA_EARLIER if qa_turns else BACKGROUND
+        first = QA_REPORT
+    elif qa_turns:
+        first = QA_EARLIER
+    else:
+        first = BACKGROUND
+    return [first] + mode_parts(current)  # aliased() keeps the turn's mode
 
 
 def last_cell_line(last: Any, now: float) -> str | None:

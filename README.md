@@ -89,7 +89,9 @@ each column's type, nulls and distinct values. On the uv path this takes under
    different, the real numbers (surprises first), any failed attempts, and one
    proposed next cell.
 5. You review: **go** (the proposed cell), **edit …**, **undo**, **explain**
-   (a walkthrough in chat) or **tidy** (apply the readability hints).
+   (a numbered walkthrough in chat, also as `/nh:explain`; nh blocks notebook
+   changes in that message unless it also names one, such as "fix" or "add")
+   or **tidy** (apply the readability hints).
 
 If a cell fails, the agent fixes it in place, at most twice, then explains the
 error in plain words.

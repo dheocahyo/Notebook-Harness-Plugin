@@ -18,6 +18,10 @@ from tests.fakes.turns import notification_prompt
 pytestmark = needs_system_python
 
 RULE = "[nh] One new cell this turn; go/next/y = do the proposed step."
+EXPLAIN = (
+    "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; "
+    "change nothing."
+)
 
 
 def submit(sandbox: Sandbox, **fields):
@@ -427,7 +431,7 @@ def test_a_mid_turn_explain_sets_the_mode(sandbox: Sandbox) -> None:
     say(sandbox, "run the next 3", "p1")
     write_state(sandbox, "last_cell.json", last_cell())
     run = say(sandbox, "explain the fixed-width parse", "p1")
-    assert run.context.startswith('Last cell: "Drop rows with missing price" [14]')
+    assert run.context.startswith(f'{EXPLAIN} Last cell: "Drop rows with missing price" [14]')
     assert RULE not in run.context
     record = turn(sandbox)
     assert (record["mode"], record["request"]) == ("explain", BATCH3)
@@ -441,6 +445,22 @@ def test_a_mid_turn_explain_sets_the_mode(sandbox: Sandbox) -> None:
         "turn_absorbed",
         "turn_open",
     ]
+
+
+def test_a_notification_in_an_explain_turn_carries_the_explain_part(sandbox: Sandbox) -> None:
+    """Design §6.2: the writer's add got E109, so QA_REPORT's "unless its writer wrote none"
+    must not read as leave to write; EXPLAIN follows the first line, which stays pinned."""
+    say(sandbox, "load the sales data", "p1")
+    write_runs(sandbox, qa_run("wf_1", "p1", "toolu_launch"), qa_run("wf_0", "p0", "toolu_old"))
+    assert say(sandbox, "explain what it is doing", "p1").context == EXPLAIN  # absorbed
+    assert notify(sandbox, "note-1", tool_use_id="toolu_launch").context == f"{QA_REPORT} {EXPLAIN}"
+    assert notify(sandbox, "note-2", tool_use_id="toolu_old").context == f"{QA_EARLIER} {EXPLAIN}"
+    assert notify(sandbox, "note-3", tool_use_id="toolu_bash").context == f"{BACKGROUND} {EXPLAIN}"
+    say(sandbox, "go", "p2")  # the next message has no mode
+    assert notify(sandbox, "note-4", tool_use_id="toolu_bash").context == BACKGROUND
+    # A new explain message's own notifications carry it too.
+    say(sandbox, "/nh:explain [14]", "p3")
+    assert notify(sandbox, "note-5", tool_use_id="toolu_bash").context == f"{BACKGROUND} {EXPLAIN}"
 
 
 def test_a_mid_turn_message_keeps_prev_turn(sandbox: Sandbox) -> None:
@@ -549,26 +569,54 @@ def write_last_cell_and_drift(sandbox: Sandbox, names: dict | None = None) -> No
 
 
 def test_the_reminder_order_for_a_new_turn(sandbox: Sandbox) -> None:
+    """Design §6.2: [NO_PROMPT_ID] + RULE + the mode parts + drift + the last cell."""
     write_last_cell_and_drift(sandbox)
-    assert say(sandbox, "go", "p1").context == f"{RULE} {LAST_FAILING} {DRIFT_LINE}"
-    # With the missing-prompt-id warning first it runs past 400: the drift tail is clipped.
-    full = f"{NO_PROMPT_ID} {RULE} {LAST_FAILING} {DRIFT_LINE}"
+    assert say(sandbox, "go", "p1").context == f"{RULE} {DRIFT_LINE} {LAST_FAILING}"
+    # With the missing-prompt-id warning first it runs past 400: the last cell's tail is cut.
+    full = f"{NO_PROMPT_ID} {RULE} {DRIFT_LINE} {LAST_FAILING}"
     assert len(full) > 400
     assert say(sandbox, "go", None).context == full[:399].rstrip() + "…"
+
+
+def test_the_reminder_order_for_an_explain_turn(sandbox: Sandbox) -> None:
+    write_last_cell_and_drift(sandbox)
+    full = f"{RULE} {EXPLAIN} {DRIFT_LINE} {LAST_FAILING}"
+    assert len(full) <= 400  # every part fits: nothing is clipped
+    assert say(sandbox, "explain the plot", "p1").context == full
+    assert say(sandbox, "/nh:explain [14]", "p2").context == full
+    assert say(sandbox, "go", "p3").context == f"{RULE} {DRIFT_LINE} {LAST_FAILING}"
 
 
 def test_the_reminder_order_for_an_absorbed_message(sandbox: Sandbox) -> None:
     say(sandbox, "go", "p1")
     write_last_cell_and_drift(sandbox)
-    assert say(sandbox, "explain the plot", "p1").context == f"{LAST_FAILING} {DRIFT_LINE}"
+    context = say(sandbox, "explain the plot", "p1").context
+    assert context == f"{EXPLAIN} {DRIFT_LINE} {LAST_FAILING}"
+    # A plain message typed later in the same turn keeps the turn's explain part.
+    context = say(sandbox, "and the legend", "p1").context
+    assert context == f"{EXPLAIN} {DRIFT_LINE} {LAST_FAILING}"
 
 
-def test_the_clip_cuts_the_drift_tail_first(sandbox: Sandbox) -> None:
+def test_the_clip_cuts_the_last_cells_tail_first(sandbox: Sandbox) -> None:
+    names = {f"frame_{i}_{'x' * 22}": "x" for i in range(4)}
+    write_last_cell_and_drift(sandbox, names)
+    drift = (
+        f"Kernel ≠ notebook: {', '.join(reversed(names))} still hold results of undone cells "
+        "(as of nh's last check); suggest Kernel → Restart Kernel and Run Up to Selected Cell."
+    )
+    full = f"{RULE} {drift} {LAST_FAILING}"
+    assert len(f"{RULE} {drift} Last cell:") < 399 < len(full)
+    text = say(sandbox, "go", "p1").context
+    assert text == full[:399].rstrip() + "…"
+    assert text.startswith(f"{RULE} {drift} Last cell: ")
+
+
+def test_a_drift_line_too_long_for_the_room_is_cut_last(sandbox: Sandbox) -> None:
     write_last_cell_and_drift(sandbox, {f"frame_number_{i:02d}_{'x' * 40}": "x" for i in range(8)})
     text = say(sandbox, "go", "p1").context
     assert len(text) <= 400 and text.endswith("…")
-    assert text.startswith(f"{RULE} {LAST_FAILING} Kernel ≠ notebook: frame_number_07_")
-    assert "Restart Kernel" not in text
+    assert text.startswith(f"{RULE} Kernel ≠ notebook: frame_number_07_")
+    assert "Restart Kernel" not in text and "Last cell" not in text
 
 
 # --- in process: the hook module itself ----------------------------------------------------
@@ -592,6 +640,8 @@ def test_the_pinned_reminders_are_unchanged(prompt_submit: ModuleType) -> None:
     assert prompt_submit.QA_REPORT == QA_REPORT
     assert prompt_submit.REMINDER_MAX_CHARS == 400
     assert prompt_submit.NO_PROMPT_ID == NO_PROMPT_ID
+    assert prompt_submit.EXPLAIN == EXPLAIN
+    assert prompt_submit.MODE_PARTS == {"explain": EXPLAIN}
 
 
 def test_a_failing_classifier_still_opens_the_turn(

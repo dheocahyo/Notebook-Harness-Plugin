@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from nh_gateway._shared import intent
 from nh_gateway._shared import turn_record as tr
 from nh_gateway._shared.paths import Layout, atomic_write_json
 from tests.fakes.turns import notification_prompt
@@ -250,6 +251,35 @@ def test_known_ids() -> None:
     assert not tr.known(record, "p3")
     assert not tr.known(record, "") and not tr.known(record, None)
     assert not tr.known(None, "p2")
+
+
+def test_no_write_mode_is_the_records_mode_for_its_own_turn_only(layout: Layout) -> None:
+    """E109's key (design §6.2): the gateway and the workflow guard pass the call's canonical
+    turn; only the record's own turn gets its mode."""
+    for mode in intent.MODES:
+        record = tr.opened(SESSION, "p2", 2.0, tr.opened(SESSION, "p1", 1.0), classified(mode))
+        assert tr.no_write_mode(record, "p2") == mode
+        assert tr.no_write_mode(record, "p1") is None  # an earlier turn: not this mode
+        assert tr.no_write_mode(record, "p3") is None
+        assert tr.no_write_mode(record, "") is None and tr.no_write_mode(record, None) is None
+        # An alias is passed as its canonical turn, never as itself.
+        record = tr.aliased(record, "n1", 2.5)
+        assert tr.no_write_mode(record, tr.canonical(record, "n1")) == mode
+        assert tr.no_write_mode(record, "n1") is None
+    assert (
+        tr.no_write_mode(tr.opened(SESSION, "p1", 1.0, None, classified(answer="yes")), "p1")
+        is None
+    )
+    assert tr.no_write_mode(None, "p1") is None
+    assert tr.no_write_mode({"turn_id": "p1", "mode": "shout"}, "p1") is None
+    # An orphan's turn is None: no turn to match, whatever mode was typed into it.
+    orphan = tr.absorbed(tr.orphan(SESSION, "o1", 1.0), "o1", classified("explain"))
+    assert (
+        orphan["mode"] == "explain" and tr.no_write_mode(orphan, tr.canonical(orphan, "o1")) is None
+    )
+    # A v1 record has no mode.
+    write_record(layout, {"v": 1, "prompt_id": "p1", "ts": 1.0, "mode": "explain"})
+    assert tr.no_write_mode(tr.read(layout, SESSION), "p1") is None
 
 
 @pytest.mark.parametrize(

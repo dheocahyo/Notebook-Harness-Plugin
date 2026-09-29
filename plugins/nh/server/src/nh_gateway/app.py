@@ -27,7 +27,7 @@ from .config import ConfigCache
 from .history import HistoryStore
 from .log import EventLog
 from .policy import stamps
-from .policy.errors import RETURN_TO_WORKFLOW, WRITER_LINE, NhError, scrub
+from .policy.errors import E109_NEXT, RETURN_TO_WORKFLOW, WRITER_LINE, NhError, scrub
 from .policy.turn import CURRENT_TURN, NotebookLocks, TurnContext, TurnLedger
 from .state import DriftStore, StaleStore
 from .tools import inspect as inspect_tool
@@ -48,15 +48,15 @@ MISSED_NEXT = (
 
 INSTRUCTIONS = """\
 Notebook Harness (nh): you pair with a data scientist in their live Jupyter notebook. They watch cells appear in JupyterLab and must understand each one. The tools enforce these rules; when a tool refuses, follow its "Next:" line.
-1. One code cell per user message: nh_add_cell (new) or nh_edit_cell (existing). If its run fails, fix that same cell with nh_edit_cell (at most 2 times), then stop and explain.
+1. One code cell per user message: nh_add_cell (new) or nh_edit_cell (existing). If its run fails, fix that same cell with nh_edit_cell (at most 2 times), then stop and explain. Only exception: a batch or re-run list the user approved when nh asked.
 2. Broad asks ("build a churn model"): write no code. Reply with 5-12 numbered one-cell steps and ask which to start.
 3. Call nh_inspect before your first write in a session and whenever you need names, columns or dtypes you have not seen in a tool result.
 4. The only markdown is the note nh_add_cell builds from `title` (<=8 words: what the cell does) and `notes` (2-5 plain bullets: what and why). Never display Markdown/HTML or print prose from code.
-5. Readable, simple code: one idea per line, named intermediate results, plain pandas, UPPER_CASE constants for judgment calls, no functions until reused, end with something visible to check.
+5. Readable, simple code: one idea per line, named intermediates, plain pandas, UPPER_CASE constants for judgment calls, no functions until reused, end with a visible check.
 6. After every cell, reply with: what it did, why, judgment calls, the real numbers (surprises first), failed attempts, and one next step as a title the user can approve with "go". Name cells by title and [n]; never mention nh- ids or line numbers.
-7. If a cell is RUNNING or QUEUED (waiting behind a running cell), tell the user and add nothing. If it was interrupted, ask before re-running or changing it. If the user deleted it, take that as a no. If it was lost (the kernel went away) or not run (the user typed into it first), tell the user and ask.
+7. RUNNING or QUEUED cell: tell the user, add nothing. Interrupted: ask before re-running or changing it. Deleted by the user: a no. Lost (kernel gone) or not run (the user typed into it first): tell the user and ask.
 8. Undo: call nh_undo, then say which variables still hold undone results.
-9. Never Read, Write, Edit, NotebookEdit or Bash-modify .ipynb files. Ask before installing packages or writing outside the project.
+9. Never Read, Write, Edit, NotebookEdit or Bash-modify .ipynb files, or print env vars or credentials. Ask before installing packages or writing outside the project.
 10. When a reminder says ultracode is on, or on /nh:qa-cell, launch the nh:qa-cell workflow instead of writing; write nothing until its report arrives.
 Load the skill nh:notebook for the full rules."""
 
@@ -162,7 +162,8 @@ class TurnGate(Middleware):
     """Every write tool must present the stamp its PreToolUse hook wrote (plan §4.3). Fails closed.
 
     A subagent's stamp passes only for nh:cell-writer in an open nh:qa-cell run of the current
-    human message; while such a run is open, the main conversation's writes wait (E108).
+    human message; while such a run is open, the main conversation's writes wait (E108). An
+    explain, plan or ask message changes nothing (E109).
     """
 
     def __init__(self, runtime: _Runtime) -> None:
@@ -218,6 +219,11 @@ class TurnGate(Middleware):
             raise NhError("E102", detail=MISSED_DETAIL, next_step=MISSED_NEXT)
         if record and record["ts"] > stamp.ts and turn_id != record["turn_id"]:
             raise NhError("E102")
+        # E109 (design §6.2): an explain, plan or ask message changes nothing. After E102, so a
+        # missed or older message still hears "send it again" or "wait"; before E108.
+        mode = turn_record.no_write_mode(record, turn_id)
+        if not stamp.agent_id and mode and _is_write(name, args):
+            raise NhError("E109", next_step=E109_NEXT[mode], verb=_VERBS.get(name, "written"))
         if (
             not stamp.agent_id
             and _is_write(name, args)
@@ -249,7 +255,8 @@ class TurnGate(Middleware):
         record: dict[str, Any] | None,
     ) -> tuple[str, str]:
         """A subagent's call: only nh:cell-writer, working for an open nh:qa-cell run of the
-        current human message, may add, edit or wait. Returns (the run's turn, its run id)."""
+        current human message, may add, edit or wait; only wait when that message explains,
+        plans or asks (E109). Returns (the run's turn, its run id)."""
 
         def refuse(code: str, detail: str = "") -> NhError:
             verb = "waited" if name == "nh_run" else _VERBS.get(name, "written")
@@ -292,6 +299,8 @@ class TurnGate(Middleware):
             or turn_id != record["turn_id"]
         ):
             raise refuse("E107")
+        if _is_write(name, args) and turn_record.no_write_mode(record, turn_id):
+            raise refuse("E109")  # an explain, plan or ask message: the writer may only wait
         return turn_id, str(run["run_id"])
 
 
@@ -301,7 +310,8 @@ _VERBS = {"nh_add_cell": "written", "nh_edit_cell": "written", "nh_run": "run", 
 
 def _is_write(name: str, args: dict[str, Any]) -> bool:
     """Changes the notebook or runs a cell: E108 holds it while nh:qa-cell writes this turn's
-    cell. ``nh_run`` wait and interrupt only follow a running cell."""
+    cell, and E109 refuses it in an explain, plan or ask message. ``nh_run`` wait and interrupt
+    only follow a running cell."""
     if name == "nh_run":
         return (args.get("mode") or "run") not in ("wait", "interrupt")
     return name in _VERBS

@@ -206,7 +206,8 @@ async def test_known_ids_pass_d1(nh: Harness) -> None:
     assert not result.is_error, text(result)
     nh.turns.prompt("p2", text="yes")
     nh.turns.notification("note-2")
-    nh.turns.prompt("p2", text="explain the parse")  # typed mid-turn: absorbed, still p2
+    # Typed mid-turn: absorbed, still p2. No mode: an explain one would now be E109 (§6.2).
+    nh.turns.prompt("p2", text="also keep the region column")
     result = await nh.call("nh_add_cell", "note-2", **DROP)
     assert not result.is_error, text(result)
     later = await nh.call("nh_add_cell", "note-1", **dict(DROP, title="Late"))  # earlier alias
