@@ -170,6 +170,30 @@ async def test_e109_comes_before_e108(nh: Harness) -> None:
     assert_e109(await nh.call("nh_add_cell", "p1", **LOAD), "written")
 
 
+async def test_plan_permission_mode_comes_before_e109(nh: Harness) -> None:
+    """Gate order (design §6.2): E104 before E109, so plan mode keeps its own answer."""
+    await loaded(nh)
+    nh.turns.prompt("p2", text="explain the load cell")
+    nh.turns.stamp("nh_add_cell", DROP, "p2", permission_mode="plan")
+    result = await nh.client.call_tool("nh_add_cell", DROP, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E104" in body and "nh: E109" not in body, body
+    assert len(code_cells(nh)) == 1
+
+
+async def test_a_reported_writer_run_gets_e107_before_e109(nh: Harness) -> None:
+    """The writer's checks (design §6.2): E107 for a run already reported comes before the
+    writer's E109, even when an explain message was absorbed into its turn."""
+    nh.turns.prompt("p1", text="load the sales data")
+    nh.turns.workflow_launched("p1")
+    nh.turns.prompt("p1", text="explain what it is doing")  # absorbed into p1
+    nh.turns.notification("note-1")  # the run's completion: reported
+    result = await nh.turns.writer_call(nh.client, "w-1", RUN, "nh_add_cell", LOAD, "p1")
+    body = text(result)
+    assert result.is_error and "nh: E107" in body and "nh: E109" not in body, body
+    assert not code_cells(nh)
+
+
 async def test_the_writer_in_an_explain_message_may_only_wait(nh: Harness) -> None:
     nh.turns.prompt("p1", text="load the sales data")
     nh.turns.workflow_launched("p1")

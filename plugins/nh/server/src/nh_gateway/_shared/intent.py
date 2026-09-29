@@ -80,6 +80,10 @@ _WS = re.compile(r"\s+")
 _TRAILING = re.compile(r"[\s.!,;:…]+$")
 _PLAN = re.compile(r"/nh:plan(?![\w-])")
 _EXPLAIN = re.compile(r"(?:/nh:explain|explain)(?![\w-])")
+# What the explain row skips before its first word (design §6.1): quotes, brackets, markdown
+# (**, `, >, #, "- ", a code fence) and invisible characters (a BOM, a zero-width space). A
+# letter, digit or "_" starts the word, so "1. explain" and "_explain_" are no explain message.
+_LEAD = re.compile(r"^[^\w/]+")
 # Base forms only, as whole words ("-" and "_" join words): "fixed", "changes", "makes",
 # "add-on" and "make_features" are not change verbs.
 _CHANGE = re.compile(r"(?<![\w-])(?:fix|change|add|update|rewrite|refactor|make)(?![\w-])")
@@ -114,7 +118,7 @@ def classify(text: Any) -> dict[str, Any]:
         result["answer"] = "yes" if bare in YES else "no" if bare in NO else None
     if _PLAN.match(message):
         result["mode"] = "plan"
-    elif _EXPLAIN.match(message) and not _CHANGE.search(message):
+    elif _EXPLAIN.match(_LEAD.sub("", message)) and not _CHANGE.search(message):
         result["mode"] = "explain"
     else:
         request = _request(message)

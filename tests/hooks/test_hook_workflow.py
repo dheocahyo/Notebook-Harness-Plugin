@@ -392,6 +392,24 @@ def test_the_mode_is_checked_before_one_run_per_message(sandbox: Sandbox, turns:
     assert_mode_denied(launch(sandbox, prompt_id="p1"))
 
 
+def test_a_subagent_is_denied_before_the_mode(sandbox: Sandbox, turns: Turns) -> None:
+    """Deny order (design §6.2): a subagent first, so it hears why it may never launch."""
+    turns.prompt("p1", text="explain the load cell")
+    run = launch(sandbox, prompt_id="p1", agent_id="a1", agent_type="general-purpose")
+    assert run.decision == "deny" and "only the main conversation" in run.reason, run.stdout
+    assert run.reason != WORKFLOW_MODE_REASON
+
+
+def test_approve_before_run_is_checked_before_the_mode(sandbox: Sandbox, turns: Turns) -> None:
+    """Deny order (design §6.2): approve_before_run before the mode, as the setting holds for
+    every message."""
+    (sandbox.project / "harness.toml").write_text("[approval]\napprove_before_run = true\n")
+    turns.prompt("p1", text="explain the load cell")
+    run = launch(sandbox, prompt_id="p1")
+    assert run.decision == "deny" and "approve_before_run" in run.reason, run.stdout
+    assert run.reason != WORKFLOW_MODE_REASON
+
+
 def test_a_message_without_a_mode_launches_as_before(sandbox: Sandbox, turns: Turns) -> None:
     for prompt_id, message in (("p1", "yes"), ("p2", "explain and fix the parse")):
         turns.prompt(prompt_id, text=message)

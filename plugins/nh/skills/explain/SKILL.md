@@ -19,9 +19,12 @@ those calls (E109) when the message names no change (fix, change, add,
 update, rewrite, refactor, make, even as a noun); the rule holds either way.
 
 1. Find the cell: call `nh_inspect(view="outline")` and pick the cell the
-   user named by title or `[n]`. With no name, take the last cell the nh
-   reminder names or, if it names none, the last code cell nh wrote (author
-   `agent` or `agent*` in the outline). If two cells match, ask which one.
+   user named by title or `[n]` (a bare number means `[n]`, the execution
+   count, not the outline's row number). With no name, take the cell the
+   user's question is about, if any; else the last cell the nh reminder names
+   (a title it cut, ending in …, matches by prefix) or, if it names none, the
+   last code cell nh wrote (author `agent` or `agent*` in the outline), else
+   the last code cell that ran. If two cells match, ask which one.
 2. Read it: `nh_inspect(view="cell", cell_id=...)` gives its code, its note
    and its outputs. Call `nh_inspect(view="var", name=...)` only when a value
    the walkthrough needs is not in the outputs.

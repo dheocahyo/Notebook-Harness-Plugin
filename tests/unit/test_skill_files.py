@@ -19,6 +19,7 @@ import nbformat
 import pytest
 
 from nh_gateway import config, meta
+from nh_gateway._shared import intent
 from nh_gateway._shared.stamp_spec import TOOL_PREFIX
 from nh_gateway._shared.tool_defaults import TOOL_DEFAULTS, WRITE_TOOLS
 from nh_gateway.policy.errors import CATALOGUE
@@ -269,7 +270,10 @@ def test_eval_case_files(case: Path):
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-@pytest.mark.parametrize("case,cells", [("one-cell-per-turn", 3), ("undo-last", 5)])
+@pytest.mark.parametrize(
+    "case,cells",
+    [("one-cell-per-turn", 3), ("undo-last", 5), ("explain-only", 3), ("slash-explain", 3)],
+)
 def test_eval_scaffold_builds_a_consistent_project(tmp_path: Path, case: str, cells: int):
     subprocess.run(
         ["bash", str(EVALS / case / "scaffold.sh")],
@@ -558,6 +562,207 @@ def test_never_edits_ipynb_mock_refuses_markdown_edits_like_the_gateway():
     _, rubric = split_frontmatter(case / "graders" / "hands-back.md")
     assert "JupyterLab" in rubric and "already fixed" in rubric
     assert "used an nh tool" not in rubric
+
+
+# ------------------------------------------------------------------ the explain evals (design §6.2)
+
+EXPLAIN_CASES = ("explain-only", "slash-explain")
+EXPLAIN_GRADERS = {
+    "no-writes",
+    "walkthrough",
+    "numbered-steps",
+    "uses-real-numbers",
+    "no-read-ipynb",
+}
+# The weight-1 graders (design §6.2): any one of them failing in every run still passes.
+CHEAP_GRADERS = {"numbered-steps", "uses-real-numbers", "no-read-ipynb", "skill-registered"}
+
+
+def _ci_threshold() -> float:
+    command = next(
+        line
+        for line in _read(REPO / ".github" / "workflows" / "ci.yml").splitlines()
+        if "claude plugin eval" in line
+    )
+    # With no ablation there are no arms, so `arm: with-only` graders are scored too.
+    assert "--ablation none" in command, command
+    found = re.search(r"--threshold (\S+)", command)
+    assert found, command
+    return float(found.group(1))
+
+
+def _weights(case: str) -> dict[str, int]:
+    weights: dict[str, int] = {}
+    for grader in sorted((EVALS / case / "graders").glob("*.md")):
+        weight = split_frontmatter(grader)[0].get("weight", 1)
+        assert isinstance(weight, int) and weight > 0, grader
+        weights[grader.stem] = weight
+    return weights
+
+
+def _case_score(weights: dict[str, int], runs: list[set[str]]) -> float:
+    """`claude plugin eval`'s score: a run's passed weight over its total, a case's mean over its
+    runs. Each run is the set of graders it fails."""
+    total = sum(weights.values())
+    passed = [sum(w for name, w in weights.items() if name not in failed) for failed in runs]
+    return sum(p / total for p in passed) / len(runs)
+
+
+@pytest.mark.parametrize("case", EXPLAIN_CASES)
+def test_explain_grader_weights_fail_a_write_and_pass_a_small_miss(case: str):
+    """A write fails the case even in one run of three with a perfect reply; so does a judge
+    that fails every run, or a reply that only inspects. One cheap miss, or one judge fail in
+    three runs, still passes."""
+    weights, threshold = _weights(case), _ci_threshold()
+    extra = {"skill-registered"} if case == "slash-explain" else set()
+    assert set(weights) == EXPLAIN_GRADERS | extra
+    assert {weights[name] for name in set(weights) & CHEAP_GRADERS} == {1}
+
+    def passes(*runs: set[str]) -> bool:
+        return _case_score(weights, list(runs)) >= threshold
+
+    ok: set[str] = set()
+    idle = {"walkthrough", "numbered-steps", "uses-real-numbers"}  # inspected, explained nothing
+    assert passes(ok, ok, ok)
+    assert not passes({"no-writes"}, ok, ok)
+    assert not passes({"walkthrough"}, {"walkthrough"}, {"walkthrough"})
+    assert not passes(idle, idle, idle)
+    assert passes({"walkthrough"}, ok, ok)
+    for grader in sorted(set(weights) & CHEAP_GRADERS):
+        assert passes({grader}, {grader}, {grader}), grader
+
+
+def _mock_call(tool: str, tool_input: dict[str, Any], spaced: bool) -> str:
+    """One line of the mock_calls target: JSON.stringify of the call (compact, raw unicode)."""
+    record = {"tool": TOOL_PREFIX + tool, "input": tool_input, "output": "ok", "verdict": "ok"}
+    if spaced:
+        return json.dumps(record, ensure_ascii=False)
+    return json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("case", EXPLAIN_CASES)
+@pytest.mark.parametrize("spaced", [False, True])
+def test_no_writes_finds_every_write_call_and_nothing_else(case: str, spaced: bool):
+    spec, _ = split_frontmatter(EVALS / case / "graders" / "no-writes.md")
+    assert (spec["type"], spec["target"], spec["match"]) == ("regex", "mock_calls", "not_contains")
+    pattern = re.compile(spec["pattern"])
+    inspect = _mock_call("nh_inspect", {"view": "outline"}, spaced)
+    # A read whose input quotes a write call: the quotes are escaped, so it is no call.
+    quoting = _mock_call(
+        "nh_inspect", {"view": "var", "name": f'"tool":"{TOOL_PREFIX}nh_run"'}, spaced
+    )
+    assert not pattern.search("\n".join([inspect, quoting]))
+    for tool in WRITE_TOOLS:
+        assert pattern.search("\n".join([inspect, _mock_call(tool, {"cell_id": "c"}, spaced)])), (
+            tool
+        )
+
+
+WALKTHROUGH = (
+    "Here's what **Load raw data and check schema** does:\n\n"
+    "1. **`import pandas as pd`**: loads pandas.\n"
+    "2. **`df = pd.read_csv(DATA_PATH)`**: reads the CSV into `df`, 43 rows.\n"
+    "3. **`df.info()`**: `price` has 37 non-null values, so 6 (14%) are missing.\n\n"
+    "Next step, if you want it: drop the rows with no price."
+)
+NUMBERED_GOOD = [
+    WALKTHROUGH,
+    "**1. Import**\n**2. Path**\n**3. Read** the csv",
+    "1) a\n2) b\n3) c",
+    "  1. a\n  2. b\n  3. c",
+    "Step 1: a\nStep 2: b\nStep 3: c",
+    "**Step 1.** a\n**Step 2.** b\n**Step 3.** c",
+    "### 1. a\n### 2. b\n### 3. c",
+    "**1** a\n**2** b\n**3** c",
+    "### Step 1 — a\n### Step 2 — b\n### Step 3 — c",
+    "**Step 1** — a\n**Step 3** — c",
+    "Step 1 - a\nStep 3 - c",
+    "#### **1. a**\n#### **3. c**",
+    "- 1. a\n- 2. b\n- 3. c",
+    "1 – a\n2 – b\n3 – c",
+    "STEP 3: c",
+    "1. a\r\n2. b\r\n3. c",
+]
+NUMBERED_BAD = [
+    "The cell imports pandas, sets the path, reads 43 rows and prints the shape.",
+    "I can't change anything in an explain message. The cell has 43 rows.",
+    "Price:\n3.5% smaller than last year",
+    "It ran in\n2023.",
+    "There are\n3 rows missing",
+    "Step 30: nothing",
+    "\n3.5 dollars on average",
+    "uses pandas v3.2",
+    "there are 3 steps in this cell",
+    "\n3-4 rows are dropped",
+]
+
+
+@pytest.mark.parametrize("case", EXPLAIN_CASES)
+def test_numbered_steps_reads_a_list_not_a_number(case: str):
+    spec, _ = split_frontmatter(EVALS / case / "graders" / "numbered-steps.md")
+    assert spec["flags"] == "i"  # the CLI's JS flag, Python's IGNORECASE
+    pattern = re.compile(spec["pattern"], re.IGNORECASE)
+    assert [text for text in NUMBERED_GOOD if not pattern.search(text)] == []
+    assert [text for text in NUMBERED_BAD if pattern.search(text)] == []
+
+
+def _init_line(skills: list[str]) -> str:
+    """The trace's init line (compact JSON, as `claude -p --output-format stream-json` writes it)."""
+    record = {"type": "system", "subtype": "init", "slash_commands": skills, "skills": skills}
+    return json.dumps(record, separators=(",", ":"))
+
+
+def test_skill_registered_reads_the_init_skill_list():
+    """A `-p` trace never holds the expanded /nh:explain text (checked on a kept 2.1.284 trace),
+    so the case checks that the skill is registered: the init line's skills list names
+    nh:explain. A reply quoting that list is JSON-escaped in the trace, so it can't match."""
+    grader = EVALS / "slash-explain" / "graders" / "skill-registered.md"
+    spec, _ = split_frontmatter(grader)
+    assert (spec["type"], spec["target"], spec["arm"]) == ("regex", "trace", "with-only")
+    pattern = re.compile(spec["pattern"])
+    manifest = json.loads(_read(PLUGIN / ".claude-plugin" / "plugin.json"))
+    front, _ = split_frontmatter(PLUGIN / "skills" / "explain" / "SKILL.md")
+    name = f"{manifest['name']}:{front['name']}"
+    assert pattern.search(_init_line(["nh:qa-cell", name, "nh:init"]))
+    assert not pattern.search(_init_line(["nh:qa-cell", "nh:init"]))
+    assert not pattern.search(_init_line(["nh:qa-cell", name + "er"]))
+    reply = {"type": "assistant", "text": _init_line(["nh:qa-cell", name])}
+    assert not pattern.search(json.dumps(reply, separators=(",", ":")))
+
+
+@pytest.mark.parametrize("case", EXPLAIN_CASES)
+def test_walkthrough_judge_gets_the_cells_whole_output(case: str):
+    """The judge sees only the last message, so its rubric carries the cell's output: then a real
+    number the PASS line doesn't list (the 25 order dates) isn't taken for an invented one."""
+    _, rubric = split_frontmatter(EVALS / case / "graders" / "walkthrough.md")
+    mock = _read(EVALS / case / "mocks" / "nh" / "nh_inspect.md")
+    outputs = mock.split("--- outputs ---\n", 1)[1]
+    assert outputs.strip() and outputs in rubric
+    assert "invents numbers the output below doesn't show" in rubric
+
+
+def test_explain_texts_name_the_classifiers_change_verbs():
+    """Only these verbs lift an explain message's E109 (design §6.1), so the texts list them all;
+    and the plain-explain path's only text, the notebook skill, says the whole reply contract."""
+    found = re.search(r"\(\?:([a-z|]+)\)", intent._CHANGE.pattern)
+    assert found, intent._CHANGE.pattern
+    verbs = ", ".join(found.group(1).split("|"))
+    assert verbs == "fix, change, add, update, rewrite, refactor, make"
+    docs = [
+        NOTEBOOK_REFS / "replies.md",
+        NOTEBOOK_REFS / "errors.md",
+        REPO / "docs" / "troubleshooting.md",
+    ]
+    assert [p for p in docs if verbs not in _read(p)] == []
+    notebook = " ".join(_read(PLUGIN / "skills" / "notebook" / "SKILL.md").split())
+    for phrase in (
+        "Explain-only message: no cell (see **explain** below)",
+        "`nh_inspect` it, then a numbered walkthrough in chat",
+        "with the real values from its output; end by proposing one next step, not taken",
+        "change nothing unless it names a change verb (E109)",
+    ):
+        assert phrase in notebook, phrase
+    assert "Any other change it asks for" in _read(NOTEBOOK_REFS / "replies.md")
 
 
 def test_kernel_signals_the_skill_names_are_emitted_by_the_gateway():

@@ -37,8 +37,7 @@ Read dumps every output. Hooks block those paths; don't look for workarounds.
   workflow writes and checks the cell: [reference/qa-workflow.md](reference/qa-workflow.md).
 
 ## Tools
-Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections:
-[reference/tools.md](reference/tools.md).
+Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections: [reference/tools.md](reference/tools.md).
 
 | Tool | Use it to | Cost |
 |---|---|---|
@@ -50,7 +49,7 @@ Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections:
 
 ## The turn (every user message)
 1. Decide whether the ask fits one cell: one step the user can check from its
-   output. If not, see "Big asks".
+   output. If not, see "Big asks". Explain-only message: no cell (see **explain** below).
 2. Inspect what you need.
 3. Call `nh_add_cell` once, with:
    - `title`: what the cell does, at most 8 words, plain text.
@@ -106,8 +105,9 @@ as its review:
   "Kernel ≠ notebook" line names the variables): they keep their values until
   the kernel is rebuilt (select the last good cell, then Kernel → Restart
   Kernel and Run Up to Selected Cell). Name the later cells now outdated.
-- **explain** / `/nh:explain`: a numbered walkthrough in chat, quoting its code
-  piece by piece. Never in the notebook; change nothing unless asked (E109).
+- **explain** / `/nh:explain`: no cell. `nh_inspect` it, then a numbered walkthrough in chat
+  quoting its code piece by piece with the real values from its output; end by proposing
+  one next step, not taken. Never in the notebook; change nothing unless it names a change verb (E109).
 - **tidy**: apply the readability hints with `nh_edit_cell`; this is the
   message's cell.
 

@@ -54,7 +54,7 @@ Always:
 | a new instruction | the cell stands; handle the new ask |
 | edit … / change … | `nh_edit_cell` on that cell; this is the message's cell |
 | undo | `nh_undo`; reply as below |
-| explain, `/nh:explain` | a numbered walkthrough in chat, quoting the code piece by piece: what each part does and why, with the real values from its output. Read-only: at most `nh_inspect`; nh refuses any change (E109) unless the message also asks for one ("explain and fix …": that fix is the message's cell) |
+| explain, `/nh:explain` | a numbered walkthrough in chat, quoting the code piece by piece: what each part does and why, with the real values from its output; end by proposing one next step without taking it. Read-only: at most `nh_inspect`; nh refuses any change (E109) unless the message names a change verb (fix, change, add, update, rewrite, refactor, make; "explain and fix …": that fix is the message's cell). Any other change it asks for ("… and drop them"): propose it as the next step |
 | tidy | apply the readability hints with `nh_edit_cell`; this is the message's cell |
 | retry, run again | `nh_run` on that cell; it uses the message's cell |
 

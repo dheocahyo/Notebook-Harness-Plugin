@@ -47,6 +47,27 @@ TABLE: list[tuple[str, dict[str, Any]]] = [
     ("explain-like-i'm-five the merge", NONE),
     ("please explain the merge", NONE),  # only a message that starts with it
     ("can you explain the merge?", NONE),
+    # lead marks before the first word are skipped for explain (design §6.1): a miss fails open
+    ('"explain cell 3"', EXPLAIN),
+    ("'explain cell 3'", EXPLAIN),
+    ("“explain cell 3”", EXPLAIN),
+    ("`explain` cell 3", EXPLAIN),
+    ("**Explain** cell 3", EXPLAIN),
+    ("*explain*", EXPLAIN),
+    ("> explain cell 3", EXPLAIN),
+    ("(explain cell 3)", EXPLAIN),
+    ("[explain] cell 3", EXPLAIN),
+    ("- explain", EXPLAIN),
+    ("#explain", EXPLAIN),
+    ("```\nexplain cell 3\n```", EXPLAIN),
+    ("﻿explain cell 3", EXPLAIN),  # a BOM
+    ("​explain cell 3", EXPLAIN),  # a zero-width space
+    (' "/nh:explain" 3', EXPLAIN),
+    ("`explain` is null in 30% of rows; drop those rows", EXPLAIN),  # a false hit fails safe
+    ('"explain and fix it"', NONE),  # the change verb still counts
+    ("1. explain", NONE),  # a digit starts a word
+    ("_explain_ cell 3", NONE),  # so does "_"
+    ('"/nh:plan" run next 3', batch(3)),  # plan is the typed command only
     # plan
     ("/nh:plan", PLAN),
     ("/nh:plan clean the sales data", PLAN),

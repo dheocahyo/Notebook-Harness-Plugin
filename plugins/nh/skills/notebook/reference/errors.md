@@ -71,7 +71,7 @@ but E120 to the workflow instead of asking the user. The most common:
 | E106 | Claude Code too old for turn tracking | suggest `claude update` |
 | E107 | the nh:qa-cell run is done, the user sent a new message since it started, or it started over an hour ago | the writer returns the refusal to the workflow; it doesn't retry |
 | E108 | the nh:qa-cell workflow is writing this message's cell | reply when its report arrives; write nothing. To change course, stop it first |
-| E109 | the message only asks to explain, plan or ask ("explain …", `/nh:explain`, `/nh:plan`, "run next 3"), so nh changes no cell in it; a mode typed mid-message holds for the rest of it | do what `Next:` says: a numbered walkthrough, the numbered plan or the one question, in chat. nh:cell-writer returns the refusal to the workflow |
+| E109 | the message is explain-only ("explain …" or `/nh:explain` naming no change verb: fix, change, add, update, rewrite, refactor, make), a `/nh:plan`, or a "run next 3" ask, so nh changes no cell in it; a mode typed mid-message holds for the rest of it | do what `Next:` says: a numbered walkthrough, the numbered plan or the one question, in chat. nh:cell-writer returns the refusal to the workflow |
 | E110 | one new cell per message; this message's cell exists | reply with the remaining steps as a numbered list; ask which next |
 | E111 | out of retries | explain with the template above; offer undo |
 | E112 | the cell already ran OK this message | report and wait; changes wait for the next message |
