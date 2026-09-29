@@ -10,6 +10,7 @@ from typing import Any
 
 from common import PLUGIN_ROOT, Payload, context, setting, settings
 
+from nh_gateway._shared import secrets
 from nh_gateway._shared.paths import Layout, read_json
 
 GOAL_MAX_CHARS = 200
@@ -23,7 +24,9 @@ LAB_NOT_FOUND = (
 
 def handle(layout: Layout, payload: Payload) -> Payload | None:
     config = settings(layout)
-    goal = " ".join(str(setting(config, "project", "goal", "")).split())
+    # The project's redactor (design §6.8): the goal before its cut, then the whole context.
+    redactor = secrets.install(secrets.Redactor.for_project(layout.project))
+    goal = " ".join(redactor.redact(str(setting(config, "project", "goal", ""))).split())
     notebook = str(setting(config, "project", "notebook", "")).strip()
     facts = []
     if goal:
@@ -44,7 +47,7 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
         "them from Bash: notebooks change only through the nh tools. Never edit .nh/ (nh's own "
         "state); settings live in harness.toml.",
     ]
-    return context("SessionStart", "\n".join(line for line in lines if line))
+    return context("SessionStart", redactor.redact("\n".join(line for line in lines if line)))
 
 
 def lab_status(lab: Any, project: str) -> str:

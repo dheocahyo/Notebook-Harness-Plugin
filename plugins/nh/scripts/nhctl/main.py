@@ -30,11 +30,14 @@ import metrics  # noqa: E402
 import scaffold  # noqa: E402
 import settings  # noqa: E402
 
+from nh_gateway._shared import secrets  # noqa: E402
+
 
 class Parser(argparse.ArgumentParser):
     """Usage errors become a JSON object too when --json was asked for."""
 
     def error(self, message: str) -> None:  # type: ignore[override]
+        message = common.scrub(message)  # it echoes the arguments (design §6.8)
         if "--json" in sys.argv[1:]:
             error = {"code": "D100", "message": message, "fix": f"See: {self.prog} --help"}
             sys.stdout.write(json.dumps({"ok": False, "error": error}) + "\n")
@@ -64,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The environment's secrets until a command finds its project (design §6.8).
+    secrets.install(secrets.Redactor.for_project(None))
     args = build_parser().parse_args(argv)
     as_json = getattr(args, "json", False)
     try:
@@ -73,8 +78,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         result = common.error_result(common.NhctlError("D198", "Interrupted."))
     except Exception as exc:
-        if os.environ.get("NHCTL_DEBUG"):
-            traceback.print_exc()
+        if os.environ.get("NHCTL_DEBUG"):  # Claude reads stderr too: redacted (§6.8)
+            sys.stderr.write(common.scrub(traceback.format_exc()))
         message = common.scrub(f"nhctl hit an internal error: {type(exc).__name__}: {exc}")
         fix = "Run again with NHCTL_DEBUG=1 for the traceback."
         result = common.error_result(common.NhctlError("D199", message, fix))

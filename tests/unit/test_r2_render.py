@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
+from nh_gateway._shared import secrets
 from nh_gateway.render import headline, next_block, selfcheck
-from tests.unit.test_render import frame, payload
+from tests.unit.test_render import PASSWORD, frame, payload, scalar
 
 SALES = ["price", "qty", "region"]
 
@@ -104,3 +107,19 @@ def test_changed_values_are_reported():
 def test_next_block_capitalises_an_untitled_label():
     text = next_block("error", retries_left=1, waits_left=2, cell="the cell `x = y` [3]")
     assert text.startswith("The cell `x = y` [3] failed.")
+
+
+# design §6.8: a changed value is reported with both reprs redacted
+@pytest.fixture
+def installed(tmp_path):
+    (tmp_path / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    secrets.install(secrets.Redactor.for_project(tmp_path, {}))
+
+
+def test_a_changed_secret_value_is_redacted_on_both_sides(installed):
+    before = payload(api=scalar("old-value", "str"), key=scalar(PASSWORD, "str"))
+    after = payload(api=scalar(PASSWORD, "str"), key=scalar(PASSWORD + "-rotated", "str"))
+    lines, _ = selfcheck(before, after, code="api = key; key = rotate(key)")
+    assert "api: 'old-value' → '[redacted:DB_PASSWORD]'" in lines
+    assert "key: '[redacted:DB_PASSWORD]' → '[redacted:DB_PASSWORD]-rotated'" in lines
+    assert not any(PASSWORD[:6] in line for line in lines)

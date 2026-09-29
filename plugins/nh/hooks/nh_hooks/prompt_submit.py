@@ -26,7 +26,7 @@ from typing import Any
 
 from common import Payload, context, text_field
 
-from nh_gateway._shared import intent, turn_record
+from nh_gateway._shared import intent, secrets, turn_record
 from nh_gateway._shared.paths import Layout, append_jsonl, atomic_write_json, read_json
 
 REMINDER_MAX_CHARS = 400
@@ -77,6 +77,9 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
         head = notification(layout, session_id, prompt_id, len(prompt), blocks, now)
     else:
         head = human_message(layout, session_id, prompt_id, prompt, now)
+    # The project's redactor (design §6.8), after the turn record is written so a failure here
+    # can't cost the gate its record: cell titles and the reminder, before any cut.
+    redactor = secrets.install(secrets.Redactor.for_project(layout.project))
 
     last = read_json(layout.last_cell)
     notebook = last.get("notebook") if isinstance(last, dict) else None
@@ -85,7 +88,7 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
     # Drift before the last cell (design §6.2): the clip cuts the last cell's tail first.
     parts.append(drift_line(read_json(layout.drift_json), notebook) or "")
     parts.append(last_cell_line(last, now) or "")
-    text = clip(" ".join(part for part in parts if part))
+    text = clip(redactor.redact(" ".join(part for part in parts if part)))
     return context("UserPromptSubmit", text) if text else None
 
 
@@ -215,7 +218,7 @@ def last_cell_line(last: Any, now: float) -> str | None:
 
 
 def cell_label(title: Any, execution_count: Any) -> str:
-    label = " ".join(title.split()) if isinstance(title, str) else ""
+    label = " ".join(secrets.current().redact(title).split()) if isinstance(title, str) else ""
     if len(label) > TITLE_MAX_CHARS:
         label = label[: TITLE_MAX_CHARS - 1].rstrip() + "…"
     label = f'"{label}"' if label else "untitled cell"

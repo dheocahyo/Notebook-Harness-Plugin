@@ -80,6 +80,7 @@ but E120 to the workflow instead of asking the user. The most common:
 | E115, E116 | undo or wait limit reached | tell the user; stop |
 | E117 | the cell was stopped before it finished (interrupted), so nh asks before changing or re-running it | say what ran before it stopped; ask whether to re-run it, change it or leave it; wait |
 | E118 | the user typed into nh's cell before it ran, so nothing ran and nh asks before running or changing it | show the user their change; ask whether to run it as it is, restore nh's version (`nh_undo`) or leave it; wait |
+| E125 | the code holds nh's `[redacted:…]` marker: nh shows you secrets that way, never their values | read the value from the environment (`os.environ["NAME"]`) without printing it, or ask the user to edit that line in JupyterLab; never retype the marker. If the hidden value is no secret, nh hid it for its name: tell the user they can rename or unset it in `.env` |
 | E130, E131 | no project JupyterLab, or one without collaboration | ask the user to run `nhctl lab start`; `nh_inspect` still works |
 | E132 | notebook not found | pass `notebook=` with a candidate from the message |
 | E133 | kernel busy (a cell is running, or nh's cell is RUNNING or QUEUED) | wait, or `nh_run(mode="wait")` for nh's own cell; add nothing |

@@ -198,7 +198,7 @@ def strip_ansi(text: str) -> str
 def shape_outputs(outputs: list[dict], *, max_chars: int, max_images: int, image_max_px: int,
                   save_dir: Path | None) -> Shaped
 def summarize_outputs(outputs: list[dict]) -> OutputSummary    # cheap: no base64 decoding
-def redact(text: str) -> str               # FR-14 seam: identity in v0.1
+def redact(text: str) -> str               # FR-14: secrets.current().redact from v0.2 (§6.8)
 def prune_outputs_dir(save_dir: Path, max_files: int = 200, max_bytes: int = 50 * 2**20) -> None
 ```
 Mime preference: `error`, then `text/plain`, then `text/markdown`, `text/latex`, then images (`image/png`, `image/jpeg`), then `text/html`. HTML becomes text only when there is no `text/plain`; tables become TSV via `html.parser`. Then `application/json` (compact), Plotly as `[plotly figure: N traces]`, widgets as `[widget]`, SVG as `[SVG figure omitted]`. `\r` progress bars keep the text after the last `\r` on each line. Consecutive streams with the same name are coalesced.
@@ -511,8 +511,8 @@ Paths: gateway files are relative to `nh_gateway/`; `hooks/`, `scripts/nhctl/` a
 | 6.4 | Cell approvals: package install, network, outside writes | D4 | C5 |
 | 6.5 | Multi re-run | D5 | C7 |
 | 6.6 | Native dialog hooks | D6 | C8 |
-| 6.7 | Secret lint rules (L011, L014, E125) | D7 | C4 |
-| 6.8 | Redaction of what Claude sees | D8 | C3 |
+| 6.7 | Secret lint rules (L011, L014) | D7 | C4 |
+| 6.8 | Redaction of what Claude sees, and E125 | D8 | C3 |
 | 6.9 | Junior/senior presets | D9 | C9 |
 | 6.10 | /nh:review | D10 | C10 |
 | 6.11 | `nhctl fresh-run --via server` | D11 | C11 |
@@ -837,3 +837,177 @@ Chunk C2 (plan D2, D0 c, D0 e). Files: `policy/errors.py`, `app.py`, `_shared/tu
 - INSTRUCTIONS pins (in `test_explain_only.py`): rules 1, 5, 7 and 9 as changed here, rules 1-10 in order, and at most 2048 chars.
 
 **Perf** (50 interleaved runs, d1cc942 vs C2 after its review, p50/p95 in ms; prompt-submit on an explain message, workflow on a plain message's launch): system 3.9 prompt-submit 117.4/125.7 → 117.5/127.4, workflow 121.2/132.1 → 119.9/129.2; server venv 3.13 prompt-submit 83.0/91.1 → 83.9/90.6, workflow 87.4/97.4 → 86.7/102.8. All under the 150 ms budget.
+
+### 6.8 Redaction of what Claude sees (FR-14) and E125
+
+Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `exec/shaping.py`, `exec/docsafe.py`, `render.py`, `tools/common.py`, `tools/write.py`, `tools/inspect.py`, `policy/errors.py`, `app.py`, `backend/rtc_backend.py`, `hooks/nh_hooks/prompt_submit.py`, `hooks/nh_hooks/session_start.py`, `hooks/nh_hooks/main.py`, `scripts/nhctl/common.py`, `scripts/nhctl/freshrun.py`, `scripts/nhctl/main.py`, `skills/notebook/reference/errors.md`, `docs/troubleshooting.md`, `spikes/v0.2/v11_redaction.py` and `spikes/RESULTS.md`. FR-14 says credentials never reach Claude through nh. C4's lint rules (6.7) stop code that prints them; this section covers what gets printed anyway. The notebook keeps the raw text; only what nh shows Claude, and what nh writes for Claude to read, is redacted.
+
+**The Redactor** (`_shared/secrets.py`: Python 3.9, stdlib only, shared by the gateway, the hooks and nhctl)
+- `Redactor.for_project(root)` takes its values from three sources. When two sources hold the same value, the first name wins.
+
+| Source | Redacted when | Marker |
+|---|---|---|
+| The project's `.env` (`parse_env`) | A secret-shaped name with a value of 8+ chars. Any other name with 16+ chars, unless its last part names a place, an address or a label (`LENGTH_EXEMPT_LAST`: PATH, DIR, FILE, FOLDER, NAME, ROOT, BUCKET, HOST, URL, USER, DB, SCHEMA, PROJECT, REGION, WAREHOUSE and the like) and no part says the value carries a secret (`SECRET_BEARING_PARTS`: WEBHOOK, HOOK, DSN, SAS, SIGNED, PRESIGNED). Never a weak value | `[redacted:NAME]` |
+| The process environment | A secret-shaped name with 8+ chars, never a weak value (PWD and OLDPWD are the shell's directories, never secrets) | `[redacted:NAME]` |
+| Jupyter tokens | JUPYTER_TOKEN and NH_JUPYTER_TOKEN in the env (8+), and the token `rtc_backend` discovers (`add_value("JUPYTER_TOKEN", token)`) | `[redacted:JUPYTER_TOKEN]` |
+
+- **Why 16 for other names.** Spike V11's 8-char rule redacted REGION=eu-west-1 (9 chars), which hid a region name in every output. DEBUG=true and DATA_PATH=data/raw.csv stay visible either way.
+- **Why the place and label exemption.** A long DATA_DIR, PROJECT_ROOT, S3_BUCKET or MLFLOW_TRACKING_URI would hide the path in every traceback, and a URL's password is caught by the `url-userinfo` pattern anyway. SLACK_WEBHOOK_URL and SENTRY_DSN are still redacted: the value is the secret.
+- **Weak values** (`is_weak_value`, `WEAK_VALUES`) are never redacted as values, from any source, whatever the name says:
+  - a well-known local default or placeholder word: postgres, changeme, minioadmin, localhost, notebook and the like;
+  - the value of its own name, or one of its parts (POSTGRES_PASSWORD=postgres);
+  - the user's login name (`$USER`, `$LOGNAME`, `$USERNAME`);
+  - a placeholder (`<your-key-here>`, `${X}`, `{pw}`, `%(pw)s`, `***`) or one repeated character (`xxxxxxxxxxxx`).
+  Redacting POSTGRES_PASSWORD=postgres hid every "postgresql" in code and outputs. The patterns still catch a URL's userinfo either way.
+- **`parse_env`** is a small stdlib parser. It handles:
+  - `export`, blank lines and `#` comments;
+  - single quotes, taken literally;
+  - double quotes with the `\n \r \t \\ \"` escapes, spanning lines;
+  - an unquoted value's ` #` comment.
+  A value holding a quote, a backslash or a control character is also redacted in its escaped form, as `cat .env` or `json.dumps` shows it. That goes for `.env` and environment values alike.
+- **Secret-shaped names** (`is_secret_name`, `SECRET_NAME_PARTS`, `SECRET_PAIRS`; C4's L014 reuses them). A name is split on `_`, `-`, `.` and camelCase into lowercase parts. It matches when:
+  - one part is secret, password, passwd, passphrase, passkey, pwd, mysqlpwd, token, credential(s), apikey, accesskey, secretkey or privatekey, or ends in password, passwd or passphrase (PGPASSWORD);
+  - two adjacent parts are basic, http or proxy followed by auth (BASIC_AUTH), or api, access, secret, private, auth, signing, encryption, account or master followed by key;
+  - the last part is pass or pw (DB_PASS, SMTP_PASS, MYSQL_PW), unless the part before says it's a pass over data (`NOT_PASSWORD_BEFORE`: FIRST_PASS, NUM_PASS);
+  - the last part is pat after a code host (`PAT_BEFORE`: GITHUB_PAT, HF_PAT);
+  - the last part is key after any part but a lookup-key word (`NOT_SECRET_KEY_BEFORE`: STRIPE_KEY and OPENAI_KEY match; SORT_KEY, PRIMARY_KEY, PARTITION_KEY and RNG_KEY don't). `key` alone doesn't.
+  It never matches when there are several parts and the last is file, path, dir, url, uri, name, id(s), count, len, length or size (JUPYTER_TOKEN_FILE, SECRET_NAME, token_ids): those name something about a secret, not the secret. tokens, tokenizer, author, keyboard, PAT, auth and AUTH_MODE don't match.
+- **Patterns.** Each is marked `[redacted:<kind>]`, and only the secret part is replaced, so `scheme://`, `@host`, `token=` and `Bearer ` stay visible.
+  - **Keyed patterns** (`token`, `password`, `secret`, `key`, `authorization`) read `key=value`, `key = "value"` (spaced only with a quoted value: `token = tokenizer.eos_token` is code), `"key": value`, and `\"key\": \"value\"` inside a JSON string, in any case. A bare value is `[^&\s"'<>]+`, never ending in `, ; ) ] } .` or `\` (the text around it: `f(token=abc)`, `"token=abc."`).
+  - **Never a secret**, quoted or not: None, null, nil, true, false, nan, undefined; a marker, or one a view cut (`[redacted…`); a placeholder (`{x}`, `${X}`, `%(x)s`, `%s`); no letter or digit (`***`, `...`); a tokenizer's special token (`[PAD]`, `[CLS]`).
+  - **Code, not a secret** (a bare value outside a URL's query): an attribute (`tokenizer.eos_token`), a name of its own kind (`token=hf_token`, `password=db_password`), a call or subscript (`getpass()`, `os.environ[`), and a short name passed on in code: letters and `_` only, one case, under 16 chars, followed by `)`, `,` or `}` (`f(token=hf)`, `{"token": tok}`).
+
+| Kind | Matches | Left alone |
+|---|---|---|
+| `url-userinfo` | `scheme://user:password@`, redacting `user:password` | A placeholder password: `{password}`, `${DB_PASS}`, `%(pw)s`, `***` |
+| `token` | Any key ending in `token` (`token=`, `access_token=`, `HF_TOKEN = "…"`, `"token": "…"`), a quoted value being one word. A credential key (`access_`/`refresh_`/`id_`/`auth_`/`api_`/`bearer`/`session`/`csrf`/`oauth`/`github`/`gh`/`hf`/`slack`/`bot`/`jwt`/`client`/`private`/`secret`/`personal`/`app`/`service`/`security` + `token`) takes any quoted word. A URL query's `?token=`, `&access_token=` (and the other fixed query keys) takes any value; a number only with 6+ digits | A number (`max_token=512`, `"token": 2003`); a quoted word under 12 chars under a plain token key, an NLP token (`{"token": "the"}`); a quoted phrase (`{"token": "New York"}`); `"bos_token": "<s>"` |
+| `password` | `password`, `passwd` and `passphrase` keys (`DB_PASSWORD = "…"`, `PGPASSWORD=…`, `"passphrase": "…"`, `?password=`). A quoted value runs to its closing quote on the same line: a passphrase may hold spaces | `password=None`, `password=db_password`, `getpass()` |
+| `secret` | `secret` keys (`client_secret=…`, `SECRET = "…"`, `"secret": "…"`, `?client_secret=`), quoted the same way | `secret=None`, `secret=os.environ[` |
+| `key` | A key whose whole name is secret-shaped (`api_key=`, `STRIPE_KEY = "…"`, `"apiKey": "…"`, `X-Api-Key: …`, `?api_key=`), with a value of 8+ chars holding a digit, as key material has | A bare `key`; a lookup key (`sort_key`, `partition_key`); a number; `${API_KEY}`; `key=value12345678` |
+| `authorization` | `Authorization: token\|Bearer\|Basic …`, and `authorization="…"`, JSON-escaped too | `f"Bearer {token}"` |
+| `aws-key` | `AKIA`/`ASIA` followed by 16 capitals or digits, as a whole word | `xAKIA…` |
+| `private-key` | `-----BEGIN … PRIVATE KEY-----` through its END line. With no END line within 16 KB (a cut key): the key-shaped characters after it, up to 8 KB | Public keys, certificates |
+| `github-token` | `ghp_`, `gho_`, `ghu_`, `ghs_` or `ghr_` followed by 20+ letters and digits; `github_pat_` followed by 20+ | Inside a longer word |
+| `api-key` | `sk-` or `sk-ant-…` followed by 20+ chars of `[A-Za-z0-9_-]` that include a digit | `sk-learn-compatible-estimators`, `task-…`, `x-sk-…` |
+| `slack-token` | `xoxa-`, `xoxb-`, `xoxp-` or `xoxr-` followed by 10+ | Inside a longer word |
+
+- **Cut pieces.** The kernel cuts long values before nh sees them: reprlib keeps a head and a tail, pandas shortens columns to `…`, and docsafe drops the head of a long stream. So a secret-named value or Jupyter token of 16+ chars is also redacted in these cut forms:
+  - 12+ chars of its start, right before `...`, `…` or the end of the text;
+  - 12+ chars of its end, right after `...`, `…`, a newline or the start of the text.
+  This only runs on texts of up to 2 MB. nh's own stream cut (docsafe, below) never leaves such a piece.
+- **One pass, longest first.** Every value (found with `str.find`), cut piece and pattern is located on the original text. Overlapping spans merge into one marker, named after the heaviest span in the group: the longest value (a pattern weighs nothing), and among equals the first to start, then the longest. A value holding `[` or `]` is looked for again, up to three times, since a marker next to it can complete it (`[redacted:A]]x`). The output never contains an input value. It is idempotent: a marker is never matched again. Nothing else is shortened or dropped.
+- **`redact_head(text, limit)`**, for callers that then cut at `limit`, redacts a window of `text` and doesn't scan the rest. The window starts at `limit + margin` chars, where margin = max(1024, the longest value + 1), and doubles until its redacted form still reaches `limit + margin` (markers are shorter than what they replace) or it holds the whole text. So a secret that crosses the cut is replaced whole, and the window's own raw edge stays past the caller's cut.
+- **docsafe's cuts start at a boundary** (`docsafe.snap_cut`). When docsafe drops the head of a stream too long for the notebook, or of a traceback line over `BUNDLE_MAX_CHARS`, the cut moves forward to the next newline, else whitespace, else one of `,;"'&<>()[]{}`, looking at most min(4096, `STREAM_KEEP_CHARS`/2) chars past it. A cut mid-token would keep a tail no pattern matches (`…E3r4T5` of a GitHub token, the end of a plain-named value). The window depends only on the kept text, so each flush still only appends.
+- **Caching and install**
+  - `for_project` caches one Redactor per root. It is rebuilt when the `.env` changes (mtime_ns, size), when the qualifying env values or the login name change, or when a value is added.
+  - `install(r)` and `current()`:
+    - the gateway installs `for_project(project)` in `_Runtime.services()`, on the first build and again on every later call (a cache hit costs one `stat`);
+    - nhctl installs one for its project in each command;
+    - the hooks build one for the event's project.
+  - Before anything is installed, `current()` is patterns-only, never the identity.
+  - `add_value` rebuilds the installed Redactor.
+
+**Wiring.** Each site redacts before it cuts.
+
+| Site | What is redacted |
+|---|---|
+| `shaping.redact`, which delegates to `secrets.current().redact`, called by `_clean` | Every stream; every text/plain, markdown, LaTeX and JSON body; each error's name, value and traceback frames. This covers the shaped text and the full copy under `.nh/outputs`, which is joined from the already-redacted sections: `_write_once` makes no second pass, and `_save_originals` writes image bytes untouched |
+| `shaping._html_to_text` | HTML markup over 1 MB: `redact_head` runs before the 1 MB cut |
+| `shaping.summarize_outputs` | The error summary, and `text_head`: `_first_line` redacts `text[:4000 + margin]` before cutting |
+| `docsafe.output_summary` | The error (160 chars) and `text_head` (200 chars): `redact_head`, then the cut. The outline, the turn summaries and `nh_run(mode="wait")` read these ("Nothing is running: … failed with …" is built from this summary, and `text_result` redacts it again) |
+| `docsafe._cap_one` | Nothing itself: its cuts start at a boundary (`snap_cut`, above) |
+| `render.error_summary`, `render.cell_label`, `render._short`, `render._describe`, `render._diff` | The text before each cut: error summaries (`redact_head`), the label's title and first code line, and the scalar reprs; then each name summary and change line whole (`@_redacted`), so the var view and run reports |
+| `write._error_lines` | The failing code line. The error summary goes through `render` |
+| `inspect._clip`, `_first_line`, `_status_lines` | Every view's whole text before its clip: the cell view (source, notes, outputs), the var view (head, text), outline rows, and status (env.json values, backend URLs) |
+| `tools.common.text_result` | Every tool result's text: the last safety net |
+| `policy.errors.scrub`, which delegates to `current().redact` | Every NhError message (including E141's diffs), the event log (`log.py`), E199's message (before its 300-char cut), the gateway's logging filter (each message, its traceback and its `stack_info`), and the backends' error texts |
+| `app._Runtime.services` | Nothing itself: it installs the project's Redactor, from the first call on |
+| hooks: `prompt_submit` | The last cell's label (its title before the cut), then the whole reminder before its 400-char clip (the notebook's name, the status, the drift names) |
+| hooks: `session_start` | The goal before its 200-char cut, then the whole context |
+| hooks: `main.log_failure` | The traceback written to `hooks.log` |
+| nhctl: `common.scrub`, which delegates to the installed Redactor (`main` installs the environment's, `project_root` the project's) | D151's log tail, lab and envsync echoes, every printed error (D199) and its `NHCTL_DEBUG=1` traceback on stderr, usage errors (D100, which echo their arguments), and `print_result`: everything nhctl prints, text or `--json` (each string in the data before `json.dumps` escapes it, `scrub_data`, then the whole line), as the last safety net |
+| nhctl: `freshrun` | `failing_report`: the failing cell's name and evalue (the runner, which runs in the project env without nh's code, hands back 8,000 raw chars; nhctl redacts with `redact_head`, then cuts to 500); `cell_label`: the title, or the first code line before its 39-char cut; and the reason line |
+| `rtc_backend._server` | Nothing itself: it passes the discovered token to `add_value`, so the token is redacted everywhere |
+
+- Code shown to Claude is redacted: the cell view, labels and the failing code line. `nh_edit_cell`'s `base_sha` and every comparison run on the raw source.
+- Review files (plan D8's "nhctl … review files") arrive with `/nh:review` in C10, which writes them through `common.scrub`.
+
+**Kept raw.** These are either not shown to Claude by nh or have to stay exact:
+- RTC writes and the `.ipynb`: the user's notebook holds what the kernel printed.
+- The history store and undo: undo restores the exact cell.
+- Every sha and comparison: `base_sha`, `review_earlier_cells`, pending keys (sha256, never text), the writer checks, and E141's check for a user change.
+- Image base64 and bytes (`_take_image`, `_save_originals`): never scanned (V11).
+- The ledger: it holds only turn state and sha256 keys, never output text.
+
+**E125** (`policy/errors.py`, `tools/write.py`)
+- First line: "Not written: the code holds nh's [redacted:…] marker, not the real value."
+- Next: "Read the value from the environment without printing it, or ask the user to edit that line in JupyterLab."
+- `nh_add_cell` and `nh_edit_cell` (the main conversation's and the writer's) check `code` for `[redacted:` along with the other argument checks. The check comes after the turn checks and before the notebook is resolved, before lint, and before any lock or write. Title, notes and intent aren't checked: they are prose and never run.
+- A writer's E125 gets `WRITER_LINE`. It doesn't count as a lint reject (E121).
+- The raw value is never restored on edit (plan default 8). Claude never sees the value, so it can't write it back.
+- E125 is in `CATALOGUE`, so C2's doc-row test requires its `errors.md` and `troubleshooting.md` rows.
+
+**Performance**
+- **Rule:** one pass per text.
+  - Values are found with `str.find`.
+  - Every pattern starts with a literal, so the regex engine skips ahead at C speed (a leading lookbehind made a regex about 40 times slower, and one alternation of anchors about 13 times slower than separate scans).
+  - The case-sensitive ones (`aws-key`, `github-token`, `api-key`, `slack-token`, PEM) are scanned with `search`, the word-boundary check done in Python.
+  - The keyed ones run with `finditer` on one lowercased copy of the text with the same offsets (`_fold`: İ, the only character whose lowercase is longer, becomes "i" first). Every skip rule is inside the regex, so a benign hit (`max_token=512`, `{"token": "the"}`, `token=tokenizer.eos_token`) never reaches Python. Python 3.9's `re` has no atomic groups or possessive quantifiers, so the code rules use a lookahead's capture matched again by reference, `(?=(?P<x>…))(?P=x)`, which is never backtracked into. Only the case-dependent checks (`_code_word`, `key`'s name) run in Python, on the hits.
+  - The userinfo regex is bounded (256 chars of user, 512 of password), so it never runs away on a long line.
+  - The keyed regexes are compiled the first time a text holds their literal (`token`, `pass`, `secret`, `key`, `authorization`), not at import: a hook runs in a fresh process, and compiling all five took ~8 ms on Python 3.9, which pushed session-start's p95 to 150 ms.
+  - Image base64 and bytes are never scanned, the full copy gets no second pass, and head-only sites use `redact_head`.
+- **Budget:** turn overhead p95 ≤ 1.5 s, for a 50 MB stream and a 20 MB image bundle.
+- **V11 re-measured** (`spikes/v0.2/v11_redaction.py`, p50/p95 in ms, `shape_outputs` end to end on Python 3.13.8, off (an identity redactor) vs patterns only vs a ~30-value `.env`). The 50 MB profiles each repeat one line: `key=value` logs full of benign token keys (token-kv), JSON records with a short `"token"` value (json-records), NLP token dumps (nlp-tokens), e-mails and URLs, a real token on every line (token-dense, 1.35 million secrets), and an `.env` value on every line (value-dense):
+
+| Case | Off | Patterns only | 30-value `.env` | Added at p95 |
+|---|---|---|---|---|
+| 5 MB bundle (5 MB stream, 5 MB PNG, two 2 KB outputs), 20 runs | 111.7/116.2 | 141.4/145.4 | 164.2/171.0 | 55 |
+| 50 MB stream, 10 runs | 355.6/375.2 | 646.5/658.6 | 864.6/872.3 | 497 |
+| 20 MB image bundle (four 5 MB PNGs, a short stream), 10 runs | 167.8/178.4 | 167.8/178.7 | 168.9/173.1 | 0 |
+| 50 MB token-kv, 5 runs | 349.1/349.7 | 1172.4/1173.3 | 1387.6/1419.5 | 1070 |
+| 50 MB json-records, 5 runs | 350.0/351.7 | 746.0/757.1 | 949.6/974.3 | 623 |
+| 50 MB nlp-tokens, 5 runs | 356.7/358.5 | 772.7/775.6 | 963.1/979.3 | 621 |
+| 50 MB emails+urls, 5 runs | 359.4/364.2 | 671.1/702.4 | 891.1/897.6 | 533 |
+| 50 MB value-dense, 5 runs | 351.2/353.0 | 588.4/598.4 | 1193.7/1200.1 | 847 |
+| 50 MB token-dense, 5 runs | 358.7/362.6 | 2079.6/2108.6 | 2293.1/2325.7 | 1963 (over) |
+
+- Every planted secret (one per pattern and three `.env` values) is gone from the shaped text and the full copy.
+- `Redactor.redact` alone (`--redactor-only`), with the `.env`, p50/p95 on Python 3.9.6 and 3.13.8: 50 MB stream 560/580 and 505/515 ms; 5 MB bundle 56/57 and 51/52 ms; token-kv 1196/1198 and 1030/1034 ms; value-dense 783/793 and 838/861 ms; token-dense 2453/2467 and 1910/1918 ms.
+- The budget holds with no cache or trim for every profile but token-dense: the worst adds 1.07 s at p95 (token-kv), where the C0 prototype's 50 MB planted stream took 1.58 s. token-dense costs about 1.3 µs per secret found (each hit is a Python-level span and a marker), so an output with a real secret on every line goes over (a known gap).
+- value-dense uses the longest `.env` value: under a shorter value, whose marker is longer than the value, the redacted full copy grows past `prune_outputs_dir`'s 50 MiB cap and is pruned at once (the spike then finds no full copy).
+
+**Known gaps**
+- Encoded secrets: base64 and URL-encoded (`%40`). JSON-escaped only in part: a `.env` or environment value's escaped form and `\"key\": \"value\"` are caught, `\u…` escapes are not.
+- A secret split across lines, or across outputs (one stream message ends mid-secret), other than the cut shapes above.
+- Secrets under the thresholds: a 7-char password, a 15-char value under a plain name, a cut piece under 12 chars.
+- Patterns-only secrets (not in `.env` or the env) that look benign:
+  - a quoted word under 12 chars under a plain token key, taken for an NLP token in any case (`{"token": "abc12345"}`, `token=b"abc123XYZ"`); a credential key (`"api_token": "abc12345"`) is still caught;
+  - a number of under 6 digits in a URL's query (`?token=12345`);
+  - a key none of the patterns names (`"auth": "…"`, `pwd=…`).
+- A weak value is never redacted: a real password that is also a well-known default (`postgres`) or the user's login name stays visible (a URL's userinfo is still caught).
+- A non-secret value under a secret-shaped name is redacted anyway (E125 then says to rename or unset it).
+- Secrets drawn in images or held in binary outputs.
+- A value that is itself part of a marker ("redacted", or the secret's own name).
+- Cost: an output with a real secret on nearly every line. A 50 MB stream of 1.35 million tokens adds ~2.0 s at p95, over the 1.5 s budget (see Performance). Benign-dense outputs (token keys, NLP tokens, e-mails, `.env` values) stay under it.
+- A full copy over 50 MiB is pruned as soon as it is written (v0.1's `prune_outputs_dir` cap). Markers longer than their values can push a copy that was just under the cap over it.
+
+**Docs:** E125 rows in `skills/notebook/reference/errors.md` and `docs/troubleshooting.md`. The re-measure goes in `spikes/RESULTS.md` under V11.
+
+**Tests:**
+- `tests/unit/test_secrets.py`:
+  - each source and threshold (REGION=eu-west-1, DEBUG=true and DATA_PATH=data/raw.csv are kept), the exemptions and the `.env` parser;
+  - name matching, including the must-not-match list;
+  - each pattern and its false positives (code names, placeholders, sk-learn), and that a DataFrame repr's columns are unchanged;
+  - cut pieces, overlap and longest first, the marker format and idempotence;
+  - `redact_head`, caching, `install`/`current`/`add_value`;
+  - a Python 3.9 import, and that a keyed regex is compiled only once a text holds its word;
+  - the review's cases: each pattern's hits and misses (ML token keys, NLP tokens, code names, lookup keys, the İ fold), weak values, the place and label exemption, equal-weight ties, a value a marker completes, and `redact_head`'s growing window.
+- One test per wiring site, each written so that the site's own call is the only one that could pass it (a later net would otherwise hide a missing or misordered call), in `tests/gateway/test_secrets_wiring.py` (the gateway's sites; `_clip`, `_error_lines` and the log filter's `stack_info` directly; `services()` from the first call; `text_result`; `rtc_backend`'s token) plus the site's existing test file:
+  - `test_shaping.py` (replacing v0.1's identity pin; a spy shows image base64 is never scanned), `test_docsafe.py` (a stream cut never starts inside a secret, `snap_cut`, append-only flushes, a long traceback line), `test_render.py` (an error summary cut inside a secret; `_describe` and `_diff`), `test_r2_render.py`;
+  - the hooks' `test_hook_prompt.py` (the title before its cut, and the whole reminder) and `test_hook_session.py`, plus the hook failure log in `test_hook_shim.py`;
+  - nhctl's `test_freshrun.py` (labels and `failing_report` called directly, on both Pythons), `test_cli.py` (printed and usage errors, the `NHCTL_DEBUG=1` traceback, `--json` strings before escaping, `scrub_data`) and `test_settings.py` (a printed diff);
+  - `test_log.py` and `test_lab.py`, whose `***` marks become `[redacted:token]`.
+- E125: add and edit, from the main conversation and the writer (with `WRITER_LINE`); nothing written; no lint reject counted.
+- Raw vs redacted: with the fake backend, the notebook, the history and a cell view's `base_sha` hold the raw value while the tool result and the `.nh/outputs` copy hold the marker, and the ledger holds no raw text. An integration test (`tests/integration/test_redaction.py`, marked `integration`) shows the same against a real JupyterLab: the `.ipynb` and the RTC document are raw, the tool result is redacted, and a cell that prints the discovered Jupyter token (built from two halves) shows `[redacted:JUPYTER_TOKEN]`.
+
+**Perf** (hooks, 3 warm-ups and 50 interleaved runs, C2 vs C3, p50/p95 in ms): through the shim, on a project with a 30-value `.env`, a goal and a last cell: system 3.9 prompt-submit 112.1/119.9 → 114.0/121.1, session-start 133.0/140.6 → 134.3/144.8; server venv 3.13 prompt-submit 79.9/84.4 → 81.0/87.0, session-start 99.0/108.8 → 101.5/110.2. A second run: p50 up 1.8 to 3.3 ms, every C3 p95 at most 141.0 ms. All under the 150 ms budget. Before the keyed regexes were compiled lazily, system 3.9 session-start reached 150.9 ms at p95.

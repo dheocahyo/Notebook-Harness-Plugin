@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import itertools
 import json
 import math
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 from hookenv import (
@@ -99,6 +101,54 @@ def test_hooks_log_starts_over_past_256_kb(sandbox: Sandbox) -> None:
     sandbox.run_argv(command_line(edit), "[ipynb")
     assert log.stat().st_size < 20 * 1024
     assert "pre-tool file" in log.read_text()
+
+
+PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; under DB_PASSWORD in the project's .env
+
+
+@pytest.fixture
+def hook_main(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """The hook's main module, in process (it prepends its own paths to sys.path)."""
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    path = PLUGIN / "hooks" / "nh_hooks" / "main.py"
+    spec = importlib.util.spec_from_file_location("nh_hook_main_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fail_and_log(sandbox: Sandbox, hook_main: ModuleType) -> str:
+    try:
+        raise RuntimeError(f"connect failed for app:{PASSWORD} via http://h/?token=abc123def")
+    except RuntimeError:
+        hook_main.log_failure(sandbox.project, "pre-tool", "nh")
+    return (sandbox.nh / "logs" / "hooks.log").read_text()
+
+
+def test_the_hooks_log_is_redacted(sandbox: Sandbox, hook_main: ModuleType) -> None:
+    (sandbox.project / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    log = fail_and_log(sandbox, hook_main)
+    assert (
+        "RuntimeError: connect failed for app:[redacted:DB_PASSWORD] "
+        "via http://h/?token=[redacted:token]"
+    ) in log
+    assert PASSWORD not in log and "abc123def" not in log
+
+
+def test_a_failing_redactor_still_masks_the_token(
+    sandbox: Sandbox, hook_main: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nh_gateway._shared import secrets
+
+    def broken(project: Path) -> secrets.Redactor:
+        raise OSError("unreadable .env")
+
+    monkeypatch.setattr(secrets.Redactor, "for_project", broken)
+    log = fail_and_log(sandbox, hook_main)
+    assert "via http://h/?token=[redacted:token]" in log and "abc123def" not in log
+    assert "pre-tool nh" in log
 
 
 def test_unusable_python_fails_open(sandbox: Sandbox) -> None:

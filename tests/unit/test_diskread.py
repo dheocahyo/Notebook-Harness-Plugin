@@ -7,8 +7,10 @@ import nbformat
 import pytest
 import pytest_asyncio
 
+from nh_gateway._shared import secrets
 from nh_gateway._shared.paths import Layout
 from nh_gateway.backend.base import NewCell
+from nh_gateway.backend.discovery import ServerInfo
 from nh_gateway.backend.diskread import DiskReadBackend
 from nh_gateway.backend.rtc_backend import RtcBackend
 from nh_gateway.config import ConfigCache
@@ -82,8 +84,15 @@ async def test_rtc_backend_falls_back_to_the_file_for_reads(rtc: RtcBackend):
 
 async def test_env_gate_refuses_old_collaboration(rtc: RtcBackend, project, monkeypatch):
     (project / ".nh" / "state" / "env.json").write_text('{"jupyter_collaboration": "4.0.2"}')
-    monkeypatch.setattr("nh_gateway.backend.discovery.discover", lambda *a, **k: None)
+    # A found server (discover raises when there is none): its token is registered for
+    # redaction before the gate refuses (design §6.8), as the gateway's installed redactor.
+    secrets.install(secrets.Redactor.for_project(project))
+    server = ServerInfo(
+        url="http://127.0.0.1:8888/", token="0ld" + "c0llab-t0ken-9f8e7d", root_dir=project
+    )
+    monkeypatch.setattr("nh_gateway.backend.discovery.discover", lambda *a, **k: server)
     ref = await rtc.resolve_notebook(NB)  # reads still fall back to the file
     with pytest.raises(NhError) as info:
         await rtc.insert_cells(ref, -1, [])
     assert info.value.code == "E131"
+    assert secrets.current().redact(server.token) == "[redacted:JUPYTER_TOKEN]"

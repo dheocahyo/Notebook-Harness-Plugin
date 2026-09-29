@@ -19,11 +19,15 @@ from pathlib import Path
 import common
 from common import NhctlError, Result
 
-from nh_gateway._shared import paths, text
+from nh_gateway._shared import paths, secrets, text
 from nh_gateway._shared.scaffold import core
 
 KEEP_COPIES = 5
 MARKER = "NH-FRESH-RUN "
+EVALUE_CHARS = 500  # of the failing cell's error message, shown after redaction
+# What the runner hands back raw: well past the cut, so a secret across it is redacted whole
+# (design §6.8). The runner can't redact: it runs in the project env, without nh's code.
+EVALUE_RAW_CHARS = 8000
 
 # Runs inside the project env: argv = copy, working dir, per-cell timeout, kernel name
 # (harness.toml [jupyter].kernel_name; "" = the notebook's kernelspec).
@@ -61,11 +65,11 @@ except (CellTimeoutError, DeadKernelError, NoSuchKernel) as exc:
     result.update(ename=type(exc).__name__, evalue=str(exc))
 if not result["ok"]:
     result["failing_index"] = state["index"]
-    result["evalue"] = result.get("evalue", "")[:500]
+    result["evalue"] = result.get("evalue", "")[:__EVALUE_RAW_CHARS__]
 result["executed"] = sum(1 for c in nb.cells if c.cell_type == "code" and c.get("execution_count"))
 nbformat.write(nb, copy)
 print(__MARKER__ + json.dumps(result))
-""".replace("__MARKER__", repr(MARKER))
+""".replace("__MARKER__", repr(MARKER)).replace("__EVALUE_RAW_CHARS__", str(EVALUE_RAW_CHARS))
 
 
 def add_parsers(sub: argparse._SubParsersAction, common_opts: argparse.ArgumentParser) -> None:
@@ -85,7 +89,7 @@ def _nh(cell: object) -> dict:
 
 
 def cell_label(cells: list, index: int) -> str:
-    """'"<note title>" [n]', falling back to the first code line."""
+    """'"<note title>" [n]', falling back to the first code line; redacted before the cut."""
     cell = cells[index]
     uid = _nh(cell).get("uid")
     title = ""
@@ -97,10 +101,28 @@ def cell_label(cells: list, index: int) -> str:
         title = text.normalize_title(first[0]) if first else ""
     if not title:
         lines = [ln.strip() for ln in core.cell_source(cell).splitlines() if ln.strip()]
-        title = lines[0] if lines else "an empty cell"
+        title = secrets.current().redact(lines[0]) if lines else "an empty cell"
         title = title if len(title) <= 40 else title[:39] + "…"
+    else:
+        title = secrets.current().redact(title)
     count = cell.get("execution_count")
     return f'"{title}"' + (f" [{count}]" if isinstance(count, int) else "")
+
+
+def failing_report(result: dict, cells: list) -> dict | None:
+    """The failing cell of a runner ``result``, None when it ran through: its error and label
+    are redacted before their cuts (design §6.8)."""
+    if result.get("ok"):
+        return None
+    index = result.get("failing_index")
+    redactor = secrets.current()
+    ename = redactor.redact(str(result.get("ename") or ""))
+    evalue = redactor.redact_head(str(result.get("evalue") or ""), EVALUE_CHARS)
+    failing = {"index": index, "ename": ename, "evalue": evalue[:EVALUE_CHARS]}
+    if isinstance(index, int) and 0 <= index < len(cells):
+        failing["label"] = cell_label(cells, index)
+        failing["uid"] = _nh(cells[index]).get("uid")
+    return failing
 
 
 def _prune(tmp: Path) -> None:
@@ -174,13 +196,7 @@ def cmd_fresh_run(args: argparse.Namespace) -> Result:
     result = json.loads(lines[-1][len(MARKER) :])
     cells = nb["cells"]
     code_cells = sum(1 for c in cells if isinstance(c, dict) and c.get("cell_type") == "code")
-    failing = None
-    if not result.get("ok"):
-        index = result.get("failing_index")
-        failing = {"index": index, "ename": result.get("ename"), "evalue": result.get("evalue")}
-        if isinstance(index, int) and 0 <= index < len(cells):
-            failing["label"] = cell_label(cells, index)
-            failing["uid"] = _nh(cells[index]).get("uid")
+    failing = failing_report(result, cells)
     common.emit_event(
         layout, "fresh_run", nb=shown, ok=bool(result.get("ok")),
         failing_cell_uid=(failing or {}).get("uid"), n_cells=code_cells, ms=ms, via="nbclient",

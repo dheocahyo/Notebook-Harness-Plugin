@@ -10,6 +10,7 @@ from fastmcp import Context
 from fastmcp.tools import ToolResult
 
 from .. import meta
+from .._shared import secrets
 from .._shared.paths import read_json
 from .._shared.text import unescape_markdown
 from ..backend.base import CellView, NotebookRef
@@ -38,6 +39,9 @@ VIEWS = ("status", "overview", "outline", "vars", "var", "cell", "intents")
 
 
 def _clip(text: str, limit: int) -> str:
+    """A view's text, redacted whole and then cut (design §6.8): the cell view's source, notes
+    and outputs, the var views, outline rows and the status lines."""
+    text = secrets.current().redact(text)
     if len(text) <= limit:
         return text
     return (
@@ -48,7 +52,7 @@ def _clip(text: str, limit: int) -> str:
 def _first_line(source: str, width: int = 80) -> str:
     for line in source.splitlines():
         if line.strip():
-            line = line.strip()
+            line = secrets.current().redact(line.strip())  # before the cut
             return line if len(line) <= width else line[: width - 1] + "…"
     return ""
 

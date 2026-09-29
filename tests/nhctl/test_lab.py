@@ -322,7 +322,7 @@ def test_old_log_is_scrubbed_and_made_private(env, lab_project):
     log.write_text("[I ServerApp] http://127.0.0.1:8888/lab?token=0ld5ecret0ld5ecret\n")
     log.chmod(0o644)
     env.json("lab", "start", "--no-browser", cwd=lab_project)
-    assert "0ld5ecret" not in log.read_text() and "token=***" in log.read_text()
+    assert "0ld5ecret" not in log.read_text() and "token=[redacted:token]" in log.read_text()
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     env.json("lab", "stop", cwd=lab_project)
 

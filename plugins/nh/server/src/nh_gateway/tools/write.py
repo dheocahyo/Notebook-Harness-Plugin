@@ -12,6 +12,7 @@ from fastmcp import Context
 from fastmcp.tools import ToolResult
 
 from .. import dataflow, meta, render
+from .._shared import secrets
 from .._shared.text import clip, count_words, render_note, split_notes, unescape_markdown
 from .._shared.turn_record import WRITER_AGENT
 from ..backend.base import (
@@ -565,8 +566,16 @@ def _error_lines(err: Any, code: str) -> list[str]:
     lines = [render.error_summary(err.ename, err.evalue, 200)]
     source = code.splitlines()
     if err.line and 1 <= err.line <= len(source):
-        lines.append(f"failing code: {source[err.line - 1].strip()}")
+        failing = secrets.current().redact(source[err.line - 1].strip())
+        lines.append(f"failing code: {failing}")
     return lines
+
+
+def refuse_redacted(code: str) -> None:
+    """E125: code holding nh's marker would put the marker, not the secret, in the notebook
+    (design §6.8). The raw value is never restored: Claude never saw it."""
+    if secrets.MARKER in code:
+        raise NhError("E125")
 
 
 def _first_line(
@@ -654,6 +663,7 @@ async def add_cell(
     windows_guard()
     started = time.monotonic()
     turn = current_turn()
+    refuse_redacted(code)
     cfg = svc.config()
     ref = await svc.resolve(notebook)
     kernel = await svc.backend.kernel_status(ref)
@@ -814,6 +824,7 @@ async def edit_cell(
     windows_guard()
     started = time.monotonic()
     turn = current_turn()
+    refuse_redacted(code)
     writer = is_writer(turn)
     if writer:
         base_sha = None  # refuse_user_code: nobody in the background can confirm the user's change

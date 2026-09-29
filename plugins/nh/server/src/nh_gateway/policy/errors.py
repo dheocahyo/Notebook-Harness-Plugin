@@ -5,11 +5,9 @@ The first line is written for the human (Claude Code shows it in red); ``Next:``
 
 from __future__ import annotations
 
-import re
-
 from fastmcp.exceptions import ToolError
 
-_TOKEN = re.compile(r"(token=)[^&\s\"']+", re.IGNORECASE)
+from .._shared import secrets
 
 # The Next line of nh:cell-writer's refusals: its final answer goes to the nh:qa-cell workflow.
 RETURN_TO_WORKFLOW = (
@@ -107,6 +105,11 @@ CATALOGUE: dict[str, tuple[str, str]] = {
         "Not written: too many rejected attempts this message.",
         "Explain to the user what you are trying to write and ask how to proceed.",
     ),
+    "E125": (
+        "Not written: the code holds nh's [redacted:…] marker, not the real value.",
+        "Read the value from the environment without printing it, "
+        "or ask the user to edit that line in JupyterLab.",
+    ),
     "E130": (
         "nh can't find this project's JupyterLab.",
         "Ask the user to start it with `nhctl lab start` (or /nh:init), then retry.",
@@ -175,7 +178,8 @@ CATALOGUE: dict[str, tuple[str, str]] = {
 
 
 def scrub(text: str) -> str:
-    return _TOKEN.sub(r"\1***", text)
+    """The installed redactor (design §6.8): every refusal, log line and error text."""
+    return secrets.current().redact(text)
 
 
 class NhError(ToolError):

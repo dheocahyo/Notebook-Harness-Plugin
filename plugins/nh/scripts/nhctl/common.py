@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from nh_gateway._shared import paths, tomlread
+from nh_gateway._shared import paths, secrets, tomlread
 from nh_gateway._shared.scaffold import core
 
 HERE = Path(os.path.realpath(__file__)).parent
@@ -27,8 +27,6 @@ MIN_CLAUDE = (2, 1, 282)
 MIN_UV = (0, 10)
 MIN_JUPYTERLAB = (4, 6)
 MIN_COLLABORATION = (5,)
-
-_TOKEN = re.compile(r"(token=|\"token\"\s*:\s*\"|Authorization:\s*token\s+)[^&\s\"']+", re.I)
 
 
 class NhctlError(Exception):
@@ -55,7 +53,8 @@ class Result:
 
 
 def scrub(text: str) -> str:
-    return _TOKEN.sub(lambda m: m.group(1) + "***", text)
+    """The installed redactor (design §6.8): the project's once ``project_root`` found it."""
+    return secrets.current().redact(text)
 
 
 # ------------------------------------------------------------------------ locations
@@ -94,6 +93,8 @@ def project_root(explicit: str | None, required: bool = True) -> Path | None:
     """The nh project containing --project (or the cwd)."""
     start = os.path.abspath(explicit or os.getcwd())
     found = paths.find_project(start)
+    if found is not None:  # what nhctl prints is redacted with the project's values (§6.8)
+        secrets.install(secrets.Redactor.for_project(found))
     if found is None and required:
         raise NhctlError(
             "D105",
@@ -248,11 +249,32 @@ def now_stamp() -> str:
 # -------------------------------------------------------------------------- output
 
 
+def scrub_data(value: Any) -> Any:
+    """``value`` with every string in it redacted, keys too, before JSON escapes a value's
+    quotes and backslashes out of the redactor's sight. Other objects become their redacted
+    ``str``, as ``json.dumps(default=str)`` would print them."""
+    if isinstance(value, str):
+        return scrub(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {
+            (scrub(key) if isinstance(key, str) else key): scrub_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [scrub_data(item) for item in value]
+    return scrub(str(value))
+
+
 def print_result(result: Result, as_json: bool) -> None:
+    """Everything nhctl prints passes the redactor (design §6.8): --json's strings before they
+    are escaped, then the whole line."""
     if as_json:
-        sys.stdout.write(json.dumps(result.data, ensure_ascii=False, default=str) + "\n")
+        line = json.dumps(scrub_data(result.data), ensure_ascii=False, default=str)
+        sys.stdout.write(scrub(line) + "\n")
     elif result.text:
-        sys.stdout.write(result.text.rstrip("\n") + "\n")
+        sys.stdout.write(scrub(result.text.rstrip("\n")) + "\n")
 
 
 def error_result(exc: NhctlError) -> Result:

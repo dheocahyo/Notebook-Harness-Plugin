@@ -227,6 +227,38 @@ def test_unparsable_harness_toml_still_gives_context(sandbox: Sandbox) -> None:
     assert "Notebook Harness (nh) is active" in start(sandbox).context
 
 
+# --- redaction (design §6.8): the context never carries a secret ---------------------------
+
+PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; under DB_PASSWORD in the project's .env
+
+
+def goal_toml(goal: str, notebook: str = "notebooks/01_eda.ipynb") -> str:
+    return f'[project]\ngoal = "{goal}"\nnotebook = "{notebook}"\n'
+
+
+def test_the_goal_is_redacted_before_its_cut(sandbox: Sandbox) -> None:
+    (sandbox.project / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    (sandbox.project / "harness.toml").write_text(goal_toml(f"Load sales as app with {PASSWORD}"))
+    assert "Goal: Load sales as app with [redacted:DB_PASSWORD]." in start(sandbox).context
+    prefix = "Load the sales tables " + "and their returns " * 9 + "with pw "  # 192 chars
+    assert len(prefix) == 192  # the password straddles the 200-char cut
+    (sandbox.project / "harness.toml").write_text(goal_toml(prefix + PASSWORD))
+    text = start(sandbox).context
+    assert f"Goal: {prefix}[redact…." in text
+    assert PASSWORD[:3] not in text
+
+
+def test_the_whole_context_is_redacted(sandbox: Sandbox) -> None:
+    token = "wh-" + "tok-8c1f0e2d9a"
+    env = dict(sandbox.env, WAREHOUSE_TOKEN=token)
+    toml = goal_toml(f"Query with {token}", notebook=f"notebooks/{token}.ipynb")
+    (sandbox.project / "harness.toml").write_text(toml)
+    text = start(sandbox, env=env).context
+    assert "Goal: Query with [redacted:WAREHOUSE_TOKEN]." in text
+    assert "Main notebook: notebooks/[redacted:WAREHOUSE_TOKEN].ipynb." in text
+    assert token not in text
+
+
 def test_setup_builds_the_runtime_in_the_foreground(sandbox: Sandbox) -> None:
     run = sandbox.run("Setup", sandbox.payload("Setup", trigger="init"))
     assert run.returncode == 0 and run.stdout == ""

@@ -22,6 +22,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
 
+from .._shared import secrets
 from .._shared.paths import Layout, atomic_write_json, read_json, safe_name
 from ..config import ConfigCache
 from ..exec import probes
@@ -164,6 +165,7 @@ class RtcBackend:
                 info = await asyncio.get_running_loop().run_in_executor(
                     self._pool, partial(discovery.discover, self.layout.project, cfg)
                 )
+                secrets.add_value("JUPYTER_TOKEN", info.token)  # redacted from now on (§6.8)
                 self._env_gate()
                 self._api = rest.Rest(info, self._pool)
                 if self._janitor is None or self._janitor.done():

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from nh_gateway import render
+from nh_gateway._shared import secrets
 from nh_gateway.policy.turn import TurnState
 from nh_gateway.render import (
     Result,
@@ -748,3 +750,63 @@ def test_error_summary_cuts_long_messages_at_a_word_boundary():
     text = error_summary("ValueError", evalue, limit=60)
     assert len(text) <= 60 and text.endswith("…") and "\n" not in text
     assert text == "ValueError: could not convert string to float: 'abc def…"
+
+
+# --- redaction (design §6.8): every label, summary and scalar is redacted before its cut ------
+
+PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; under DB_PASSWORD in the project's .env
+
+
+@pytest.fixture
+def installed(tmp_path):
+    (tmp_path / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    secrets.install(secrets.Redactor.for_project(tmp_path, {}))
+
+
+def test_labels_are_redacted_before_the_cut(installed):
+    assert cell_label(f"Connect with {PASSWORD}", 3) == '"Connect with [redacted:DB_PASSWORD]" [3]'
+    # The password starts at column 25 of a 40-char label: cut first, 14 of its chars would show.
+    label = cell_label(None, 4, f"conn = connect(password='{PASSWORD}')")
+    assert label == "the cell `conn = connect(password='[redacted:DB_P…` [4]"
+    assert cell_label(None, 4, f"c = f('{PASSWORD}')") == (
+        "the cell `c = f('[redacted:DB_PASSWORD]')` [4]"
+    )
+
+
+def test_error_summaries_are_redacted_before_the_cut(installed):
+    assert error_summary("RuntimeError", f"x {PASSWORD}", 120) == (
+        "RuntimeError: x [redacted:DB_PASSWORD]"
+    )
+    cut = error_summary("RuntimeError", f"login failed for user admin with {PASSWORD} on db", 60)
+    assert cut == "RuntimeError: login failed for user admin with…"
+    assert error_summary("E", f"{PASSWORD}\nmore", 120) == "E: [redacted:DB_PASSWORD]…"
+
+
+def test_an_error_summary_cut_inside_a_long_word_shows_no_piece_of_the_secret(installed):
+    """A URL is one word, so the cut can't fall back to a space: cut first, the password's first
+    5 chars would show, too few for the cut-piece rule (review of C3)."""
+    evalue = f"could not connect to postgresql+psycopg2://reporting_app:{PASSWORD}@db:5432/sales"
+    assert ("OperationalError: " + evalue).index(PASSWORD) == 80 - 5
+    assert error_summary("OperationalError", evalue, 81) == (
+        "OperationalError: could not connect to postgresql+psycopg2://[redacted:DB_PASSWO…"
+    )
+
+
+def test_name_summaries_and_changes_are_redacted_whole(installed):
+    """_describe and _diff build their lines from names nh doesn't cut (a type, a dtype): the
+    whole line is redacted."""
+    assert render._describe({"kind": "container", "type": f"dict_{PASSWORD}", "len": 2}) == (
+        "dict_[redacted:DB_PASSWORD] len 2"
+    )
+    old = {"kind": "Series", "rows": 3, "dtype": "int64"}
+    new = {"kind": "Series", "rows": 3, "dtype": f"category_{PASSWORD}"}
+    assert render._diff(old, new) == "Series dtype int64 → category_[redacted:DB_PASSWORD]"
+
+
+def test_scalar_reprs_in_the_self_check_are_redacted(installed):
+    lines, _ = selfcheck(payload(), payload(api=scalar(PASSWORD, "str")))
+    assert lines == ["api: new str '[redacted:DB_PASSWORD]'"]
+    lines, _ = selfcheck({"error": f"probe failed: {PASSWORD}"}, payload(n=scalar(1)))
+    assert (
+        lines[0] == "state before the run unknown (probe failed: [redacted:DB_PASSWORD]); after it:"
+    )

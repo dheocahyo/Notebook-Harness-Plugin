@@ -14,8 +14,11 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from PIL import Image
 
+from nh_gateway._shared import secrets
 from nh_gateway.exec.shaping import (
+    MAX_HTML_CHARS,
     PNG_LIMIT,
+    _html_to_text,
     prune_outputs_dir,
     redact,
     shape_outputs,
@@ -502,8 +505,90 @@ def test_shaped_carries_the_summary():
     assert shape([stream("hi\n")]).summary.types == ["stdout"]
 
 
-def test_redact_is_identity_in_v01():
-    assert redact("token=abc SECRET") == "token=abc SECRET"
+PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; under DB_PASSWORD in the project's .env
+
+
+def install_secret(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    secrets.install(secrets.Redactor.for_project(root, {}))
+
+
+def test_redact_is_the_installed_redactor(tmp_path):
+    """v0.1's identity seam is FR-14's redactor (design §6.8), patterns-only until installed."""
+    assert redact("token=abc123 SECRET") == "token=[redacted:token] SECRET"
+    install_secret(tmp_path)
+    assert (
+        redact(f"pw {PASSWORD} token=abc123") == "pw [redacted:DB_PASSWORD] token=[redacted:token]"
+    )
+
+
+def test_every_text_output_and_the_full_copy_are_redacted(tmp_path):
+    install_secret(tmp_path)
+    frame = f"\x1b[36m----> \x1b[39m3 connect('postgresql://app:{PASSWORD}@db')"
+    outputs = [
+        stream(f"connecting with {PASSWORD}\n" + "row\n" * 3000),
+        stream(f"warning: {PASSWORD}\n", name="stderr"),
+        bundle({"text/plain": f"'{PASSWORD}'"}, "execute_result"),
+        bundle({"text/markdown": f"**{PASSWORD}**"}),
+        bundle({"text/latex": f"$${PASSWORD}$$"}),
+        bundle({"application/json": {"password": PASSWORD}}),
+        error("RuntimeError", f"login failed for {PASSWORD}", [frame, f"RuntimeError: {PASSWORD}"]),
+    ]
+    shaped = shape(outputs, save_dir=outputs_dir(tmp_path))
+    assert shaped.truncated and shaped.full_path is not None
+    full = (tmp_path / "proj" / shaped.full_path).read_text()
+    assert shaped.error is not None and shaped.summary.error is not None
+    texts = [shaped.text, full, shaped.error.evalue, shaped.error.traceback, shaped.summary.error]
+    for text in texts + [shaped.summary.text_head or ""]:
+        assert PASSWORD[:8] not in text, text
+    assert full.count("[redacted:DB_PASSWORD]") == 8  # 2 streams, 4 bundles, the error's 2 lines
+    assert "connecting with [redacted:DB_PASSWORD]" in shaped.text
+    assert "connect('postgresql://[redacted:DB_PASSWORD]@db')" in shaped.error.traceback
+    assert shaped.summary.error == "RuntimeError: login failed for [redacted:DB_PASSWORD]"
+    assert Path(shaped.full_path).stem == hashlib.sha256(full.encode()).hexdigest()[:16]
+
+
+def test_images_are_never_scanned(tmp_path, monkeypatch):
+    install_secret(tmp_path)
+    redactor = secrets.current()
+    scanned: list[str] = []
+    real = redactor.redact
+
+    def spy(text):  # redact_head and the module's redact() both end up here
+        scanned.append(text)
+        return real(text)
+
+    monkeypatch.setattr(redactor, "redact", spy)
+    data = image_b64(640, 480)
+    shaped = shape([bundle({"image/png": data}), stream(f"saved with {PASSWORD}\n")])
+    assert shaped.images[0].data == base64.b64decode(data)
+    assert shaped.text == "[image 1: 640x480 png]\n[stdout] saved with [redacted:DB_PASSWORD]"
+    assert scanned and not any(data[:64] in text for text in scanned if isinstance(text, str))
+    assert max(len(text) for text in scanned) < 200
+
+
+def test_html_over_1_mb_is_redacted_before_its_cut(tmp_path):
+    install_secret(tmp_path)
+    head = "<table><tr>" + "<td>x</td>" * ((MAX_HTML_CHARS - 40) // 10) + "<td>"
+    head += "y" * (MAX_HTML_CHARS - 10 - len(head))  # the password starts 10 chars before the cut
+    markup = f"{head}{PASSWORD}</td></tr></table>"
+    assert markup.index(PASSWORD) == MAX_HTML_CHARS - 10
+    text = _html_to_text(markup)
+    assert PASSWORD[:10] not in text and text.endswith("[… HTML cut …]")
+    assert "[redacted:" in text
+    shaped = shape([bundle({"text/html": markup})])
+    assert PASSWORD[:10] not in shaped.text
+
+
+def test_summary_heads_are_redacted_before_they_are_cut(tmp_path):
+    install_secret(tmp_path)
+    blank = "\n" * 3990  # the first line starts 10 chars before the 4000-char window's end
+    summary = summarize_outputs([stream(blank + PASSWORD + " rest\n")])
+    assert summary.text_head == "[redacted:DB_PASSWORD] rest"
+    summary = summarize_outputs([error("RuntimeError", f"{'x ' * 50}{PASSWORD}", [])])
+    assert summary.error is not None and PASSWORD[:4] not in summary.error
 
 
 def test_prune_keeps_the_newest_files(tmp_path):

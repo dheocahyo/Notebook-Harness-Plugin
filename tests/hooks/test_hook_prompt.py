@@ -670,3 +670,56 @@ def test_a_failing_classifier_still_opens_the_turn(
         None,
     )
     assert "zq_private_ledger" not in (sandbox.nh / "log.jsonl").read_text()
+
+
+# --- redaction (design §6.8): the reminder never carries a secret ---------------------------
+
+PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; under DB_PASSWORD in the project's .env
+
+
+def test_the_last_cells_title_is_redacted_before_its_cut(
+    sandbox: Sandbox, prompt_submit: ModuleType
+) -> None:
+    (sandbox.project / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    write_state(sandbox, "last_cell.json", last_cell(title=f"Rotate {PASSWORD}", status="error"))
+    assert '"Rotate [redacted:DB_PASSWORD]" [14]' in submit(sandbox).context
+    prefix = "Connect to the sales warehouse as the reporting user, pw "  # 57 chars
+    assert len(prefix) + 3 == prompt_submit.TITLE_MAX_CHARS  # the password straddles the cut
+    write_state(sandbox, "last_cell.json", last_cell(title=prefix + PASSWORD, status="error"))
+    text = submit(sandbox).context
+    assert f'"{prefix}[r…" [14]' in text  # cut after the redaction: no piece of the password
+    assert PASSWORD[:3] not in text
+
+
+def test_the_reminder_redacts_the_environments_secrets(sandbox: Sandbox) -> None:
+    token = "wh-" + "tok-8c1f0e2d9a"
+    env = dict(sandbox.env, WAREHOUSE_TOKEN=token)
+    write_state(sandbox, "last_cell.json", last_cell(title=f"Query with {token}", status="error"))
+    payload = sandbox.payload("UserPromptSubmit", prompt="go")
+    text = sandbox.run("UserPromptSubmit", payload, env=env).context
+    assert '"Query with [redacted:WAREHOUSE_TOKEN]" [14]' in text and token not in text
+
+
+def test_the_whole_reminder_is_redacted(sandbox: Sandbox) -> None:
+    (sandbox.project / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    fields = {"notebook": f"notebooks/{PASSWORD}.ipynb", "status": f"odd {PASSWORD}"}
+    write_state(sandbox, "last_cell.json", last_cell(**fields))  # parts other than the title
+    text = submit(sandbox).context
+    assert "in [redacted:DB_PASSWORD].ipynb: odd [redacted:DB_PASSWORD]." in text
+    assert PASSWORD[:4] not in text
+
+
+def test_a_failing_redactor_still_writes_the_turn_record(
+    sandbox: Sandbox, prompt_submit: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The record is written before the redactor is built: a failure there costs the reminder
+    (main logs it), never the gate's record, which would turn the next call into E102."""
+
+    def broken(root: object) -> object:
+        raise RuntimeError("redactor bug")
+
+    monkeypatch.setattr(prompt_submit.secrets.Redactor, "for_project", broken)
+    payload = sandbox.payload("UserPromptSubmit", prompt="go", prompt_id="p1")
+    with pytest.raises(RuntimeError, match="redactor bug"):
+        prompt_submit.handle(Layout(sandbox.project), payload)
+    assert turn(sandbox)["turn_id"] == "p1"

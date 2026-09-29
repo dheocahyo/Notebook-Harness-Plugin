@@ -22,6 +22,7 @@ from typing import Any
 
 from PIL import Image
 
+from .._shared import secrets
 from .._shared.text import clip
 from ..backend.base import ErrorInfo, OutputSummary
 from ..render import error_summary
@@ -130,8 +131,9 @@ def strip_ansi(text: str) -> str:
 
 
 def redact(text: str) -> str:
-    """FR-14 seam: secret redaction. Identity in v0.1."""
-    return text
+    """FR-14 (design §6.8): the installed redactor's ``redact``. Every text Claude reads from
+    an output passes here once, before any cut; image base64 and bytes never do."""
+    return secrets.current().redact(text)
 
 
 def shape_outputs(
@@ -294,7 +296,9 @@ def _clean(text: str) -> str:
 
 
 def _first_line(text: str, limit: int) -> str:
-    line = next((ln.strip() for ln in _clean(text[:4000]).splitlines() if ln.strip()), "")
+    # Redacted with a margin past the 4000-char window, so a secret across it goes whole.
+    window = text[: 4000 + secrets.current().margin]
+    line = next((ln.strip() for ln in _clean(window).splitlines() if ln.strip()), "")
     return clip(line, limit)
 
 
@@ -438,7 +442,11 @@ class _HtmlText(HTMLParser):
 
 def _html_to_text(markup: str) -> str:
     parser = _HtmlText()
-    parser.feed(markup[:MAX_HTML_CHARS])
+    if len(markup) > MAX_HTML_CHARS:  # redact before the cut, so no secret is cut in half
+        markup_head = secrets.current().redact_head(markup, MAX_HTML_CHARS)[:MAX_HTML_CHARS]
+    else:
+        markup_head = markup
+    parser.feed(markup_head)
     parser.close()
     text = parser.text()
     return text + "\n[… HTML cut …]" if len(markup) > MAX_HTML_CHARS else text

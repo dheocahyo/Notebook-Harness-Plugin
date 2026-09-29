@@ -17,6 +17,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent
 
 from .. import dataflow, meta, render
+from .._shared import secrets
 from .._shared.paths import Layout, atomic_write_json, read_json
 from .._shared.text import normalize_title
 from ..backend.base import (
@@ -328,7 +329,9 @@ def text_result(
     status: str | None = None,
     cell_id: str | None = None,
 ) -> ToolResult:
-    content: list[Any] = [TextContent(type="text", text=text)]
+    """Every tool result's text passes the installed redactor here, the last safety net
+    (design §6.8): each site has already redacted before cutting; this catches the rest."""
+    content: list[Any] = [TextContent(type="text", text=secrets.current().redact(text))]
     content.extend(images or [])
     meta: dict[str, Any] = {"nh/v": 1}
     if status is not None:

@@ -6,9 +6,12 @@ Cells are named by title and ``[n]`` everywhere here, never by nh- id or line nu
 from __future__ import annotations
 
 import ast
+import functools
 import re
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
 
+from ._shared import secrets
 from ._shared.text import clip, normalize_title
 
 LABEL_CHARS = 40
@@ -60,12 +63,15 @@ _INPLACE_LINE = re.compile(r"(?m)^[ \t]*([A-Za-z_]\w*)\s*\..*\binplace\s*=\s*Tru
 def cell_label(title: str | None, execution_count: int | None, source: str = "") -> str:
     """'"Drop rows with missing price" [14]'; without a title, 'the cell `df = load()` [14]' with
     the first code line (≤ 40 chars). Untitled labels start lowercase: don't open a sentence with one.
+    Both are redacted before the cut (design §6.8).
     """
-    name = " ".join(normalize_title(title or "").split())
+    redact = secrets.current().redact
+    name = " ".join(redact(normalize_title(title or "")).split())
     if name:
         label = f'"{name}"'
     else:
         line = next((ln.strip() for ln in source.splitlines() if ln.strip()), "")
+        line = redact(line)
         line = line if len(line) <= LABEL_CHARS else line[: LABEL_CHARS - 1].rstrip() + "…"
         label = f"the cell `{line}`" if line else "an empty cell"
     return label if execution_count is None else f"{label} [{execution_count}]"
@@ -559,6 +565,22 @@ def _brief(value: dict) -> str:
     return _size(value) if value.get("kind") == "DataFrame" else f"len {_rows(value) or 0:,}"
 
 
+_Summary = TypeVar("_Summary", bound=Callable[..., Any])
+
+
+def _redacted(func: _Summary) -> _Summary:
+    """A summary line with its names and values redacted (design §6.8); scalar reprs are
+    already redacted before ``_short`` cuts them."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> str | None:
+        text = func(*args, **kwargs)
+        return secrets.current().redact(text) if text else text
+
+    return cast(_Summary, wrapper)
+
+
+@_redacted
 def _describe(value: dict, origin: str = "") -> str:
     """One name's summary; ``origin`` (' (from df 10×2)') follows the size of a frame or series."""
     kind = value.get("kind")
@@ -582,6 +604,7 @@ def _describe(value: dict, origin: str = "") -> str:
     return str(kind or "?")
 
 
+@_redacted
 def _diff(old: dict, new: dict) -> str | None:
     """What changed between two summaries of one name; None when nothing visible did."""
     kind = new.get("kind")
@@ -691,7 +714,7 @@ def _names(items: list[str], limit: int = MAX_NAMES) -> str:
 
 
 def _short(value: Any, limit: int = 40) -> str:
-    text = " ".join(str(value).split())
+    text = " ".join(secrets.current().redact(str(value)).split())  # redacted before the cut
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -846,6 +869,7 @@ def error_summary(ename: str, evalue: str, limit: int = ERROR_CHARS) -> str:
     """
     lines = [line.strip() for line in (evalue or "").splitlines() if line.strip()]
     text = f"{ename}: {lines[0]}" if lines else (ename or "Error")
+    text = secrets.current().redact_head(text, limit)  # before the cut (design §6.8)
     if len(text) > limit:
         return clip(text, limit)
     return text.rstrip(" ,;:-") + "…" if len(lines) > 1 else text

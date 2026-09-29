@@ -20,7 +20,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ._meta_rules import tool_meta
-from ._shared import turn_record
+from ._shared import secrets, turn_record
 from ._shared.paths import Layout, find_project
 from .backend.base import NotebookBackend
 from .config import ConfigCache
@@ -102,9 +102,18 @@ Notebook = Annotated[
 
 
 class _TokenScrub(logging.Filter):
+    """Every log line passes the redactor (design §6.8), and so does its traceback: E199's
+    ``log.exception`` carries the exception's text."""
+
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg = scrub(record.getMessage())
         record.args = None
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = scrub(record.exc_text)
+        if record.stack_info:
+            record.stack_info = scrub(record.stack_info)
         return True
 
 
@@ -122,11 +131,15 @@ class _Runtime:
         )
 
     def services(self) -> Services | None:
+        # The project's redactor (design §6.8): refreshed on every call, a cache hit unless
+        # .env or the environment changed.
         if self._services is not None:
+            secrets.install(secrets.Redactor.for_project(self._services.project))
             return self._services
         project = self._project or find_project()
         if project is None:
             return None
+        secrets.install(secrets.Redactor.for_project(project))
         layout = Layout(project)
         cache = ConfigCache(project)
         backend = self._backend

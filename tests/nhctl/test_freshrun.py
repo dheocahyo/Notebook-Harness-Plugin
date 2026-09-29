@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
-from nhctl_testlib import SERVER, VENV_PYTHON
+from nhctl_testlib import PLUGIN, PYTHONS, SERVER, VENV_PYTHON
 
 pytestmark = pytest.mark.skipif(not VENV_PYTHON.exists(), reason="server venv not synced")
 
@@ -92,6 +93,79 @@ def test_failing_notebook_names_the_cell(env, nb_project):
     assert "nh-" not in human.stdout
     events = [json.loads(line) for line in (nb_project / ".nh/log.jsonl").read_text().splitlines()]
     assert [e["failing_cell_uid"] for e in events] == ["nh-cccccccccc", "nh-cccccccccc"]
+
+
+def test_the_failing_cell_is_redacted_before_its_cuts(env, nb_project):
+    """The label and the error message pass the project's redactor before their cuts
+    (design §6.8); the copy in .nh/tmp keeps the real output, as notebooks do."""
+    password = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; the project's .env holds it
+    (nb_project / ".env").write_text(f"DB_PASSWORD={password}\n")
+    nb = nb_project / "notebooks/01_eda.ipynb"
+    failing = (  # reads the value itself, so the cell's source holds no secret
+        'from pathlib import Path\npw = Path("../.env").read_text().split("=", 1)[1].strip()\n'
+        'raise ValueError("x" * 490 + pw)'
+    )
+    cells = LOADER + [note(f"Connect as app with {password}", "nh-cccccccccc"),
+                      code(failing, "nh-cccccccccc", 7)]  # fmt: skip
+    write_nb(nb, cells)
+    proc = env.run("fresh-run", "--json", cwd=nb_project)
+    assert proc.returncode == 1, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["failing"] == {
+        "index": 3, "ename": "ValueError", "evalue": "x" * 490 + "[redacted:",
+        "label": '"Connect as app with [redacted:DB_PASSWORD]" [7]', "uid": "nh-cccccccccc",
+    }  # fmt: skip
+    human = env.run("fresh-run", "notebooks/01_eda.ipynb", cwd=nb_project)
+    assert '"Connect as app with [redacted:DB_PASSWORD]" [7]: ValueError: xxx' in human.stdout
+    for out in (proc.stdout, human.stdout, (nb_project / ".nh/log.jsonl").read_text()):
+        assert password[:3] not in out.replace("x" * 490, "")
+    copy = json.loads((nb_project / result["copy"]).read_text())
+    assert password in json.dumps(copy["cells"][3]["outputs"])
+
+
+# Calls freshrun's label and report builders directly: printed output is scrubbed again, which
+# would hide a site that cut before it redacted (review of C3).
+DIRECT = """
+import json, sys
+from pathlib import Path
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+import freshrun
+from nh_gateway._shared import secrets
+secrets.install(secrets.Redactor.for_project(Path(sys.argv[3]), {}))
+cells, result = json.loads(sys.argv[4]), json.loads(sys.argv[5])
+report = freshrun.failing_report(result, cells)
+print(json.dumps({"code": freshrun.cell_label(cells, 0), "failing": report}))
+"""
+
+
+@pytest.mark.parametrize("python", PYTHONS)
+def test_labels_and_the_failing_report_are_redacted_before_their_cuts(tmp_path, python):
+    password = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; the project's .env holds it
+    (tmp_path / ".env").write_text(f"DB_PASSWORD={password}\n")
+    line = f'engine = create_engine("pg://app:{password}@db/x")'
+    assert line.index(password) == 39 - 6  # cut first, 6 chars of it would show
+    cells = [
+        code(line, "nh-aaaaaaaaaa", 3),
+        note(f"Connect as app with {password}", "nh-cccccccccc"),
+        code("connect()", "nh-cccccccccc", 7),
+    ]
+    result = {"ok": False, "failing_index": 2, "ename": f"Login{password}Error",
+              "evalue": "x" * 495 + password}  # fmt: skip
+    argv = [str(PLUGIN / "scripts" / "nhctl"), str(SERVER / "src"), str(tmp_path)]
+    argv += [json.dumps(cells), json.dumps(result)]
+    proc = subprocess.run(
+        [python, "-c", DIRECT, *argv], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    shown = json.loads(proc.stdout)
+    assert shown == {
+        "code": '"engine = create_engine(\"pg://[redacted:…" [3]',
+        "failing": {
+            "index": 2, "ename": "Login[redacted:DB_PASSWORD]Error", "evalue": "x" * 495 + "[reda",
+            "label": '"Connect as app with [redacted:DB_PASSWORD]" [7]', "uid": "nh-cccccccccc",
+        },
+    }  # fmt: skip
+    assert password[:4] not in proc.stdout
 
 
 def test_needs_the_env(env, project):
