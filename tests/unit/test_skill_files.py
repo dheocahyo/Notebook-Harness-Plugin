@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import csv
+import datetime
 import fnmatch
 import io
 import json
@@ -318,19 +320,63 @@ DROP = {
 DATES = {
     "title": "Count orders per month",
     "notes": [
-        "Parses order_date as dates, in a new series order_dates",
+        "Parses order_date strictly, so a date that does not exist raises",
         "Counts the orders in each calendar month, oldest first",
     ],
-    "intent": "parse order_date as dates and count the orders per month",
-    "code": 'order_dates = pd.to_datetime(df["order_date"])\n'
+    "intent": "parse order_date strictly and count the orders per month",
+    "code": 'order_dates = pd.to_datetime(df["order_date"], format="%Y-%m-%d")\n'
     'orders_per_month = order_dates.dt.to_period("M").value_counts().sort_index()\n'
     "orders_per_month",
 }
-DATES_FIXED = (
-    'order_dates = pd.to_datetime(df["order_date"], errors="coerce")\n'
-    'print("unparsed dates:", df.loc[order_dates.isna(), "order_date"].tolist())\n'
+DATES_STILL_BAD = DATES["code"].replace('"%Y-%m-%d")', '"%Y-%m-%d", exact=True)')
+# The fix error-retry's prompt asks for: strict parsing, the order with a date that does not exist
+# left out and named.
+DATES_LEFT_OUT = (
+    'real_dates = pd.date_range("2024-01-01", "2024-12-31").strftime("%Y-%m-%d")\n'
+    'is_real_date = df["order_date"].isin(real_dates)\n'
+    'left_out = df.loc[~is_real_date, ["order_id", "order_date"]]\n'
+    'print("left out:", left_out.to_dict("records"))\n'
+    'order_dates = pd.to_datetime(df.loc[is_real_date, "order_date"], format="%Y-%m-%d")\n'
     'orders_per_month = order_dates.dt.to_period("M").value_counts().sort_index()\n'
     "orders_per_month"
+)
+DATES_BOUND_FIRST = 'DATE_FORMAT = "%Y-%m-%d"\n' + DATES["code"].replace(
+    '"%Y-%m-%d"', "DATE_FORMAT"
+)
+DATES_PRINT_FIRST = 'print("rows:", len(df))\n' + DATES["code"]
+# a failing line after blank and comment lines, which count in its number
+DATES_SPACED = 'DATE_FORMAT = "%Y-%m-%d"\n\n# strict: a bad date raises\n' + DATES["code"].replace(
+    '"%Y-%m-%d"', "DATE_FORMAT"
+)
+DATES_BAD_ROWS = (
+    'parsed = pd.to_datetime(df["order_date"], format="%Y-%m-%d", errors="coerce")\n'
+    "bad_rows = df[parsed.isna()]\n"
+    "bad_rows"
+)
+# A failed run that binds a name of each kind before its failing line, so a retry finds them in
+# the kernel and binds them again: the same (DATES_KEPT_SAME) or changed (DATES_KEPT_CHANGED).
+DATES_KEPT = (
+    'DATE_FORMAT = "%Y-%m-%d"\n'
+    "BAD_IDS = [1020]\n"
+    "COLUMNS = df.columns\n"
+    'raw_dates = df["order_date"]\n'
+    'units = df[["units"]]\n'
+    "dated = df.copy()\n"
+)
+DATES_KEPT_FAIL = DATES_KEPT + DATES["code"].replace('"%Y-%m-%d"', "DATE_FORMAT")
+DATES_KEPT_SAME = DATES_KEPT + DATES_LEFT_OUT
+DATES_KEPT_CHANGED = (
+    'DATE_FORMAT = "%Y-%m"\n'
+    "BAD_IDS = [1020, 1021]\n"
+    "COLUMNS = list(df.columns)\n"
+    'raw_dates = df.loc[df["price"].notna(), "order_date"]\n'
+    'units = df[["units"]] * 2\n'
+    "dated = df.dropna()\n"
+    "dated"
+)
+# more changed or new names than the self-check shows
+DATES_KEPT_MANY = (
+    DATES_KEPT_CHANGED.removesuffix("dated") + 'n_rows = len(dated)\nn_bad = 1\nlabel = "x"\ndated'
 )
 HEATMAP = {
     "title": "Correlation heatmap of numeric columns",
@@ -369,14 +415,6 @@ MOCK_SCENARIOS: dict[str, tuple[dict[str, str], list[tuple[str, str, dict[str, A
     "undo-last/mocks/nh/nh_inspect.md": (
         {"NH_EVAL_LAST_CELL": "drop"},
         [("p1", "nh_inspect", {"view": "overview"})],
-    ),
-    "error-retry/mocks/nh/nh_add_cell.md": ({}, [("p1", "nh_add_cell", DATES)]),
-    "error-retry/mocks/nh/nh_edit_cell.md": (
-        {},
-        [
-            ("p1", "nh_add_cell", DATES),
-            ("p1", "nh_edit_cell", {"cell_id": "$cell", "code": DATES_FIXED}),
-        ],
     ),
     "note-shape/mocks/nh/nh_add_cell.md": ({}, [("p1", "nh_add_cell", HEATMAP)]),
     "never-edits-ipynb/mocks/nh/nh_edit_cell.md": (
@@ -452,30 +490,42 @@ def _eval_fixture(env: dict[str, str]):
             os.environ.update(saved_env)
 
 
-async def run_mock_scenario(name: str) -> str:
-    """The real gateway's text for the last call of MOCK_SCENARIOS[name]."""
+async def replay(
+    env: dict[str, str], calls: list[tuple[str, str, dict[str, Any]]], seen: list | None = None
+) -> Any:
+    """The real gateway's result (a CallToolResult) for the last of ``calls`` on the eval fixture.
+    A "$cell" argument is the cell id the previous call's result names. ``seen``, when given,
+    collects every call's result in order."""
     from fastmcp import Client
 
     from nh_gateway.app import create_server
     from tests.fakes.turns import Turns, text
 
-    env, calls = MOCK_SCENARIOS[name]
     with _eval_fixture(env) as (project, data):
         backend = _plot_backend(project)
         notebook = nbformat.read(project / "notebooks" / "eda.ipynb", as_version=4)
         for cell in notebook.cells:  # the kernel ran the fixture's cells
             if cell.cell_type == "code":
                 backend._execute(cell.source)
-        turns, prompt, result = Turns(project, data), "", ""
+        turns, prompt, result = Turns(project, data), "", None
         async with Client(create_server(project, backend)) as client:
             for prompt_id, tool, args in calls:
                 if prompt_id != prompt:
                     turns.prompt(prompt_id)
                     prompt = prompt_id
-                cell = re.search(r"\bcell=(\S+)", result)
+                cell = re.search(r"\bcell=(\S+)", text(result) if result else "")
                 args = {k: (cell.group(1) if v == "$cell" and cell else v) for k, v in args.items()}
-                result = text(await turns.call(client, tool, args, prompt_id))
+                result = await turns.call(client, tool, args, prompt_id)
+                if seen is not None:
+                    seen.append(result)
         return result
+
+
+async def run_mock_scenario(name: str) -> str:
+    """The real gateway's text for the last call of MOCK_SCENARIOS[name]."""
+    from tests.fakes.turns import text
+
+    return text(await replay(*MOCK_SCENARIOS[name]))
 
 
 def result_shape(text: str) -> dict[str, Any]:
@@ -529,6 +579,1502 @@ async def test_mock_matches_the_real_gateway_result(name: str):
     if name in EXACT_MOCKS:  # its graders read the numbers, which result_shape leaves out
         assert body.strip() == real.strip(), f"{name} drifted from the gateway:\n{real}"
     assert bool(front.get("error")) == bool(re.search(r"^nh: E\d{3}", real, flags=re.MULTILINE))
+
+
+# ------------------------------------------------------------------ error-retry's agent mocks
+#
+# error-retry's mocks are `type: agent`: a model plays the gateway from one description,
+# mocks/nh/fixtures/nh-server.md, so a run can fail, retry and fix its cell and see the numbers the
+# real kernel would show. Each template must match the real gateway's text in every state
+# AGENT_SCENARIOS lists for it (placeholders aside); each state comes with the "Which template"
+# rule that picks the template there, and the rules the file states for filling placeholders are
+# checked on the same results. The file describes pandas 2.2.3 while these tests run the gateway
+# on the suite's pandas, which words some errors and dtypes differently: the texts the file gives
+# as pandas facts are checked by test_nh_server_pandas_facts, which runs only under pandas 2.2.3.
+
+ER_MOCKS = EVALS / "error-retry" / "mocks" / "nh"
+NH_SERVER = ER_MOCKS / "fixtures" / "nh-server.md"
+NH_SERVER_INCLUDE = "{{file:fixtures/nh-server.md}}"
+ER_EXPECT = {
+    "nh_add_cell": ADD_CELL_EXPECT,
+    "nh_edit_cell": {"cell_id": "string", "code": "string"},
+    "nh_run": {"cell_id": "string"},
+    "nh_inspect": {},
+    "nh_undo": {},
+}
+ERROR_PREFIX = "ERROR: "  # an agent mock's tool error; the gateway returns refusals as tool errors
+Call = tuple[str, str, dict[str, Any]]
+
+
+def _add(code: str = DATES["code"], **fields: Any) -> Call:
+    return ("p1", "nh_add_cell", {**DATES, "code": code, **fields})
+
+
+def _edit(code: str, cell_id: str = "$cell", **fields: Any) -> Call:
+    return ("p1", "nh_edit_cell", {"cell_id": cell_id, "code": code, **fields})
+
+
+def _run(mode: str | None = "run", cell_id: str = "$cell") -> Call:
+    """An nh_run call; ``mode=None`` sends no `mode`, so the server's default applies."""
+    return (
+        "p1",
+        "nh_run",
+        {"cell_id": cell_id} if mode is None else {"cell_id": cell_id, "mode": mode},
+    )
+
+
+def _inspect(view: str | None, **args: Any) -> Call:
+    return ("p1", "nh_inspect", {"view": view, **args} if view else args)
+
+
+def _undo(cell_id: str | None = None) -> Call:
+    return ("p1", "nh_undo", {"cell_id": cell_id} if cell_id else {})
+
+
+UNDO = _undo()
+FAILED = [_add()]
+FIXED = [_add(), _edit(DATES_LEFT_OUT)]
+NO_RETRIES = [_add(), _edit(DATES_STILL_BAD), _edit(DATES_STILL_BAD + "\n")]
+LONG_TITLE = "Parse order dates strictly and then count the orders per month"
+NOTES = ["Loads data/sales.csv into df", "Shows its shape as a first check"]
+# a run that shows nothing, one that binds an array and a long string, one that changes df
+DATES_SILENT = (
+    'order_dates = pd.to_datetime(df.loc[df["order_id"] != 1020, "order_date"], format="%Y-%m-%d")\n'
+    'orders_per_month = order_dates.dt.to_period("M").value_counts().sort_index()'
+)
+DATES_ARRAY = (
+    'NOTE = "orders whose order_date is not a real calendar date are left out"\n'
+    'is_bad_order = df["order_id"].isin([1020]).to_numpy()\n'
+    'order_dates = pd.to_datetime(df.loc[~is_bad_order, "order_date"], format="%Y-%m-%d")\n'
+    'order_dates.dt.to_period("M").value_counts().sort_index()'
+)
+DATES_REBINDS_DF = 'df = df[df["order_id"] != 1020]\n' + DATES["code"]
+# retries that change what DATES_KEPT_FAIL bound: a frame's rows, columns and dtypes; a frame's
+# dtype and nulls at the same shape, with a series' dtype and nulls; a series' length
+DATES_KEPT_RESHAPED = (
+    'dated = dated[dated["order_id"] != 1020]\n'
+    'dated["order_date"] = pd.to_datetime(dated["order_date"], format="%Y-%m-%d")\n'
+    'dated["order_month"] = dated["order_date"].dt.to_period("M")\n'
+    'dated.groupby("order_month").size()'
+)
+DATES_KEPT_RETYPED = (
+    'dated["order_date"] = pd.to_datetime(dated["order_date"], format="%Y-%m-%d", errors="coerce")\n'
+    'raw_dates = pd.to_datetime(raw_dates, format="%Y-%m-%d", errors="coerce")\n'
+    "dated"
+)
+DATES_KEPT_SHORTER = 'raw_dates = raw_dates[df["order_id"] != 1020]\nraw_dates'
+# edits of the loader before any add: one that runs, one that fails after binding df, and one
+# that fails binding nothing (its undo leaves no names behind)
+LOADER_OK = (
+    'import pandas as pd\nDATA_PATH = "../data/sales.csv"\ndf = pd.read_csv(DATA_PATH)\ndf.shape'
+)
+LOADER_BAD = (
+    'import pandas as pd\ndf = pd.read_csv("../data/sales.csv")\n'
+    'df["order_date"] = pd.to_datetime(df["order_date"], format="%Y-%m-%d")\ndf.shape'
+)
+LOADER_BAD_BINDS_NOTHING = (
+    'import pandas as pd\npd.to_datetime(df["order_date"], format="%Y-%m-%d")'
+)
+
+
+def _loader(code: str, **fields: Any) -> Call:
+    return _edit(code, FIXTURE_LOADER, **fields)
+
+
+LOADER_EDITED = [_loader(LOADER_OK)]
+LOADER_FAILED = [_loader(LOADER_BAD)]
+LOADER_RESTORED = [_loader(LOADER_OK), UNDO]
+UNDONE = [_add(DATES_BOUND_FIRST), UNDO]  # leaves DATE_FORMAT in the kernel
+
+# The "Which template" rules (nh-server.md), each naming the template it picks.
+R_ADD = 'Else run the code (see "Running code"): "add ok" or "add failed".'
+R_ADD_AFTER_UNDO = 'nh_undo removed the added cell: "E110".'
+R_ADD_AFTER_FAIL = (
+    'The message\'s cell exists, its latest run failed and a retry is left: "E110 after a failure".'
+)
+R_ADD_AGAIN = 'The message\'s cell exists otherwise: "E110".'
+R_ADD_NOTE = (
+    "Else, if the title has more than 8 words, or the notes have fewer than 2 or more than 5 "
+    'bullets: "E120 note".'
+)
+R_EDIT_UNKNOWN = '`cell_id` is not a current cell id: "E140".'
+R_EDIT_LOADER_LATE = (
+    "`cell_id` is the loader while the message's cell is the added cell, or after nh_undo "
+    'removed it: "E113".'
+)
+R_EDIT_LOADER = (
+    "`cell_id` is the loader and the message has no cell yet: the loader becomes the message's "
+    'cell; run the new code: "edit ok, the loader" or "edit failed, the loader".'
+)
+R_EDIT_OK_ALREADY = "The message's cell's latest run was ok: \"E112\"."
+R_EDIT_NO_RETRIES = 'The message\'s cell failed and its 2 retries are used: "E111".'
+R_RETRY_OK = 'Else it is a retry: run the new code. "edit ok"'
+R_RETRY_FAIL_1 = '"edit failed, 1 retry left" (retry 1 of 2)'
+R_RETRY_FAIL_2 = '"edit failed, no retries left" (retry 2 of 2)'
+R_WAIT = 'mode "wait": "run wait".'
+R_INTERRUPT = 'Mode "interrupt": "run interrupt".'
+R_RUN_OK_ALREADY = 'mode "run" on the message\'s cell: "E112" if its latest run was ok'
+R_RUN_NO_RETRIES = '"E111" if its 2 retries are used'
+R_RERUN = 'else re-run the same code as a retry: "re-run failed"'
+R_RUN_LOADER = (
+    'mode "run" on the loader when the message has no cell yet: the loader becomes the message\'s '
+    'cell and runs its code again: "re-run ok, the loader".'
+)
+R_RUN_LOADER_LATE = (
+    'mode "run" on the loader while the message\'s cell is the added cell, or after nh_undo '
+    'removed it: "E114".'
+)
+R_RUN_UNKNOWN = 'Any other id: "E140".'
+R_UNDO_OTHER = "`cell_id` is sent and is not the message's cell's id or its note's id: \"E143\"."
+R_UNDO = (
+    'The added cell exists: remove it. "undo, names left" if any run of it assigned names, else '
+    '"undo".'
+)
+R_UNDO_LOADER = (
+    "The message's cell is the loader and its old code is not back yet: put it back. \"undo, the "
+    'loader, names left" if any of this message\'s runs of it assigned names, else "undo, the '
+    'loader".'
+)
+R_UNDO_NOTHING = 'Nothing else can be undone: "E143".'
+
+
+def _r_view(view: str) -> tuple[str, str, str]:
+    """The rules picking a notebook view before any run, while the added cell exists, and else."""
+    return (
+        f'"inspect {view}, before any run" before any run',
+        f'"inspect {view}" while the added cell exists',
+        f'else "inspect {view}, no added cell"',
+    )
+
+
+R_OVERVIEW, R_OUTLINE, R_INTENTS = _r_view("overview"), _r_view("outline"), _r_view("intents")
+R_VARS_FIRST = '"inspect vars, before any run" before any run'
+R_VARS = 'else "inspect vars"'
+R_VAR = '"inspect var" for a `name` the kernel holds'
+R_VAR_NONE = '"inspect var, no such name" for any other name'
+R_CELL_LOADER = '"inspect cell, the loader" while this message has not run the loader'
+R_CELL_RESTORED = '"inspect cell, the loader restored" after an undo put its old code back'
+R_CELL_LOADER_RUN = 'else "inspect cell"'
+R_CELL = 'With the added cell\'s id while it exists: "inspect cell".'
+R_CELL_UNKNOWN = 'An id that is not a current cell id: "E140".'
+R_STATUS = 'view "status": "inspect status".'
+R_VIEW_BAD = (
+    'Any other view, view "var" without `name`, or view "cell" without `cell_id`: "E120 view".'
+)
+
+# template name in nh-server.md -> (the rule that picks it, the calls whose last result it matches)
+AGENT_SCENARIOS: dict[str, list[tuple[str, list[Call]]]] = {
+    "add ok": [(R_ADD, [_add(DATES_LEFT_OUT)]), (R_ADD, [_add(DATES_SILENT)])],
+    "add failed": [
+        (R_ADD, FAILED),
+        (R_ADD, [_add(DATES_PRINT_FIRST)]),
+        (R_ADD, [_add(DATES_BOUND_FIRST)]),
+        (R_ADD, [_add(DATES_KEPT_FAIL)]),
+        (R_ADD, [_add(DATES_SPACED)]),
+    ],
+    "edit ok": [
+        (R_RETRY_OK, FIXED),
+        (R_RETRY_OK, [_add(), _edit(DATES_STILL_BAD), _edit(DATES_LEFT_OUT)]),
+        (R_RETRY_OK, [_add(DATES_KEPT_FAIL), _edit(DATES_KEPT_SAME)]),
+        (R_RETRY_OK, [_add(DATES_KEPT_FAIL), _edit(DATES_KEPT_CHANGED)]),
+        (R_RETRY_OK, [_add(DATES_KEPT_FAIL), _edit(DATES_KEPT_MANY)]),
+        (R_RETRY_OK, [_add(), _edit(DATES_ARRAY)]),
+        (R_RETRY_OK, [_add(), _edit(DATES_REBINDS_DF)]),
+        (R_RETRY_OK, [_add(DATES_KEPT_FAIL), _edit(DATES_KEPT_RESHAPED)]),
+        (R_RETRY_OK, [_add(DATES_KEPT_FAIL), _edit(DATES_KEPT_RETYPED)]),
+        (R_RETRY_OK, [_add(DATES_KEPT_FAIL), _edit(DATES_KEPT_SHORTER)]),
+        (R_RETRY_OK, [*LOADER_FAILED, _loader(LOADER_OK)]),
+        (R_RETRY_OK, [*LOADER_FAILED, UNDO, _loader(LOADER_OK)]),
+    ],
+    "edit failed, 1 retry left": [(R_RETRY_FAIL_1, [_add(), _edit(DATES_STILL_BAD)])],
+    "edit failed, no retries left": [(R_RETRY_FAIL_2, NO_RETRIES)],
+    "re-run failed": [
+        (R_RERUN, [_add(), _run()]),
+        (R_RERUN, [_add(), _run(None)]),  # no `mode`: its default is "run"
+        (R_RERUN, [_add(), _edit(DATES_STILL_BAD), _run()]),
+        (R_RERUN, [*LOADER_FAILED, _run(cell_id=FIXTURE_LOADER)]),
+    ],
+    "edit ok, the loader": [
+        (R_EDIT_LOADER, LOADER_EDITED),
+        (R_EDIT_LOADER, [_loader(LOADER_OK, notes=NOTES)]),
+        (R_EDIT_LOADER, [_edit(LOADER_OK, f"{FIXTURE_LOADER}-n")]),  # a note's id: its cell
+    ],
+    "edit failed, the loader": [
+        (R_EDIT_LOADER, LOADER_FAILED),
+        (R_EDIT_LOADER, [_loader(LOADER_BAD, notes=NOTES)]),
+    ],
+    "re-run ok, the loader": [(R_RUN_LOADER, [_run(cell_id=FIXTURE_LOADER)])],
+    "E110 after a failure": [
+        (R_ADD_AFTER_FAIL, [_add(), _add(DATES_LEFT_OUT)]),
+        (R_ADD_AFTER_FAIL, [_add(), _edit(DATES_STILL_BAD), _add(DATES_LEFT_OUT)]),
+        (R_ADD_AFTER_FAIL, [*LOADER_FAILED, _add()]),
+        (R_ADD_AFTER_FAIL, [_loader(LOADER_BAD_BINDS_NOTHING), UNDO, _add()]),
+    ],
+    "E110": [
+        (R_ADD_AGAIN, [*FIXED, _add(DATES_LEFT_OUT)]),
+        (R_ADD_AGAIN, [*NO_RETRIES, _add(DATES_LEFT_OUT)]),
+        (R_ADD_AGAIN, [*LOADER_EDITED, _add()]),
+        (R_ADD_AGAIN, [_run(cell_id=FIXTURE_LOADER), _add()]),
+        (R_ADD_AGAIN, [*LOADER_RESTORED, _add()]),
+        (R_ADD_AFTER_UNDO, [_add(), UNDO, _add(DATES_LEFT_OUT)]),
+    ],
+    "E111": [
+        (R_EDIT_NO_RETRIES, [*NO_RETRIES, _edit(DATES_LEFT_OUT)]),
+        (R_RUN_NO_RETRIES, [*NO_RETRIES, _run()]),
+    ],
+    "E112": [
+        (R_EDIT_OK_ALREADY, [*FIXED, _edit(DATES_LEFT_OUT + "\n")]),
+        (R_RUN_OK_ALREADY, [*FIXED, _run()]),
+        (R_EDIT_OK_ALREADY, [*LOADER_EDITED, _loader(LOADER_OK + "\n")]),
+        (R_RUN_OK_ALREADY, [*LOADER_EDITED, _run(cell_id=FIXTURE_LOADER)]),
+        (R_EDIT_OK_ALREADY, [*LOADER_RESTORED, _loader(LOADER_OK)]),
+    ],
+    "E113": [
+        (R_EDIT_LOADER_LATE, [_add(), _loader("df = 1")]),
+        (R_EDIT_LOADER_LATE, [_add(), UNDO, _loader("df = 1")]),
+    ],
+    "E114": [
+        (R_RUN_LOADER_LATE, [_add(), _run(cell_id=FIXTURE_LOADER)]),
+        (R_RUN_LOADER_LATE, [_add(), UNDO, _run(cell_id=FIXTURE_LOADER)]),
+    ],
+    "E120 note": [
+        (R_ADD_NOTE, [_add(title=LONG_TITLE, notes=["Parses order_date strictly"])]),
+        (R_ADD_NOTE, [_add(notes=[])]),
+    ],
+    "E120 view": [
+        (R_VIEW_BAD, [_inspect("bogus")]),
+        (R_VIEW_BAD, [_inspect("var")]),
+        (R_VIEW_BAD, [_inspect("cell")]),
+    ],
+    "E140": [
+        (R_EDIT_UNKNOWN, [_add(), UNDO, _edit(DATES_LEFT_OUT)]),
+        (R_CELL_UNKNOWN, [_inspect("cell", cell_id="nh-0000000000")]),
+        (R_RUN_UNKNOWN, [_add(), _run(cell_id="nh-0000000000")]),
+    ],
+    "E143": [
+        (R_UNDO_NOTHING, [UNDO]),
+        (R_UNDO_NOTHING, [_add(), UNDO, UNDO]),
+        (R_UNDO_NOTHING, [*LOADER_RESTORED, UNDO]),
+        (R_UNDO_OTHER, [_add(), _undo(FIXTURE_LOADER)]),
+        (R_UNDO_OTHER, [_add(), _undo("nh-0000000000")]),
+    ],
+    "run wait": [
+        (R_WAIT, [_add(), _run("wait")]),
+        (R_WAIT, [*FIXED, _run("wait")]),
+        (R_WAIT, [_run("wait", cell_id=FIXTURE_LOADER)]),
+    ],
+    "run interrupt": [(R_INTERRUPT, [_add(), _run("interrupt")])],
+    "undo": [(R_UNDO, [_add(), UNDO]), (R_UNDO, [_add(), _undo("$cell")])],
+    "undo, names left": [(R_UNDO, UNDONE), (R_UNDO, [*FIXED, UNDO])],
+    "undo, the loader": [(R_UNDO_LOADER, [_loader(LOADER_BAD_BINDS_NOTHING), UNDO])],
+    "undo, the loader, names left": [
+        (R_UNDO_LOADER, LOADER_RESTORED),
+        (R_UNDO_LOADER, [*LOADER_FAILED, UNDO]),
+    ],
+    "inspect overview, before any run": [
+        (R_OVERVIEW[0], [_inspect("overview")]),
+        (R_OVERVIEW[0], [_inspect(None)]),  # the default view
+        (R_OVERVIEW[0], [_add(notes=[]), _inspect("overview")]),  # a refused add runs nothing
+    ],
+    "inspect overview": [
+        (R_OVERVIEW[1], [*FAILED, _inspect("overview")]),
+        (R_OVERVIEW[1], [*FIXED, _inspect("overview")]),
+        (R_OVERVIEW[1], [_add(), _edit(DATES_REBINDS_DF), _inspect("overview")]),
+    ],
+    "inspect overview, no added cell": [
+        (R_OVERVIEW[2], [*UNDONE, _inspect("overview")]),
+        (R_OVERVIEW[2], [_add(), UNDO, _inspect("overview")]),
+        (R_OVERVIEW[2], [*LOADER_EDITED, _inspect("overview")]),
+        (R_OVERVIEW[2], [*LOADER_FAILED, _inspect("overview")]),
+        (R_OVERVIEW[2], [*LOADER_RESTORED, _inspect("overview")]),
+    ],
+    "inspect outline, before any run": [(R_OUTLINE[0], [_inspect("outline")])],
+    "inspect outline": [
+        (R_OUTLINE[1], [*FAILED, _inspect("outline")]),
+        (R_OUTLINE[1], [*FIXED, _inspect("outline")]),
+    ],
+    "inspect outline, no added cell": [
+        (R_OUTLINE[2], [*UNDONE, _inspect("outline")]),
+        (R_OUTLINE[2], [*LOADER_FAILED, _inspect("outline")]),
+        (R_OUTLINE[2], [*LOADER_RESTORED, _inspect("outline")]),
+    ],
+    "inspect vars, before any run": [(R_VARS_FIRST, [_inspect("vars")])],
+    "inspect vars": [
+        (R_VARS, [*FAILED, _inspect("vars")]),
+        (R_VARS, [*FIXED, _inspect("vars")]),
+        (R_VARS, [_add(DATES_KEPT_FAIL), _inspect("vars")]),
+        (R_VARS, [_add(), _edit(DATES_ARRAY), _inspect("vars")]),
+        (R_VARS, [_add(), _edit(DATES_REBINDS_DF), _inspect("vars")]),
+        (R_VARS, [*UNDONE, _inspect("vars")]),
+    ],
+    "inspect var": [
+        (R_VAR, [*FIXED, _inspect("var", name="orders_per_month")]),
+        (R_VAR, [*FIXED, _inspect("var", name="left_out")]),
+        (R_VAR, [_inspect("var", name="df")]),
+        (R_VAR, [_inspect("var", name="df", rows=10)]),
+        (R_VAR, [_inspect("var", name="df", rows=11)]),
+        (R_VAR, [_inspect("var", name="df", rows=20)]),
+        (R_VAR, [_add(DATES_KEPT_FAIL), _inspect("var", name="raw_dates", rows=3)]),
+        (R_VAR, [_add(), _edit(DATES_REBINDS_DF), _inspect("var", name="df", rows=3)]),
+        (R_VAR, [*UNDONE, _inspect("var", name="df")]),  # a name it holds, after names were left
+    ],
+    "inspect var, no such name": [
+        (R_VAR_NONE, [_inspect("var", name="orders_per_month")]),
+        (R_VAR_NONE, [*FAILED, _inspect("var", name="order_dates")]),
+        (R_VAR_NONE, [*UNDONE, _inspect("var", name="orders_per_month")]),
+    ],
+    "inspect cell": [
+        (R_CELL, [*FAILED, _inspect("cell", cell_id="$cell")]),
+        (R_CELL, [*FIXED, _inspect("cell", cell_id="$cell")]),
+        (R_CELL_LOADER_RUN, [*LOADER_EDITED, _inspect("cell", cell_id=FIXTURE_LOADER)]),
+    ],
+    "inspect cell, the loader": [
+        (R_CELL_LOADER, [_inspect("cell", cell_id=FIXTURE_LOADER)]),
+        (R_CELL_LOADER, [*FAILED, _inspect("cell", cell_id=FIXTURE_LOADER)]),
+        (R_CELL_LOADER, [*UNDONE, _inspect("cell", cell_id=FIXTURE_LOADER)]),
+    ],
+    "inspect cell, the loader restored": [
+        (R_CELL_RESTORED, [*LOADER_RESTORED, _inspect("cell", cell_id=FIXTURE_LOADER)]),
+    ],
+    "inspect intents, before any run": [(R_INTENTS[0], [_inspect("intents")])],
+    "inspect intents": [(R_INTENTS[1], [*FAILED, _inspect("intents")])],
+    "inspect intents, no added cell": [
+        (R_INTENTS[2], [*LOADER_EDITED, _inspect("intents")]),
+        (R_INTENTS[2], [*LOADER_RESTORED, _inspect("intents")]),
+        (R_INTENTS[2], [_add(), UNDO, _inspect("intents")]),
+    ],
+    "inspect status": [(R_STATUS, [_inspect("status")])],
+}
+AGENT_CASES = [(name, i) for name, cases in AGENT_SCENARIOS.items() for i in range(len(cases))]
+
+
+def nh_server_templates() -> dict[str, str]:
+    """nh-server.md's templates: a `### name` heading, then the text in a ```text fence."""
+    _, _, section = NH_SERVER.read_text(encoding="utf-8").partition("\n## Templates\n")
+    found = re.findall(r"^### ([^\n]+)\n\n```text\n(.*?)\n```$", section, flags=re.M | re.S)
+    assert len(found) == section.count("\n### "), "a template heading has no ```text fence"
+    return dict(found)
+
+
+def _nh_server_section(title: str) -> str:
+    """The text of one `## title` section of nh-server.md."""
+    text = NH_SERVER.read_text(encoding="utf-8")
+    return text.partition(f"\n## {title}\n")[2].partition("\n## ")[0]
+
+
+def match_template(
+    template: str, text: str, patterns: dict[str, str] | None = None
+) -> dict[str, str] | None:
+    """The placeholder values when ``text`` is ``template`` filled in, else None.
+
+    `<name>` stands for text on one line, or for whole lines (maybe none) when its name has the
+    word "lines" and it fills its line; `<... section lines>` stands for a whole `--- name ---`
+    section or nothing. A name used twice must stand for the same text. ``patterns`` gives the
+    regex a one-line placeholder must fit, by name.
+    """
+    source, names, parts, pos = template + "\n", {}, [], 0
+    for found in re.finditer(r"<([^<>\n]+)>", source):
+        name, start, end = found.group(1), found.start(), found.end()
+        parts.append(re.escape(source[pos:start]))
+        pos = end
+        if name in names:
+            parts.append(f"(?P={names[name]})")
+            continue
+        names[name] = f"g{len(names)}"
+        many = re.search(r"\blines\b", name) is not None
+        if many and (start == 0 or source[start - 1] == "\n") and source[end] == "\n":
+            body, pos = r"(?:[^\n]*\n)*?", end + 1  # whole lines, with their line breaks
+            if name.endswith(" section lines"):  # a whole `--- name ---` section, or nothing
+                body = rf"(?:--- [^\n]+ ---\n{body})?"
+        elif many:
+            body = r"[\s\S]*?"
+        else:
+            body = "(?:" + (patterns or {}).get(name, r"[^\n]*?") + ")"
+        parts.append(f"(?P<{names[name]}>{body})")
+    parts.append(re.escape(source[pos:]))
+    found = re.fullmatch("".join(parts), text.strip("\n") + "\n")
+    if found is None:
+        return None
+    return {name: found.group(group).rstrip("\n") for name, group in names.items()}
+
+
+def test_match_template_reads_placeholders():
+    template = 'Ran "<title>" [<n>] <state lines>.\nnh: n=<n>\n<output lines>\nend'
+    assert match_template(template, 'Ran "T" [2] failed with X:\n  y.\nnh: n=2\na\nb\nend') == {
+        "title": "T",
+        "n": "2",
+        "state lines": "failed with X:\n  y",
+        "output lines": "a\nb",
+    }
+    assert match_template(template, 'Ran "T" [2] ok.\nnh: n=2\nend')["output lines"] == ""
+    assert match_template(template, 'Ran "T" [2] ok.\nnh: n=3\nend') is None  # <n> twice
+    assert match_template('"<title>" [1]', '"T\nU" [1]') is None  # one line only
+    assert match_template("a <b>", "a b\nc") is None
+    sections = "--- a ---\n<a lines>\n<b section lines>\n--- end ---"
+    assert match_template(sections, "--- a ---\nx\n--- b ---\ny\n--- end ---") == {
+        "a lines": "x",
+        "b section lines": "--- b ---\ny",
+    }
+    assert match_template(sections, "--- a ---\nx\n--- end ---")["b section lines"] == ""
+
+
+def test_error_retry_mocks_are_agents_on_one_description():
+    for mock in EVALS.rglob("mocks/nh/*.md"):
+        front, body = split_frontmatter(mock)
+        if front.get("type") != "agent":  # a fixed mock is replayed by the test above
+            assert mock.relative_to(EVALS).as_posix() in MOCK_SCENARIOS, mock
+            continue
+        assert mock.parent == ER_MOCKS, mock
+        assert front.get("expect", {}) == ER_EXPECT[mock.stem], mock
+        intro = f"This call is {mock.stem}. Answer it as the nh server described below."
+        assert body == f"{intro}\n\n{NH_SERVER_INCLUDE}\n", mock
+    assert sorted(p.stem for p in ER_MOCKS.glob("*.md")) == sorted(ER_EXPECT)
+    # the include is a plain file (the loader skips folders) and is not substituted again
+    assert "{{" not in NH_SERVER.read_text(encoding="utf-8")
+
+
+def test_nh_server_has_a_scenario_and_a_rule_for_each_template():
+    templates = nh_server_templates()
+    assert set(templates) == set(AGENT_SCENARIOS)
+    which = _prose(_nh_server_section("Which template"))
+    for name, template in templates.items():
+        refusal = re.search(r"^nh: E\d{3}", template, flags=re.M) is not None
+        assert template.startswith(ERROR_PREFIX) == refusal, name
+        assert ERROR_PREFIX not in template[len(ERROR_PREFIX) :], name
+        for rule, _ in AGENT_SCENARIOS[name]:
+            # the rule picks this template: an edited or swapped rule fails here
+            assert f'"{name}"' in rule and _prose(rule) in which, (name, rule)
+    # every template the rules name exists
+    named = set(re.findall(r'"((?:inspect|edit|add|undo|run|re-run|E1)[^"]*)"', which))
+    assert named - {"run"} <= set(templates), named - set(templates)
+    assert _prose('nh_inspect (`view` defaults to "overview"):') in which
+    # each default is replayed: a scenario sends no `view`, and one sends nh_run with no `mode`
+    sent = [
+        (tool, args) for cases in AGENT_SCENARIOS.values() for _, c in cases for _, tool, args in c
+    ]
+    assert ("nh_inspect", {}) in sent
+    assert any(tool == "nh_run" and "mode" not in args for tool, args in sent)
+    assert _prose('nh_run (`mode` defaults to "run"):') in which
+
+
+def _sales_csv() -> str:
+    base = _read(EVALS / "_scaffold" / "base.sh")
+    return re.search(r"cat > data/sales\.csv <<'CSV'\n(.*?\n)CSV\n", base, flags=re.S).group(1)
+
+
+def _printed_df() -> list[str]:
+    """The lines of `print(df)` as nh-server.md gives them."""
+    server = NH_SERVER.read_text(encoding="utf-8")
+    block = re.search(
+        r"^`print\(df\)` shows the whole frame.*?\n\n```text\n(.*?)\n```$", server, re.M | re.S
+    )
+    return block.group(1).splitlines()
+
+
+def _prose(text: str) -> str:
+    """``text`` with its line breaks and indents as single spaces, so wrapping doesn't matter."""
+    return " ".join(text.split())
+
+
+def test_nh_server_facts_match_the_eval_fixture():
+    pd = pytest.importorskip("pandas")
+    server = NH_SERVER.read_text(encoding="utf-8")
+    data = _sales_csv()
+    frame = pd.read_csv(io.StringIO(data))
+    # to_string() is the same under the mock's pandas 2.2.3 and the tests' pandas
+    assert _printed_df() == frame.to_string().splitlines()
+    assert _prose("`print(df)` shows the whole frame (`NaN` is a missing price):") in _prose(server)
+    rows = list(csv.DictReader(io.StringIO(data)))
+
+    def real_date(text: str) -> bool:
+        with contextlib.suppress(ValueError):
+            return bool(datetime.date.fromisoformat(text))
+        return False
+
+    bad = [(i, row) for i, row in enumerate(rows) if not real_date(row["order_date"])]
+    assert [(i, row["order_id"], row["order_date"]) for i, row in bad] == [
+        (19, "1020", "2024-02-30")
+    ]
+    index, row = bad[0]
+    assert (
+        f"`{row['order_date']}`, at index {index} (position {index}): order_id {row['order_id']}, "
+        f"{row['region']},\n  {row['product']}, {row['units']} units, price {row['price']}."
+    ) in server
+    shown = textwrap.indent(frame.loc[[index]].to_string(), "  ")
+    assert (
+        f"- df's rows at index {index} as pandas prints them:\n\n  ```text\n{shown}\n  ```"
+        in server
+    )
+    # a filter keeps the index labels
+    picked = frame.loc[frame["order_id"] == int(row["order_id"]), ["order_id", "order_date"]]
+    assert list(picked.index) == [index]
+    shown = textwrap.indent(picked.to_string(), "  ")
+    assert f"with only order_id and order_date:\n\n  ```text\n{shown}\n  ```" in server
+    assert _prose(
+        "A filter keeps df's index labels (only `reset_index()` numbers the rows again), so order "
+        f"{row['order_id']} is index {index} in any frame taken from df's rows"
+    ) in _prose(server)
+    missing = sum(not r["price"] for r in rows)
+    at = ", ".join(str(i) for i, r in enumerate(rows) if not r["price"]).rsplit(", ", 1)
+    assert rows[index]["price"] and _prose(
+        f"The {missing} missing prices are at index {' and '.join(at)}. Row {index} has a price, "
+        f"so the other {len(rows) - 1} rows still hold all {missing} missing prices."
+    ) in _prose(server)
+    # what leaving out the bad order, dropping nulls, a date series and a mask give
+    kept = frame.loc[frame["order_id"] != int(row["order_id"])]
+    dates = pd.to_datetime(kept["order_date"], format="%Y-%m-%d").dt.to_period("M")
+    mask = frame["order_id"].isin([int(row["order_id"])])
+    assert (str(mask.dtype), len(mask)) == ("bool", len(frame))
+    assert (len(dates), len(frame.dropna())) == (len(kept), len(rows) - missing)
+    assert _prose(
+        f"Without order {row['order_id']} (left out by its order_id, its date or index {index}), "
+        f"df has {len(kept)} rows and all {kept.shape[1]} columns, still with "
+        f"{int(kept['price'].isna().sum())} missing prices. Only dropping the missing prices "
+        f"(such as `dropna()`) leaves {len(frame.dropna())} rows. A series taken from df's rows "
+        f"has one value per row ({len(frame)}, or {len(dates)} without order {row['order_id']}), "
+        """also after `pd.to_datetime` or `.dt.to_period("M")`; only counting them """
+        "(`value_counts()`, `groupby(...).size()`) gives one value per month, "
+        f'{len(dates.value_counts())}. A mask such as `df["order_id"].isin(...)` is a '
+        f"{mask.dtype} series of {len(mask)} values."
+    ) in _prose(server)
+    assert f"{len(rows)} rows and {len(rows[0])} columns" in server
+    assert f"price float64 with {missing} missing prices" in server
+    months = collections.Counter(r["order_date"][:7] for r in rows if real_date(r["order_date"]))
+    counts = ", ".join(f"{month} {n}" for month, n in sorted(months.items()))
+    assert f"order {row['order_id']} left out):\n  {counts}." in server
+    shown = "\n".join(f"  {month}    {n}" for month, n in sorted(months.items()))
+    assert f"  order_date\n{shown}\n  Freq: M, Name: count, dtype: int64" in server
+    raw = collections.Counter(r["order_date"][:7] for r in rows)
+    assert f"would count 2024-02 as {raw['2024-02']}, {len(rows)} in all" in server
+    # the count footers (the same under the mock's pandas 2.2.3 and the tests' pandas)
+    month = pd.to_datetime(kept["order_date"], format="%Y-%m-%d").dt.to_period("M")
+    counts = repr(month.value_counts().sort_index())
+    assert f"```text\n{textwrap.indent(counts, '  ')}\n  ```" in server
+    assert repr(kept.groupby(month).size()).endswith("\nFreq: M, dtype: int64")
+    assert repr(kept.groupby(month)["order_id"].count()).endswith(
+        "\nFreq: M, Name: order_id, dtype: int64"
+    )
+    by_text = repr(month.dt.strftime("%Y-%m").value_counts().sort_index())
+    assert by_text.endswith("\nName: count, dtype: int64") and "Freq" not in by_text
+    assert _prose(
+        "The same counts from `groupby(...).size()` end with `Freq: M, dtype: int64`; from "
+        '`groupby(...)["order_id"].count()` they end with `Freq: M, Name: order_id, dtype: int64`'
+    ) in _prose(server)
+    assert _prose(
+        'from month strings (`strftime("%Y-%m")`) they end with `Name: count, dtype: int64` and '
+        "have no Freq."
+    ) in _prose(server)
+    # the installed packages the suite's overview mock shows
+    installed = re.search(r"^installed: (.+)$", _read(EVALS / "mocks/nh/nh_inspect.md"), re.M)
+    assert f"`<installed packages>`: `{installed.group(1)}`." in server
+
+
+def _four_line_message(server: str) -> str:
+    """The ValueError message nh-server.md gives for a strict parse of order_date."""
+    block = re.search(
+        r"with this message of four lines:\n\n    ```text\n(.*?)\n    ```", server, re.S
+    )
+    return textwrap.dedent(block.group(1))
+
+
+def test_nh_server_pandas_facts():
+    """The pandas texts and dtypes nh-server.md states are pandas 2.2.3's, the version it names.
+    The suite's own pandas words some of them differently (pandas 3 drops ", at position N" and
+    parses to datetime64[us]), so they are checked only where pandas 2.2.3 is installed, e.g.
+    `uv run --project plugins/nh/server --with pandas==2.2.3 --with numpy==2.1.3 pytest ...`.
+    """
+    pd = pytest.importorskip("pandas")
+    server = NH_SERVER.read_text(encoding="utf-8")
+    assert "which has pandas 2.2.3" in server
+    if pd.__version__ != "2.2.3":
+        pytest.skip(f"nh-server.md states pandas 2.2.3's texts; this is pandas {pd.__version__}")
+    frame = pd.read_csv(io.StringIO(_sales_csv()))
+    order_date = frame["order_date"]
+
+    classes: dict[str, type] = {}
+
+    def raised(call) -> tuple[str, str]:
+        try:
+            call()
+        except Exception as exc:  # the class name is the fact under test
+            classes[type(exc).__name__] = type(exc)
+            return type(exc).__name__, str(exc)
+        raise AssertionError("it raised nothing")
+
+    message = _four_line_message(server)
+    assert message.startswith("day is out of range for month, at position 19. You might")
+    for call in (
+        lambda: pd.to_datetime(order_date),
+        lambda: pd.to_datetime(order_date, format="%Y-%m-%d"),
+        lambda: pd.to_datetime(order_date, format="%Y-%m-%d", exact=True),
+        lambda: pd.to_datetime(order_date, errors="raise"),
+    ):
+        assert raised(call) == ("ValueError", message)
+    iso = "Time data 2024-02-30 is not ISO8601 format, at position 19. You might want to try:"
+    assert f"`{iso}`" in server
+    iso_message = iso + message.partition("\n")[1] + message.partition("\n")[2]
+    assert raised(lambda: pd.to_datetime(order_date, format="ISO8601")) == (
+        "ValueError",
+        iso_message,
+    )
+    mixed = "day is out of range for month: 2024-02-30, at position 19"
+    assert f"DateParseError,\n    `{mixed}` (one line)" in server
+    assert raised(lambda: pd.to_datetime(order_date, format="mixed")) == ("DateParseError", mixed)
+    assert raised(lambda: order_date.astype("datetime64[ns]")) == ("DateParseError", mixed)
+    one = message.replace("position 19", "position 0")
+    assert raised(lambda: pd.to_datetime("2024-02-30", format="%Y-%m-%d")) == ("ValueError", one)
+    single = "day is out of range for month: 2024-02-30, at position 0"
+    assert f"`{single}`" in server
+    assert raised(lambda: pd.to_datetime("2024-02-30")) == ("DateParseError", single)
+    stamp = "day is out of range for month: 2024-02-30"
+    assert f'`pd.Timestamp("2024-02-30")`: DateParseError, `{stamp}`' in server
+    assert raised(lambda: pd.Timestamp("2024-02-30")) == ("DateParseError", stamp)
+    plain = ("ValueError", "day is out of range for month")
+    assert raised(lambda: datetime.datetime.strptime("2024-02-30", "%Y-%m-%d")) == plain
+    assert raised(lambda: datetime.date.fromisoformat("2024-02-30")) == plain
+    assert issubclass(classes["DateParseError"], ValueError)
+    assert "DateParseError is a subclass of ValueError" in server
+    parsed = pd.to_datetime(order_date, format="%Y-%m-%d", errors="coerce")
+    assert list(parsed[parsed.isna()].index) == [19]
+    assert (str(parsed.dtype), str(parsed.dt.to_period("M").dtype)) == (
+        "datetime64[ns]",
+        "period[M]",
+    )
+    assert _prose(
+        'Parsed dates have dtype `datetime64[ns]`; `.dt.to_period("M")` gives `period[M]`.'
+    ) in _prose(server)
+
+
+# The self-check line forms nh-server.md gives, by kind: frames (0), series (1), arrays (2),
+# the rest (3). Each form's backticked pieces are in nh-server.md; `<nulls>` is checked below.
+SELF_CHECK_FORMS: list[tuple[int, str]] = [
+    (0, "<name>: new DataFrame <rows>×<cols> (from <sources>)<nulls>"),
+    (0, "<name>: new DataFrame <rows>×<cols and nulls>"),
+    (0, "<name>: DataFrame <old rows>×<old cols> → <rows>×<cols and the rest>"),
+    (0, "<name>: DataFrame <rows>×<cols>; values changed"),
+    (0, "<name>: DataFrame <rows>×<cols and changes>"),
+    (1, "<name>: new Series len <length> <dtype> (from <sources>)<nulls>"),
+    (1, "<name>: new Series len <length> <dtype and nulls>"),
+    (1, "<name>: Series len <length>; values changed"),
+    (1, "<name>: Series <series changes>"),
+    (2, "<name>: new ndarray <shape> <dtype>"),
+    (3, "<name>: new <type> len <length>"),
+    (3, "<name>: new <type> <repr>"),
+    (3, "<name>: new <type>"),
+    (3, "<name>: <old repr> → <repr>"),
+]
+# what the parts of a self-check line may hold (`nulls` differs for frames and series)
+FRAME_NULLS = r"; no nulls|; nulls: \w+ \d+(, \w+ \d+)*"
+SERIES_NULLS = r"(; nulls [1-9]\d*)?"
+MORE = r"( \+\d+ more)?"
+# what changed in a frame that existed: columns, dtypes, missing counts
+FRAME_CHANGES = (
+    rf"(; new columns \w+(, \w+)*{MORE})?(; dropped columns \w+(, \w+)*{MORE})?"
+    rf"(; dtype \w+ \S+ → \S+(, \w+ \S+ → \S+)?{MORE})?(; nulls \w+ \d+ → \d+(, \w+ \d+ → \d+)*{MORE})?"
+)
+SERIES_CHANGES = r"(len \d+ → \d+ \([+-]\d+\)|dtype \S+ → \S+|nulls \d+ → \d+)(; (dtype \S+ → \S+|nulls \d+ → \d+))*"
+SELF_CHECK_PARTS = {
+    "name": r"\w+",
+    "rows": r"\d+",
+    "cols": r"\d+",
+    "old rows": r"\d+",
+    "old cols": r"\d+",
+    "length": r"\d+",
+    "old length": r"\d+",
+    "change with its sign": r"[+-]\d+",
+    "cols and nulls": rf"\d+({FRAME_NULLS})",
+    "cols and the rest": rf"\d+( \([+-]\d+ rows\))?{FRAME_CHANGES}",
+    "cols and changes": rf"\d+{FRAME_CHANGES}",
+    "series changes": SERIES_CHANGES,
+    "dtype and nulls": rf"\S+{SERIES_NULLS}",
+    "shape": r"\(\d+,( \d+)*\)|\(\d+(, \d+)+\)",
+}
+SELF_CHECK_PROSE = [
+    "`<name>: new DataFrame <rows>×<cols> (from <sources>)` and then `; no nulls`, or `; nulls: `",
+    "`<name>: new Series len <length> <dtype> (from <sources>)`, then `; nulls <count>` when it "
+    "has missing values; nothing about nulls when it has none.",
+    "When there are none, leave out ` (from <sources>)`.",
+    "A new NumPy array: `<name>: new ndarray <shape> <dtype>`, with the shape as Python shows a "
+    "tuple, such as `(43,)`.",
+    "`<name>: new <type> <repr>`",
+    'a string shows in single quotes, so `DATE_FORMAT = "%Y-%m-%d"` gives '
+    "`DATE_FORMAT: new str '%Y-%m-%d'`. A repr longer than 40 characters is cut to its first 39 "
+    'and "…".',
+    "`<name>: new <type> len <length>`",
+    "object: `<name>: new <type>`, with the type's bare name, such as `new Index` for a pandas "
+    "Index.",
+    "A frame that changed: `<name>: DataFrame <old rows>×<old cols> → <rows>×<cols>` and ` (<row "
+    "change with its sign> rows)` when its rows changed, or `<name>: DataFrame <rows>×<cols>` when "
+    "its shape stayed. Then, each only when it applies, `; new columns ` and the added columns, "
+    "`; dropped columns ` and the dropped ones, `; dtype ` and `<column> <old dtype> → <dtype>` for "
+    "each column whose dtype changed (two at most, then ` +<count> more`), and `; nulls ` and "
+    "`<column> <old count> → <count>` for each column whose missing count changed; names and pairs "
+    'joined by ", ".',
+    'A series that changed: `<name>: Series ` and then, joined by "; ", each that applies: '
+    "`len <old length> → <length> (<change with its sign>)`, `dtype <old dtype> → <dtype>`, "
+    "`nulls <old count> → <count>`.",
+    "`<name>: DataFrame <rows>×<cols>; values changed`",
+    "`<name>: Series len <length>; values changed`",
+    "`<name>: <old repr> → <repr>`",
+    "old and new description, as in the lines for new names but without `new `, joined by ` → `",
+    "a name whose value did not change gets no line here, only a place in step 2. Modules (such "
+    "as `pd`) are never listed. A name is new when it did not exist before this run: it is not "
+    "`DATA_PATH`, `df` or `schema`, and no earlier run of this message assigned it (a failed run "
+    "did assign the names on the lines before its failing line).",
+    'They are never "new", and `df` is one of them whenever the code uses df without changing it.',
+    "frames first, then series, then arrays, then the rest. One name leads its group: the first "
+    "of these names the code's last line shows, or, when it shows none, the one the code assigns "
+    "last. The lead comes first in its group even when its name sorts later. The others follow "
+    "sorted by name as Python sorts strings",
+    "At most 8 lines in all, the closing line of step 2 included. When step 1 gives more lines "
+    "than fit, keep one fewer than fit and add `… <count> more changed or new names` after them",
+    "`same shape and nulls: ` the frames, series and arrays, `same length: ` the lists, dicts, "
+    "sets and tuples, `same type: ` other objects, `unchanged: ` the numbers and strings.",
+    '(names only, sorted as above, joined by ", ")',
+    "one line only: the whole first self-check line about a frame, a series or an array, copied "
+    "exactly (it starts with `<name>: new DataFrame`, `<name>: new Series`, `<name>: new ndarray`, "
+    "`<name>: DataFrame`, `<name>: Series` or `<name>: ndarray`; frames come first, so it is a "
+    "frame's line when there is one). When it is longer than 100 characters",
+]
+CLOSING_LABELS = ["same shape and nulls", "same length", "same type", "unchanged"]
+
+
+def _self_check_form(line: str) -> tuple[int, dict[str, str]]:
+    """The kind and parts of a self-check line, by the first form in SELF_CHECK_FORMS it fits."""
+    for kind, form in SELF_CHECK_FORMS:
+        values = match_template(form, line)
+        if values is not None:
+            return kind, values
+    raise AssertionError(f"no self-check form fits {line!r}")
+
+
+def _string_constants(code: str) -> dict[str, str]:
+    """The names ``code`` binds to a string literal at top level, with their values."""
+    import ast
+
+    found: dict[str, str] = {}
+    for node in ast.parse(code).body:
+        if isinstance(node, ast.Assign) and isinstance(getattr(node.value, "value", None), str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found[target.id] = node.value.value
+    return found
+
+
+def _check_self_check(checks: list[str], headline: str | None, code: str) -> None:
+    """A result's self-check lines follow the forms and order nh-server.md states."""
+    from nh_gateway import render
+
+    server = _prose(NH_SERVER.read_text(encoding="utf-8"))
+    for piece in SELF_CHECK_PROSE:
+        assert _prose(piece) in server, piece
+    assert render.MAX_SELF_CHECK == 8 and render.HEADLINE_CHARS == 100
+    closing = None
+    if checks and checks[-1].split(": ")[0] in CLOSING_LABELS:
+        closing, checks = checks[-1], checks[:-1]
+        groups = [part.split(": ", 1) for part in closing.split("; ")]
+        labels = [label for label, _ in groups]
+        assert labels == [label for label in CLOSING_LABELS if label in labels], closing
+        for _, names in groups:
+            assert names.split(", ") == sorted(names.split(", ")), closing
+    # df is in the closing line whenever the code uses it and doesn't change it
+    changes_df = re.search(r"(?m)^\s*df\s*(\[[^\n]*\]|\.\w+)?\s*=(?!=)|inplace\s*=\s*True", code)
+    if re.search(r"\bdf\b", code) and not changes_df:
+        same = dict(part.split(": ", 1) for part in (closing or "").split("; ") if part)
+        assert "df" in same.get("same shape and nulls", "").split(", "), (closing, code)
+    # the fixture's names are never new
+    fixture = {"DATA_PATH", "df", "schema"}
+    assert not [line for line in checks if line.split(": new ")[0] in fixture], checks
+    if checks and checks[-1].startswith("… "):
+        assert re.fullmatch(r"… \d+ more changed or new names", checks[-1])
+        assert len(checks) + (closing is not None) == 8
+        checks = checks[:-1]
+    seen: list[tuple[int, str, str]] = []
+    strings = _string_constants(code)
+    for line in checks:
+        kind, values = _self_check_form(line)
+        for part, value in values.items():
+            rule = (FRAME_NULLS if kind == 0 else SERIES_NULLS) if part == "nulls" else None
+            rule = rule or SELF_CHECK_PARTS.get(part)
+            assert rule is None or re.fullmatch(rule, value), (part, line)
+        if values.get("type") == "str" and values["name"] in strings:  # repr, cut at 40
+            shown = repr(strings[values["name"]])
+            assert values["repr"] == (shown if len(shown) <= 40 else shown[:39] + "…"), line
+        seen.append((kind, values["name"], line))
+    assert [kind for kind, _, _ in seen] == sorted(kind for kind, _, _ in seen), checks
+    # one name leads its kind: the first the last line shows, else the last one assigned
+    names = [name for _, name, _ in seen]
+    last = code.rstrip().splitlines()[-1] if code.strip() else ""
+    shown = {n: m.start() for n in names if (m := re.search(rf"\b{re.escape(n)}\b", last))}
+    bound = [n for n in re.findall(r"(?m)^(\w+)\s*=(?!=)", code) if n in names]
+    lead = min(shown, key=shown.__getitem__) if shown else (bound[-1] if bound else None)
+    for kind in {kind for kind, _, _ in seen}:
+        group = [name for k, name, _ in seen if k == kind]
+        first = [lead] if lead in group else []
+        assert group == first + sorted(n for n in group if n != lead), (group, lead)
+    if headline is not None:  # the first data line, cut at a space to 100 characters and "…"
+        data = [line for kind, _, line in seen if kind < 3]
+        if not data or len(data[0]) <= 100:
+            assert headline == (f"; {data[0]}" if data else "")
+        else:
+            shown = headline.removeprefix("; ")
+            kept = shown.removesuffix("…")
+            assert len(shown) <= 100 and shown.endswith("…") and data[0].startswith(kept)
+            assert data[0][len(kept)] in " ,;:-", headline
+
+
+# `<variable lines>` forms (inspect overview and vars), as nh-server.md states them
+VAR_LINE_FORMS = [
+    "<name>: pandas DataFrame <rows>x<cols><frame nulls>; columns: <columns>",
+    "<name>: Series len <length> <dtype>, nulls <count>",
+    "<name>: ndarray <shape> <dtype>",
+    "<name>: <type> len <length>",
+    "<name>: <type> = <repr>",
+    "<name>: <module>.<type>",
+]
+VAR_LINE_PARTS = {
+    "name": r"\w+",
+    "rows": r"\d+",
+    "cols": r"\d+",
+    "length": r"\d+",
+    "count": r"\d+",
+    "frame nulls": r"(, nulls \w+ \d+(, \w+ \d+)*)?",
+    "columns": r"\w+(, \w+)*",
+    "dtype": r"\S+",
+    "shape": SELF_CHECK_PARTS["shape"],
+    "type": r"\w+(?:\.\w+)*",
+    "module": r"\w+(?:\.\w+)*",
+    "repr": r".+",
+}
+VAR_LINE_PROSE = [
+    "a frame: `<name>: pandas DataFrame <rows>x<cols>` then `, nulls <column> <count>` for the "
+    'columns with missing values (joined by ", "; left out when none has any), then `; columns: ` '
+    'and its columns joined by ", ";',
+    "a series: `<name>: Series len <length> <dtype>, nulls <count>`;",
+    "an array: `<name>: ndarray <shape> <dtype>`;",
+    "a number or string: `<name>: <type> = <repr>`; a list, dict, set or tuple: `<name>: <type> "
+    "len <length>`; anything else: `<name>: <module>.<type>`, the module that defines the type "
+    "and its name, such as `pandas.core.indexes.base.Index` for a pandas Index.",
+    "one line per kernel variable, in the order the names were first assigned: `DATA_PATH`, `df` "
+    "and `schema` first, then the names this message's runs assigned. The first three keep their "
+    'lines from "inspect overview, before any run" unless a run assigned them again. A name '
+    "assigned again keeps its place.",
+]
+
+
+def _bound_names(calls: list[Call], seen: list[Any]) -> list[str]:
+    """The names the runs of ``calls`` assigned at top level, in the order first assigned; a run
+    that failed binds only the lines before its failing line."""
+    from tests.fakes.turns import text
+
+    names: list[str] = []
+    for (_, _, args), result in zip(calls, seen, strict=True):
+        body = text(result)
+        head = [line for line in body.splitlines() if not line.startswith("Kernel ≠")]
+        if result.is_error or not head or not re.match(r"(Added|Updated|Re-ran) ", head[0]):
+            continue
+        lines = args.get("code", "").splitlines()
+        failing = re.search(r"^Cell In\[\d+\], line (\d+)$", body, re.M)
+        if failing:
+            lines = lines[: int(failing.group(1)) - 1]
+        names += re.findall(r"(?m)^(\w+)\s*=(?!=)", "\n".join(lines))
+    return list(dict.fromkeys(names))
+
+
+def _check_variable_lines(lines: list[str], calls: list[Call], seen: list[Any]) -> None:
+    """`<variable lines>`: the forms, the fixture's three names first, then first-assigned order."""
+    server = _prose(NH_SERVER.read_text(encoding="utf-8"))
+    for piece in VAR_LINE_PROSE:
+        assert _prose(piece) in server, piece
+    for line in lines:
+        values = next(
+            (
+                v
+                for form in VAR_LINE_FORMS
+                if (v := match_template(form, line, VAR_LINE_PARTS)) is not None
+            ),
+            None,
+        )
+        assert values is not None, line
+        for part, value in values.items():
+            assert re.fullmatch(VAR_LINE_PARTS[part], value), (part, line)
+    names = [line.split(": ", 1)[0] for line in lines]
+    assert names[:3] == ["DATA_PATH", "df", "schema"], lines
+    bound = _bound_names(calls, seen)
+    first = nh_server_templates()["inspect vars, before any run"].splitlines()[:3]
+    for name, line, fixed in zip(names[:3], lines[:3], first, strict=True):
+        if name not in bound:
+            assert line == fixed, (line, fixed)
+    extra = names[3:]
+    assert extra == [n for n in bound if n in extra], (extra, bound)
+
+
+def _tally(calls: list[Call], seen: list[Any]) -> tuple[int, int]:
+    """Retries and undos by nh-server.md's rules: after a failed run, each edit or re-run of the
+    message's cell that is not refused is a retry; each nh_undo that is not refused is an undo."""
+    from tests.fakes.turns import text
+
+    failed, retries, undos = False, 0, 0
+    for (_, tool, _), result in zip(calls, seen, strict=True):
+        if result.is_error:
+            continue
+        if tool == "nh_undo":
+            undos += 1
+            continue
+        head = [line for line in text(result).splitlines() if not line.startswith("Kernel ≠")]
+        if not head or not re.match(r"(Added|Updated|Re-ran) ", head[0]):
+            continue
+        if failed and tool in ("nh_edit_cell", "nh_run"):
+            retries += 1
+        failed = "; it failed with " in head[0]
+    return retries, undos
+
+
+def _loader_state(calls: list[Call], seen: list[Any]) -> tuple[str, str]:
+    """The loader's run number and outline status after ``calls``: [1] and ok until this message
+    runs it, its latest run's number and status after, and " " and STALE once an undo put its
+    old code back (until it runs again)."""
+    from tests.fakes.turns import text
+
+    number, status = "1", "ok"
+    for (_, tool, _), result in zip(calls, seen, strict=True):
+        body = text(result)
+        if result.is_error:
+            continue
+        if tool == "nh_undo" and "\nRestored the previous version of " in f"\n{body}":
+            number, status = " ", "STALE"
+        elif ran := re.search(
+            r'^(?:Updated|Re-ran) "Load raw data and check schema" \[(\d+)\].*?; '
+            r"(ran ok|it failed with (\w+))",
+            body,
+            re.M,
+        ):
+            number, status = (
+                ran.group(1),
+                "ok" if ran.group(2) == "ran ok" else f"ERR {ran.group(3)}",
+            )
+    return number, status
+
+
+def _restored(calls: list[Call], seen: list[Any]) -> bool:
+    """Whether an undo put the loader's old code back and no run came after it."""
+    return _loader_state(calls, seen)[1] == "STALE"
+
+
+def _check_cell_name(value: str, calls: list[Call], seen: list[Any], latest: int) -> None:
+    """`<cell name>`: title and latest run number, the title alone for the restored loader, or
+    the words for an added cell nh_undo removed."""
+    from tests.fakes.turns import text
+
+    server = _prose(NH_SERVER.read_text(encoding="utf-8"))
+    assert (
+        _prose(
+            '`<cell name>` is `"<title>" [<n>]`, the cell\'s title and latest run number. It is '
+            '`"<title>"` alone for the loader after an undo put its old code back (it has no run '
+            "number then), and `a cell nh wrote earlier in this message` for the added cell after "
+            "nh_undo removed it."
+        )
+        in server
+    )
+    removed = any(
+        tool == "nh_undo" and not r.is_error and "\nRemoved " in f"\n{text(r)}"
+        for (_, tool, _), r in zip(calls, seen, strict=True)
+    )
+    if value == "a cell nh wrote earlier in this message":
+        assert removed, value
+    elif numbered := re.fullmatch(r'"[^"]+" \[(\d+)\]', value):
+        assert numbered.group(1) == str(latest) and not _restored(calls, seen), value
+    else:
+        assert re.fullmatch(r'"[^"]+"', value) and _restored(calls, seen), value
+
+
+# the templates that report the message's first run (always 2), and those that report a retry,
+# with the retries used before it (None: their `<r>`)
+FIRST_RUN_TEMPLATES = {
+    "add ok",
+    "add failed",
+    "edit ok, the loader",
+    "edit failed, the loader",
+    "re-run ok, the loader",
+}
+RETRY_TEMPLATES = {
+    "edit ok": None,
+    "edit failed, 1 retry left": 1,
+    "edit failed, no retries left": 2,
+    "re-run failed": None,
+}
+# placeholders whose form is fixed, so a neighbouring placeholder can't take part of them
+PLACEHOLDER_PATTERNS = {
+    "cell name": r'"[^"\n]+"(?: \[\d+\])?|a cell nh wrote earlier in this message',
+    "the loader's name": r'"Load raw data and check schema"(?: \[\d+\])?',
+}
+KERNEL_RULE = (
+    "When an nh_undo result starts with a `Kernel ≠ notebook:` line, every later nh_inspect "
+    'answer that is not a refusal and not "inspect status" starts with that same line, copied '
+    "exactly, above the template's first line (until a run assigns those names again)."
+)
+NO_OUTPUT = "--- output ---\n<output lines>\n"
+HINTS = "--- readability hints (advisory) ---"
+SECTION = re.compile(r"--- .+ ---")
+
+
+def _as_the_mock_shows_it(
+    real: str, template: str, calls: list[Call], seen: list[Any]
+) -> tuple[str, str]:
+    """The real text as nh-server.md tells the mock to show it, with the template to match it:
+    the hints section left out, the "check this" lines and an inspect view's "Kernel ≠ notebook"
+    line checked by their own rules and taken out, and no output section when a run shows
+    nothing. Where the Kernel ≠ notebook rule says the line leads, the real text must have it."""
+    from tests.fakes.turns import text
+
+    server_text = NH_SERVER.read_text(encoding="utf-8")
+    server = _prose(server_text)
+    lines = real.split("\n")
+    results = list(zip(calls, seen, strict=True))
+    undos = [i for i, ((_, t, _), r) in enumerate(results) if t == "nh_undo" and not r.is_error]
+    undo_first = text(seen[undos[-1]]).split("\n")[0] if undos else ""
+    ran_since = bool(undos) and any(
+        t in ("nh_add_cell", "nh_edit_cell", "nh_run") and not r.is_error
+        for (_, t, _), r in results[undos[-1] + 1 :]
+    )
+    # the rule's own case: an inspect view that is not refused and not "status", after an undo
+    # whose result led with the line, and no run since (a run may assign those names again)
+    if (
+        calls[-1][1] == "nh_inspect"
+        and calls[-1][2].get("view") != "status"
+        and not seen[-1].is_error
+        and undo_first.startswith("Kernel ≠ notebook:")
+        and not ran_since
+    ):
+        assert _prose(KERNEL_RULE) in server
+        assert lines[0] == undo_first, f"the undo's Kernel ≠ notebook line does not lead:\n{real}"
+    if lines[0].startswith("Kernel ≠ notebook:") and not template.startswith("Kernel ≠"):
+        tool, args = calls[-1][1], calls[-1][2]
+        assert tool == "nh_inspect" and args.get("view") != "status", real
+        undone = [
+            text(r).split("\n")[0]
+            for (_, t, _), r in zip(calls, seen, strict=True)
+            if t == "nh_undo" and not r.is_error
+        ]
+        assert undone and lines[0] == undone[-1], real
+        assert _prose(KERNEL_RULE) in server
+        del lines[0]
+    if HINTS in lines:  # the mock never shows them
+        assert _prose("never add a `--- readability hints (advisory) ---` section.") in server
+        start = lines.index(HINTS)
+        end = next(i for i in range(start + 1, len(lines)) if SECTION.fullmatch(lines[i]))
+        del lines[start:end]
+    if len(lines) > 2 and lines[2] == "--- check this ---":
+        rule = re.search(r"`--- check this ---` and `([^`]+)`", server_text).group(1)
+        assert "put these two lines right after the `nh:` line" in server
+        end = next(i for i in range(3, len(lines)) if SECTION.fullmatch(lines[i]))
+        for line in lines[3:end]:
+            assert match_template(rule, line) is not None, line
+        del lines[2:end]
+    real = "\n".join(lines)
+    if NO_OUTPUT in template and "\n--- output ---\n" not in real:
+        assert (
+            _prose(
+                "If a run shows nothing at all, leave out the `--- output ---` line and "
+                "`<output lines>`."
+            )
+            in server
+        )
+        template = template.replace(NO_OUTPUT, "")
+    return real, template
+
+
+def _check_output_cut(output: str) -> None:
+    """A long output keeps its start and end around a cut line, then names the full output."""
+    from nh_gateway import config
+    from nh_gateway.exec import shaping
+
+    server = _prose(NH_SERVER.read_text(encoding="utf-8"))
+    lines = output.splitlines()
+    cut = [line for line in lines if line.startswith("[… ")]
+    if not cut:
+        assert "[full output:" not in output
+        return
+    assert config.DEFAULTS["output"]["max_chars"] == 2000 and shaping.HEAD_SHARE == 0.3
+    assert (
+        _prose(
+            "when the shown text (labels included) is longer than 2000 characters, nh keeps about its "
+            "first 30% and its last 70%, whole lines, 2000 characters in all, with the line "
+            "`[… <count> chars cut …]` between them (`<count>`: how many characters were left out, "
+            "with a comma every three digits), and adds the last line "
+            "`[full output: .nh/outputs/<16 lowercase hex digits>.txt]`."
+        )
+        in server
+    )
+    assert len(cut) == 1 and re.fullmatch(r"\[… \d{1,3}(,\d{3})* chars cut …\]", cut[0]), output
+    assert re.fullmatch(r"\[full output: \.nh/outputs/[0-9a-f]{16}\.txt\]", lines[-1]), output
+    assert len(output) <= 2000
+
+
+def _check_prose_rules(
+    name: str, values: dict[str, str], real: str, calls: list[Call], seen: list[Any]
+) -> None:
+    """The rules nh-server.md states in words for a template's placeholders, on the result of
+    ``calls`` (``seen`` holds each call's result)."""
+    server_text = NH_SERVER.read_text(encoding="utf-8")
+    server = _prose(server_text)
+    templates = nh_server_templates()
+    code = next((args["code"] for _, _, args in reversed(calls) if "code" in args), "")
+    from tests.fakes.turns import text
+
+    runs = [int(m.group(1)) for r in seen if (m := re.search(r"\bexec=(\d+)", text(r)))]
+    latest = max(runs, default=1)
+    retries, undos = _tally(calls, seen)
+    # the mock invents nothing: no cell, variable, output or number the calls did not create
+    assert (
+        _prose(
+            "Never show a cell, a variable, an output or a number that the calls so far did not "
+            "create."
+        )
+        in server
+    )
+    if calls[-1][1] == "nh_run" and "mode" not in calls[-1][2]:  # the server's default mode
+        which = _prose(_nh_server_section("Which template"))
+        assert _prose('nh_run (`mode` defaults to "run"):') in which
+    # no placeholder hides a section of the result (only the loader's note check has one)
+    for part, value in values.items():
+        headers = [line for line in value.splitlines() if SECTION.fullmatch(line)]
+        assert headers == (
+            ["--- notices ---"] if headers and part == "notices section lines" else []
+        ), (
+            part,
+            real,
+        )
+    if "k" in values:  # the failing line's number counts every line of the code sent
+        assert code.splitlines()[int(values["k"]) - 1].strip() == values["failing line"], real
+        assert (
+            _prose(
+                "`<k>`: the number of the failing line in the code sent, counting every line, blank "
+                "lines and comment lines included (the first line is 1)."
+            )
+            in server
+        )
+    first = values.get('error summary, and a "." unless it ends with "…" or "."')
+    if first is not None:
+        summary, message = values["error summary"], values["full error message, all its lines"]
+        assert first == summary + ("" if summary.endswith(("…", ".")) else ".")
+        head, _, rest = message.partition("\n")
+        assert summary == f"{values['error name']}: " + (head.rstrip(":") + "…" if rest else head)
+        assert (
+            _prose(
+                "`<error summary>`: `<error name>: ` and the message's whole first line, copied "
+                'exactly. When the message has more lines, replace only that first line\'s final ":" '
+                'with "…".'
+            )
+            in server
+        )
+    if "self-check lines" in values:
+        _check_self_check(
+            values["self-check lines"].splitlines(), values.get("; headline, if any"), code
+        )
+    for part in ("output lines", "printed lines"):
+        if part in values:
+            _check_output_cut(values[part])
+    if "variable lines" in values:
+        _check_variable_lines(values["variable lines"].splitlines(), calls, seen)
+    # run numbers: the message's first run is 2 and each retry takes the next number; a result
+    # that reports no run shows the cell's latest run number
+    assert (
+        _prose(
+            "the message's first run (the add's, or the loader's) is 2, the next run (the first "
+            "retry) is 3, the one after it 4. A refused call runs nothing and takes no number. "
+            "`<this run's number>` is the number of the run the result reports, never the number of "
+            "an earlier run. `<n>` is the cell's latest run number."
+        )
+        in server
+    )
+    assert (
+        _prose(
+            "A retry runs as 2 plus its retry number (3, then 4), so its result never shows the first "
+            "run's 2."
+        )
+        in server
+    )
+    this_run = "this run's number"
+    machine = re.search(r"^nh: cell=\S+ exec=(\S+) .*retries=(\d)/2 .*undos=(\d)/3$", real, re.M)
+    if name in FIRST_RUN_TEMPLATES:
+        assert f"<{this_run}>" not in templates[name] and machine.group(1) == "2" == str(latest)
+    elif name in RETRY_TEMPLATES:
+        used = RETRY_TEMPLATES[name]
+        assert values[this_run] == str(2 + (int(values["r"]) if used is None else used)), real
+        assert values[this_run] == str(latest), real
+    else:
+        assert f"<{this_run}>" not in templates[name], name
+    if "n" in values:
+        assert values["n"] == str(latest), real
+    # retries and undos, counted by the rules
+    assert (
+        _prose(
+            "After a failed run, each nh_edit_cell of the message's cell, and each nh_run re-run of "
+            'it, is a retry: first "retry 1 of 2", then "retry 2 of 2". There is no third. `<r>` and '
+            "`<retries used>` are the number of retries used so far, counting the one this result "
+            "reports."
+        )
+        in server
+    )
+    assert (
+        _prose(
+            "Each nh_undo that is not refused counts one; `<undos used>` is how many did (0 until "
+            "then)."
+        )
+        in server
+    )
+    if machine:
+        assert (int(machine.group(2)), int(machine.group(3))) == (retries, undos), real
+    for part, count in (("r", retries), ("retries used", retries), ("undos used", undos)):
+        if part in values:
+            assert values[part] == str(count), (part, real)
+    if "cell name" in values:
+        _check_cell_name(values["cell name"], calls, seen, latest)
+    loader_number, loader_status = _loader_state(calls, seen)
+    if "the loader's name" in values:
+        title = '"Load raw data and check schema"'
+        wanted = title if loader_status == "STALE" else f"{title} [{loader_number}]"
+        assert values["the loader's name"] == wanted, real
+        assert (
+            _prose(
+                '`<the loader\'s name>` is its `<cell name>`: `"Load raw data and check schema" [1]` '
+                "until this message runs it."
+            )
+            in server
+        )
+    if name == "inspect status":
+        assert (
+            _prose(
+                "Make up the folder, path, URL, pid and versions once (jupyter_server 2 or newer, "
+                "collaboration 5 or newer) and keep them in every answer."
+            )
+            in server
+        )
+        gateway = _gateway_source()
+        assert "major is not None and major < 2" in gateway  # discovery skips older servers
+        assert "major is not None and major < 5" in gateway  # E131 below collaboration 5
+    if "status, padded with spaces to 10 characters" in values:
+        status, summary = (
+            values["status, padded with spaces to 10 characters"],
+            values["summary lines"],
+        )
+        assert status == status.rstrip().ljust(10) and summary.startswith("  → ")
+        summary = summary.removeprefix("  → ")
+        if status.rstrip() == "ok":
+            assert len(summary) <= 60 and "\n" not in summary
+        else:
+            assert status.rstrip() == "ERR " + summary.split(":")[0] and len(summary) <= 160
+    if "the loader's run number" in values:
+        status = values["the loader's status, padded with spaces to 10 characters"]
+        summary = values["the loader's summary lines"]
+        assert status == status.rstrip().ljust(10)
+        assert (values["the loader's run number"], status.rstrip()) == (
+            loader_number,
+            loader_status,
+        ), real
+        if loader_status == "STALE":
+            assert summary == "", real
+        elif loader_status == "ok":
+            assert summary.startswith("  → ") and len(summary) <= 64, real
+        else:
+            assert summary.startswith(f"  → {loader_status[4:]}: "), real
+        assert (
+            _prose(
+                "`<the loader's run number>` is its latest run number (1 until this message runs it), "
+                "or a single space after an undo put its old code back; its status is then `STALE` "
+                "and its summary nothing."
+            )
+            in server
+        )
+    if name == "re-run failed":
+        after = (
+            "edit failed, 1 retry left" if values["r"] == "1" else "edit failed, no retries left"
+        )
+        last = templates[after].splitlines()[-1]
+        last = last.replace("<title>", values["title"]).replace(f"<{this_run}>", values[this_run])
+        assert real.splitlines()[-1] == last
+    if name == "re-run ok, the loader":  # the loader's own outputs, as inspect cell shows them
+        shown = templates["inspect cell, the loader"].partition("--- outputs ---\n")[2]
+        assert _prose(values["output lines"]).replace(" str ", " object ") == _prose(shown)
+    if name == "E110 after a failure":
+        left = 2 - retries
+        assert values['"2 retries" or "1 retry"'] == ("2 retries" if left == 2 else "1 retry")
+    if name == "E120 note":
+        title = calls[-1][2]["title"]
+        for line in values["problem lines"].splitlines():
+            if line.startswith("- L003: "):
+                found = re.fullmatch(
+                    r"- L003: The title has (\d+) words \(max 8\): `(.+)`(\..*)", line
+                )
+                words, shown, fix = found.groups()
+                assert int(words) == len(title.split())
+                assert shown == (title if len(title) <= 60 else title[:59] + "…"), shown
+                assert (
+                    _prose(
+                        'then the title in backticks, cut to its first 59 characters and "…" when '
+                        "it is longer than 60"
+                    )
+                    in server
+                )
+                assert f"`{fix}`" in server_text
+                assert "`- L003: The title has <words> words (max 8): `" in server_text
+            else:
+                line = re.sub(
+                    r"has (1 bullet|\d+ bullets|no bullets);", "has <count> bullet;", line
+                )
+                assert f"`{line}`" in server_text
+    if name == "E120 view":
+        line = values["problem line"]
+        line = re.sub(r"\(got '[^']*'\)", "(got '<view sent>')", line)
+        assert f"`{line}`" in server_text, line
+    if "notices section lines" in values:
+        notice = re.search(r"`(--- notices ---)` and\n`(Note unchanged [^`]+)`", server_text)
+        wanted = "" if "notes" in calls[-1][2] else "\n".join(notice.groups())
+        assert values["notices section lines"] == wanted, real
+    if name == "run wait":
+        state = values["state lines"]
+        assert state == "finished" or state.startswith("failed with ValueError: "), state
+    if name in ("undo, names left", "undo, the loader, names left"):
+        names = re.findall(r"`([^`]+)`", values["names"])
+        assert names == sorted(names) and values["names"] == ", ".join(f"`{n}`" for n in names)
+        assert values['"holds" for one name, else "hold"'] == (
+            "holds" if len(names) == 1 else "hold"
+        )
+        assert "pd" not in names and "(not modules such as `pd`)" in server
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("name,index", AGENT_CASES, ids=[f"{n}#{i}" for n, i in AGENT_CASES])
+async def test_nh_server_template_matches_the_real_gateway(name: str, index: int):
+    pytest.importorskip("pandas")
+    pytest.importorskip("matplotlib")
+    from tests.fakes.turns import text
+
+    _, calls = AGENT_SCENARIOS[name][index]
+    seen: list[Any] = []
+    result = await replay({}, calls, seen)
+    real, template = _as_the_mock_shows_it(text(result), nh_server_templates()[name], calls, seen)
+    values = match_template(template.removeprefix(ERROR_PREFIX), real, PLACEHOLDER_PATTERNS)
+    assert values is not None, f"{name!r} drifted from the gateway:\n{real}"
+    assert template.startswith(ERROR_PREFIX) == result.is_error, real
+    _check_prose_rules(name, values, real, calls, seen)
+    if name == "inspect var":  # its first line is the name's "inspect vars" line
+        shown = text(await replay({}, [*calls[:-1], _inspect("vars")])).splitlines()
+        assert values['the name\'s line, exactly as "inspect vars" shows it'] in shown
+        args = calls[-1][2]
+        if args["name"] == "df" and len(calls) == 1:  # the head, from print(df) in nh-server.md
+            rows = args.get("rows", 5)
+            printed = _printed_df()[: rows + 1]
+            if rows <= 10:
+                printed = [printed[0][1:]] + [line[0] + line[2:] for line in printed[1:]]
+            assert values["first rows lines"].splitlines() == printed
+            assert _prose(
+                "When `rows` is 10 or less the index has one digit, so pandas prints each line one "
+                "space narrower: remove one space from the start of the header line (it then "
+                "starts with 3 spaces, not 4) and one space right after the index number of each "
+                "row."
+            ) in _prose(NH_SERVER.read_text(encoding="utf-8"))
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+async def test_nh_server_check_this_and_scalar_var_rules_match_the_gateway():
+    pytest.importorskip("pandas")
+    from tests.fakes.turns import text
+
+    server = NH_SERVER.read_text(encoding="utf-8")
+    lines = text(await replay({}, [_add(), _edit(DATES_BAD_ROWS)])).splitlines()
+    rule = re.search(r"`--- check this ---` and `([^`]+)`", server).group(1)
+    assert "right after the `nh:` line" in server and lines[2] == "--- check this ---"
+    assert match_template(rule, lines[3]) == {"name": "bad_rows", "rows": "1", "percent": "97"}
+    edited = "\n".join(lines[:2] + lines[4:])
+    assert match_template(nh_server_templates()["edit ok"], edited) is not None, edited
+    scalar = text(await replay({}, [_inspect("var", name="DATA_PATH")])).splitlines()
+    assert "the second line is `--- value ---` and the third its repr" in _prose(server)
+    assert scalar == [
+        "DATA_PATH: str = '../data/sales.csv'",
+        "--- value ---",
+        "'../data/sales.csv'",
+    ]
+    assert "a number or string: `<name>: <type> = <repr>`" in server
+    # a list and a pandas object, as "inspect vars" and "inspect var" show them
+    for name, line in (
+        ("BAD_IDS", "`<name>: <type> len <length>`"),
+        ("COLUMNS", "`<name>: <module>.<type>`"),
+    ):
+        calls = [_add(DATES_KEPT_FAIL), _inspect("var", name=name)]
+        shown = text(await replay({}, calls)).splitlines()
+        listed = text(await replay({}, [*calls[:-1], _inspect("vars")])).splitlines()
+        assert shown[0] in listed and shown[1] == "--- value ---" and len(shown) == 3, shown
+        assert match_template(line.strip("`"), shown[0]) is not None and line in _prose(server)
+    assert "such as `pandas.core.indexes.base.Index` for a pandas Index." in _prose(server)
+
+
+# The worked examples in nh-server.md, each with the calls it is the result of.
+EXAMPLE_ADD = (
+    'DATE_FORMAT = "%Y-%m-%d"\n'
+    'order_dates = pd.to_datetime(df["order_date"], format=DATE_FORMAT)\n'
+    'orders_per_month = order_dates.dt.to_period("M").value_counts().sort_index()\n'
+    "orders_per_month"
+)
+EXAMPLE_BY_ID = (
+    'DATE_FORMAT = "%Y-%m-%d"\n'
+    "BAD_ORDER_IDS = [1020]\n"
+    'df_dated = df[~df["order_id"].isin(BAD_ORDER_IDS)]\n'
+    'order_dates = pd.to_datetime(df_dated["order_date"], format=DATE_FORMAT)\n'
+    'orders_per_month = order_dates.dt.to_period("M").value_counts().sort_index()\n'
+    "orders_per_month"
+)
+EXAMPLE_GROUPBY = (
+    'excluded = df[df["order_id"] == 1020]\n'
+    'print("Left out:")\n'
+    "print(excluded)\n"
+    "df_dated = df.drop(excluded.index)\n"
+    'order_month = pd.to_datetime(df_dated["order_date"], format="%Y-%m-%d").dt.to_period("M")\n'
+    'orders_per_month = df_dated.groupby(order_month)["order_id"].count()\n'
+    "orders_per_month"
+)
+EXAMPLES = [
+    [_add(EXAMPLE_ADD)],
+    [_add(EXAMPLE_ADD), _edit(EXAMPLE_BY_ID)],
+    [_add(EXAMPLE_ADD), _edit(EXAMPLE_GROUPBY)],
+]
+
+
+def _as_pandas_2_2_3(text: str) -> str:
+    """The suite's pandas 3 words these two facts differently from the pandas 2.2.3 nh-server.md
+    describes (test_nh_server_pandas_facts checks the 2.2.3 texts)."""
+    text = text.replace("datetime64[us]", "datetime64[ns]")
+    return text.replace(
+        "day is out of range for month. You might",
+        "day is out of range for month, at position 19. You might",
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+async def test_nh_server_worked_examples_match_the_gateway():
+    pytest.importorskip("pandas")
+    from tests.fakes.turns import text
+
+    section = _nh_server_section("Worked examples")
+    examples = re.findall(
+        r"^### [^\n]+\n\n```python\n(.*?)\n```\n\n```text\n(.*?)\n```$", section, re.M | re.S
+    )
+    assert len(examples) == len(EXAMPLES) == section.count("\n### ")
+    templates = nh_server_templates()
+    for (code, shown), calls in zip(examples, EXAMPLES, strict=True):
+        assert calls[-1][2]["code"] == code
+        seen: list[Any] = []
+        real = _as_pandas_2_2_3(text(await replay({}, calls, seen)))
+        lines = [line for line in real.split("\n") if not line.startswith("nh: cell=")]
+        lines = lines[: lines.index("--- next ---")]
+        if HINTS in lines:
+            lines = lines[: lines.index(HINTS)]
+        assert re.sub(r"ran ok in \d+\.\ds", "ran ok in 0.1s", "\n".join(lines)) == shown, real
+        # and it is a template filled in
+        name = "add failed" if len(calls) == 1 else "edit ok"
+        real, template = _as_the_mock_shows_it(real, templates[name], calls, seen)
+        assert match_template(template, real) is not None, real
 
 
 # ------------------------------------------------------------------ docs follow the gateway

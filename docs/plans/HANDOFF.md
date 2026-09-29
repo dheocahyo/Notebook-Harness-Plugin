@@ -19,7 +19,7 @@ Evals at d93bb5b: 8 of 9 cases pass. error-retry fails the same way at 1a04ea7 a
 
 Two workflows were stopped for the move. Their work is saved here; both patches apply cleanly to this commit, error-retry first and then C4 (checked with `git apply`).
 
-### 1. error-retry rework (next): `error-retry-wip.patch`
+### 1. error-retry rework: done (reviewed, fixed, committed; the patch is removed)
 
 - **What it does.** error-retry now uses `type: agent` mocks. A model plays the gateway from templates and data facts in `error-retry/mocks/nh/fixtures/nh-server.md`, so the answers follow the code actually sent. There are case-level nh_add_cell (expect guard kept), nh_edit_cell, nh_inspect, nh_run and nh_undo mocks.
   - The prompt asks for a strict parse (`format="%Y-%m-%d"`, no `errors="coerce"`, no try/except), and asks to leave out and name a bad order.

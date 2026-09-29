@@ -12,10 +12,10 @@
    with the template below. Offer **undo**, then wait.
 
 Template (plain words, no stack dump):
-> "Parse order dates" [2] still fails. The failing code is
-> `pd.to_datetime(df["order_date"])`. Python said: "day is out of range for
-> month, at position 19". The likely cause is an impossible date in the data
-> (row 19 is 2024-02-30). One fix: parse with `errors="coerce"`, which turns bad
+> "Parse signup dates" [4] still fails. The failing code is
+> `pd.to_datetime(df["signup_date"])`. Python said: "day is out of range for
+> month, at position 7". The likely cause is an impossible date in the data
+> (row 7 is 2023-11-31). One fix: parse with `errors="coerce"`, which turns bad
 > dates into missing values, then count them. Say **undo** to remove the cell,
 > or tell me how you'd like to handle bad dates.
 
