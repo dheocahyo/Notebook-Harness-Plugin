@@ -168,14 +168,24 @@ def _lint_failure(
     return NhError("E120", detail="\n".join(lines), next_step=next_step)
 
 
+HIDDEN_ONLY = "\n  (only a hidden [redacted:…] value changed)"
+
+
 def diff_lines(old: str, new: str, limit: int = 6) -> str:
+    """The lines that changed from ``old`` to ``new``, at most ``limit``. Both are redacted
+    before the diff and the cut: a private key cut above its END line would show its body
+    (review of C3). A change only inside a hidden value says so, not an empty diff."""
+    red = secrets.current().redact
+    shown_old, shown_new = red(old), red(new)
     diff = [
         line
-        for line in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0)
+        for line in difflib.unified_diff(
+            shown_old.splitlines(), shown_new.splitlines(), lineterm="", n=0
+        )
         if not line.startswith(("---", "+++", "@@"))
     ]
     if not diff:
-        return ""
+        return HIDDEN_ONLY if old != new and shown_old == shown_new else ""
     shown = diff[:limit]
     more = f"\n  … {len(diff) - limit} more changed lines" if len(diff) > limit else ""
     return "\n" + "\n".join(f"  {line}" for line in shown) + more
@@ -198,8 +208,13 @@ def user_change(svc: Services, uid: str, ref: NotebookRef, current: str) -> str:
     last = nh_last_source(svc, uid, ref)
     if last is not None:
         return diff_lines(last, current)
-    head = "\n".join(f"  {line}" for line in current.splitlines()[:6])
-    return f"\nThe cell now reads:\n{head}" if head else ""
+    head = head_lines(current)
+    return f"\nThe cell now reads:{head}" if head else ""
+
+
+def head_lines(source: str, limit: int = 6) -> str:
+    """The first ``limit`` lines of ``source``, redacted before the cut (see diff_lines)."""
+    return "".join(f"\n  {line}" for line in secrets.current().redact(source).splitlines()[:limit])
 
 
 def nh_wrote(svc: Services, uid: str, ref: NotebookRef, current: str) -> bool:
@@ -908,7 +923,7 @@ async def edit_cell(
                 raise NhError(
                     "E141",
                     cell=f"the note above {target_label}",
-                    diff="\n" + "\n".join(f"  {line}" for line in note.source.splitlines()[:6]),
+                    diff=head_lines(note.source),
                     next_step=next_for(
                         turn,
                         "Ask the user; keep their wording in notes= or leave the note alone "

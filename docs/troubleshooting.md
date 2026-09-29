@@ -55,7 +55,7 @@ Find the code below.
 | A cell shows QUEUED | it waits behind another cell already running in the kernel (maybe yours) | wait, or stop the running cell in JupyterLab; the agent adds nothing meanwhile |
 | **E117** stopped before it finished | the cell was interrupted (by you, or by the agent at your request) | say whether to re-run it, change it or leave it; nh doesn't re-run a stopped cell unasked |
 | **E118** typed into before it ran | you edited nh's new cell before its run started, so nh ran nothing | say whether to run your version, restore nh's (undo) or leave it |
-| **E125** "Not written: the code holds nh's [redacted:…] marker, not the real value." | nh hides secrets (tokens, passwords, keys from `.env` or the environment) from the agent as `[redacted:NAME]`, and the agent copied that marker into a cell | nothing to do: the agent reads the value with `os.environ` without printing it, or asks you to type that line in JupyterLab. nh never writes the real value back for it. If the hidden value is no secret (a plain setting whose name has TOKEN, SECRET, PASSWORD or KEY in it), rename that variable in `.env` or unset it |
+| **E125** "Not written: the code holds nh's [redacted:…] marker, not the real value." | nh hides secrets (tokens, passwords, keys from `.env` or the environment) from the agent as `[redacted:NAME]`, and the agent copied that marker into a cell | nothing to do: the agent reads the value from the environment or `.env` without printing it, or asks you to type that line in JupyterLab (a marker like `[redacted:password]` names no variable). nh never writes the real value back for it. If the hidden value is no secret: nh hides a setting (in `.env` or the environment) whose name looks secret (TOKEN, SECRET, PASSWORD, KEY…), and any other `.env` value of 16+ characters unless its name ends in a word for a place or label (`_PATH`, `_DIR`, `_URL`, `_HOST`, `_NAME`, `_SCHEMA`…). Rename it to end in such a word (`MODEL_VARIANT` → `MODEL_VARIANT_NAME`) or unset it |
 | **E133** kernel busy | another cell (maybe yours) is running | wait for it, or interrupt it in JupyterLab |
 | **E140** cell not found | the cell was moved, re-created or deleted in JupyterLab | the agent re-reads the outline; nothing to do |
 | **E141** you changed the cell | nh won't overwrite your edits silently, and doesn't run a cell you typed into before it started (the reminder then says "not run") | the agent shows the change and asks first |
@@ -78,12 +78,15 @@ Find the code below.
 | `.nh/logs/gateway.log` | nh's MCP server |
 | `.nh/logs/hooks.log` | hook errors (hooks never block Claude Code on their own failure) |
 | `.nh/logs/env-sync.log` | `nhctl env sync` |
-| `.nh/logs/jupyterlab.log` | the JupyterLab `nhctl lab start` launched |
+| `.nh/logs/jupyterlab.log` | the JupyterLab `nhctl lab start` launched, and what its kernels write straight to their output (subprocess, `os.system`, C libraries), raw. `nhctl lab status --log` shows its tail with secrets hidden |
 | `.nh/log.jsonl` | one event per turn and cell (no code, no outputs), used by `nhctl metrics` |
 | `.nh/state/` | turn records, stamps, last cell, env and JupyterLab records |
 
-Tokens never appear in these files. Don't edit `.nh/` by hand; nh blocks the
-agent from doing so too.
+nh never writes the JupyterLab token into these files. Other secrets can reach
+the logs raw when a tool prints them: uv or conda in `env-sync.log`, a kernel's
+subprocess in `jupyterlab.log`. nh shows the agent their tails through `nhctl`,
+with secrets hidden. Don't edit `.nh/` by hand; nh blocks the agent from doing
+so too.
 
 ## Reinstall or remove
 

@@ -369,6 +369,8 @@ def check_nbstripout(problems: Problems, project: Path) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> Result:
+    # Installs the project's redactor first: a check's message may echo a .env value (§6.8).
+    common.project_root(getattr(args, "project", None), required=False)
     problems = Problems()
     if sys.platform.startswith(("win", "cygwin")):
         problems.add(

@@ -102,7 +102,7 @@ full output.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_chars` | `2000` | Characters of cell output per result (head and tail; tracebacks keep the tail). The full text is saved under `.nh/outputs/`. |
+| `max_chars` | `2000` | Characters of cell output per result (head and tail; tracebacks keep the tail). The full text is saved under `.nh/outputs/`, with secrets shown as `[redacted:NAME]` as in the result; the notebook keeps the raw output. |
 | `max_images` | `2` | Images per result. |
 | `image_max_px` | `768` | Longest side of an image sent to the agent, in pixels. |
 

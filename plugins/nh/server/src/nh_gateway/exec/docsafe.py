@@ -17,6 +17,7 @@ import math
 from typing import Any
 
 from .._shared import secrets
+from .._shared.text import terminal_text
 from ..backend.base import OutputSummary
 
 MAX_SAFE_INT = 2**53 - 1
@@ -202,7 +203,8 @@ def doc_outputs(
 def output_summary(outputs: list[dict[str, Any]]) -> OutputSummary:
     """Cheap summary for the outline: types, first error, first text line, image count. No decoding.
 
-    The error and the text head are redacted before they are cut (design §6.8)."""
+    The error and the text head are shown as a terminal shows them, and redacted before they
+    are cut (design §6.8)."""
     summary = OutputSummary(count=len(outputs))
     redactor = secrets.current()
     for output in outputs:
@@ -211,7 +213,7 @@ def output_summary(outputs: list[dict[str, Any]]) -> OutputSummary:
             summary.types.append(kind)
         if kind == "error" and summary.error is None:
             error = f"{output.get('ename', '')}: {output.get('evalue', '')}"
-            summary.error = redactor.redact_head(error, 160)[:160]
+            summary.error = _clean_head(redactor, error, 160, strip=False)
         text = ""
         if kind == "stream":
             text = output.get("text") or ""
@@ -222,5 +224,25 @@ def output_summary(outputs: list[dict[str, Any]]) -> OutputSummary:
         if isinstance(text, list):
             text = "".join(text)
         if text.strip() and not summary.text_head:
-            summary.text_head = redactor.redact_head(text.strip(), 200)[:200]
+            summary.text_head = _clean_head(redactor, text, 200, strip=True)
     return summary
+
+
+def _clean_head(redactor: secrets.Redactor, text: str, limit: int, strip: bool) -> str:
+    """The first ``limit`` characters of ``text`` as a terminal shows it (no ANSI escapes, \\r
+    progress or control characters), redacted before the cut: a colour code inside a value hid
+    it from the redactor (review of C3). Only a window is cleaned, grown until its redacted form
+    reaches ``limit`` plus the redactor's margin, as :meth:`Redactor.redact_head` does."""
+    if strip:
+        text = text[len(text) - len(text.lstrip()) :]
+    want = limit + redactor.margin
+    size = want
+    while True:
+        whole = size >= len(text)
+        cleaned = terminal_text(text[:size])
+        if strip:
+            cleaned = cleaned.strip() if whole else cleaned.lstrip()
+        out = redactor.redact(cleaned)
+        if whole or len(out) >= want:
+            return out[:limit]
+        size *= 2

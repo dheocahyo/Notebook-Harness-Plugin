@@ -40,6 +40,10 @@ START_TIMEOUT_S = 30
 STOP_TIMEOUT_S = 10
 PROBE_TIMEOUT_S = 3
 LOG_FILE = "jupyterlab.log"
+LOG_LINES = 40
+# Kernels write their fd-level output (subprocess, C libraries) into the log raw, so nh points
+# Claude at this scrubbed tail, never at the file (design §6.8).
+SHOW_LOG = "nhctl lab status --log"
 BARE_PYTHONS = ("python", "python3")
 SERVER_FILE = re.compile(r"jpserver-\d+\.json$")
 # Environment the launched server must not inherit: nhctl passes its own token.
@@ -55,6 +59,9 @@ def add_parsers(sub: argparse._SubParsersAction, common_opts: argparse.ArgumentP
     start.add_argument("--timeout", type=float, default=START_TIMEOUT_S)
     start.set_defaults(func=cmd_start)
     status = lab_sub.add_parser("status", parents=[common_opts], help="is it running?")
+    status.add_argument(
+        "--log", action="store_true", help=f"also show its log's last {LOG_LINES} lines, redacted"
+    )
     status.set_defaults(func=cmd_status)
     stop = lab_sub.add_parser("stop", parents=[common_opts], help="stop it")
     stop.set_defaults(func=cmd_stop)
@@ -375,7 +382,7 @@ def cmd_start(args: argparse.Namespace) -> Result:
         "notebook": notebook,
         "session": session,
         "browser_opened": opened,
-        "log": None if lab.get("adopted") else f".nh/logs/{LOG_FILE}",
+        "log": None if lab.get("adopted") else SHOW_LOG,
         "warnings": warnings,
     }
     verb = {
@@ -468,7 +475,7 @@ def _wait_for_server(
             raise NhctlError(
                 "D145",
                 f"JupyterLab exited during startup (exit {proc.returncode}).",
-                f"See .nh/logs/{LOG_FILE}.",
+                f"See {SHOW_LOG}.",
                 data={"log_tail": common.tail(log_path)},
             )
         time.sleep(0.2)
@@ -476,7 +483,7 @@ def _wait_for_server(
     raise NhctlError(
         "D146",
         f"JupyterLab didn't start within {timeout:.0f}s.",
-        f"See .nh/logs/{LOG_FILE}, then retry nhctl lab start.",
+        f"See {SHOW_LOG}, then retry nhctl lab start.",
         data={"log_tail": common.tail(log_path)},
     )
 
@@ -515,6 +522,16 @@ def cmd_status(args: argparse.Namespace) -> Result:
     project = common.project_root(getattr(args, "project", None))
     assert project is not None
     layout = paths.Layout(project)
+    result = _status(project, layout)
+    if getattr(args, "log", False):
+        log_tail = common.tail(layout.logs / LOG_FILE, LOG_LINES)  # scrubbed (design §6.8)
+        result.data["log_tail"] = log_tail
+        head = f"--- .nh/logs/{LOG_FILE}, last {LOG_LINES} lines ---"
+        result.text += f"\n{head}\n{log_tail or '(empty)'}"
+    return result
+
+
+def _status(project: Path, layout: paths.Layout) -> Result:
     lab, server = current_lab(layout)
     if server is None:
         _, found, _ = find_project_server(project, runtime_dirs())

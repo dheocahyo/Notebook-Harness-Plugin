@@ -97,7 +97,9 @@ def test_printed_errors_are_redacted(env, project):
 
 
 # `nhctl lab status` with its command swapped for one that fails or returns ``data``, run
-# through main(): what reaches stdout and stderr (design §6.8; review of C3).
+# through main(): what reaches stdout and stderr (design §6.8; review of C3). The "d199",
+# "net" and "tail" modes take away the later scrubs, so each site is the only one that could
+# pass its test.
 DRIVER = """
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
@@ -111,7 +113,20 @@ def data(args):
     smtp = os.environ["SMTP_PASSWORD"]
     conf = "password=" + json.dumps(secret)
     return common.Result({"detail": f"login failed: {smtp}", f"conf {smtp}": conf}, "", 1)
-lab.cmd_status = fail if sys.argv[2] == "fail" else data
+def control(args):
+    return common.Result({"detail": "login with " + os.environ["CTRL_TOKEN"]}, "", 0)
+lab.cmd_status = {"fail": fail, "d199": fail, "control": control}.get(sys.argv[2], data)
+if sys.argv[2] == "d199":  # what main hands print_result, before print_result's own scrubs
+    common.print_result = lambda result, as_json: print(json.dumps(result.data))
+if sys.argv[2] == "net":  # print_result's whole-line scrub on its own
+    common.scrub_data = lambda value: value
+if sys.argv[2] == "tail":
+    secrets.install(secrets.Redactor.for_project(None))
+    path = os.path.join(os.environ["NH_TEST_DIR"], "x.log")
+    with open(path, "w") as handle:
+        handle.write(f"one\\napi_token={secret}\\nthree\\n")
+    print(common.tail(path, 2))
+    sys.exit(0)
 if sys.argv[2] == "scrub_data":
     secrets.install(secrets.Redactor.for_project(None))
     shown = common.scrub_data({f"token={secret}": [1, None, 2.5, ValueError(f"password={secret}")]})
@@ -120,6 +135,7 @@ if sys.argv[2] == "scrub_data":
 sys.exit(main.main(["lab", "status", "--json"]))
 """
 PW = "Wx9Kp2Lm" + "7Qz4Rt8V"  # fake
+CTRL = "Qw\x01" + "Er7Ty9Ui2Op"  # fake; json.dumps writes \u0001, which no redactor form is
 SMTP = 'Pa"ss' + "\\w0rd99"  # fake; JSON escapes its quote and backslash
 
 
@@ -151,3 +167,36 @@ def test_json_strings_are_redacted_before_json_escapes_them(python):
     proc = drive(python, "scrub_data")  # keys, lists and other objects too
     shown = {"token=[redacted:token]": [1, None, 2.5, "password=[redacted:password]"]}
     assert json.loads(proc.stdout) == shown, proc.stderr
+
+
+def test_a_value_json_writes_as_a_unicode_escape_is_redacted_before_json_dumps(python):
+    """scrub_data's own case: the line net can't match ``\\u0001``, the form json.dumps gives
+    a control character."""
+    proc = drive(python, "control", CTRL_TOKEN=CTRL)
+    assert json.loads(proc.stdout) == {"detail": "login with [redacted:CTRL_TOKEN]"}, proc.stderr
+    assert CTRL[3:] not in proc.stdout
+
+
+def test_the_printed_line_is_redacted_without_scrub_data(python):
+    """print_result's whole-line scrub on its own, with scrub_data taken away."""
+    proc = drive(python, "net")
+    assert proc.returncode == 1, proc.stderr
+    assert proc.stdout.count("[redacted:SMTP_PASSWORD]") == 2
+    assert "w0rd99" not in proc.stdout
+
+
+def test_d199s_message_is_redacted_before_print_result(python):
+    """main scrubs D199's message itself: print_result, patched to print what it gets, shows it
+    already redacted."""
+    proc = drive(python, "d199")
+    error = json.loads(proc.stdout)["error"]
+    line = "could not reach postgresql://[redacted:url-userinfo]@db/x, api_token=[redacted:token]"
+    assert error["code"] == "D199", proc.stderr
+    assert error["message"] == f"nhctl hit an internal error: ConnectionError: {line}"
+    assert PW[:4] not in proc.stdout + proc.stderr
+
+
+def test_a_log_tail_is_redacted(python, tmp_path):
+    """common.tail scrubs what it returns: envsync writes it to env-sync.json unprinted."""
+    proc = drive(python, "tail", NH_TEST_DIR=str(tmp_path))
+    assert proc.stdout == "api_token=[redacted:token]\nthree\n", proc.stderr

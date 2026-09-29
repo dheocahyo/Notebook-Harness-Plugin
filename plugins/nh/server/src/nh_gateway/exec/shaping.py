@@ -23,7 +23,7 @@ from typing import Any
 from PIL import Image
 
 from .._shared import secrets
-from .._shared.text import clip
+from .._shared.text import clip, terminal_text
 from ..backend.base import ErrorInfo, OutputSummary
 from ..render import error_summary
 
@@ -34,14 +34,6 @@ PNG_LIMIT = 150 * 1024  # larger PNGs are re-encoded as JPEG q80
 MAX_DECODE_PIXELS = 40_000_000
 MAX_HTML_CHARS = 1_000_000
 
-_ANSI = re.compile(
-    r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI: colours, cursor movement
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC: titles, hyperlinks
-    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"  # DCS, SOS, PM, APC
-    r"|\x1b[@-Z\\-_]"  # other two-byte escapes
-)
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_SURROGATE = re.compile("[\ud800-\udfff]")
 # A bare object repr: "<Figure size 640x480 with 1 Axes>", "<IPython.core.display.HTML object>".
 _OBJECT_REPR = re.compile(r"^<[^\n<>]*>$")
 _CHAIN = re.compile(
@@ -124,10 +116,6 @@ class _Section:
             return body
         sep = "\n" if "\n" in body else " "
         return f"[{self.label}]{sep}{body}"
-
-
-def strip_ansi(text: str) -> str:
-    return _ANSI.sub("", text)
 
 
 def redact(text: str) -> str:
@@ -281,25 +269,39 @@ def _bundle(out: dict) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _collapse_cr(text: str) -> str:
-    """Progress bars: keep what a terminal shows, the text after the last \\r on each line."""
-    if "\r" not in text:
-        return text
-    lines = text.replace("\r\n", "\n").split("\n")
-    return "\n".join(line.rstrip("\r").rsplit("\r", 1)[-1] for line in lines)
-
-
 def _clean(text: str) -> str:
-    text = _collapse_cr(strip_ansi(text))
-    text = _SURROGATE.sub("\ufffd", _CONTROL.sub("", text))
-    return redact(text.rstrip("\n"))
+    return redact(terminal_text(text).rstrip("\n"))
+
+
+FIRST_LINE_WINDOW = 4000  # the first window _first_line cleans, past its margin
+FIRST_LINE_MAX = 1 << 20  # and the most it grows to
 
 
 def _first_line(text: str, limit: int) -> str:
-    # Redacted with a margin past the 4000-char window, so a secret across it goes whole.
-    window = text[: 4000 + secrets.current().margin]
-    line = next((ln.strip() for ln in _clean(window).splitlines() if ln.strip()), "")
-    return clip(line, limit)
+    """The first non-blank line, cleaned and redacted, clipped to ``limit``. Only a window is
+    cleaned: it starts at the first non-blank character and grows until that line ends (or is
+    longer than ``limit``) in its safe part, the part more than the redactor's margin before its
+    raw edge, where a secret the edge cuts can't reach (review of C3)."""
+    start = len(text) - len(text.lstrip())
+    margin = secrets.current().margin
+    size = FIRST_LINE_WINDOW + margin
+    while True:
+        end = start + size
+        whole = end >= len(text) or size >= FIRST_LINE_MAX
+        cleaned = _clean(text[start:end])
+        safe = cleaned if whole else cleaned[: max(0, len(cleaned) - margin)]
+        lines = safe.split("\n")
+        for index, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if whole or index < len(lines) - 1 or len(line) > limit:
+                return clip(line, limit)
+            break  # the line may go on past the safe part
+        else:
+            if whole:
+                return ""
+        size *= 2
 
 
 def _coalesce_streams(outputs: Iterable[Any]) -> list[dict]:

@@ -118,7 +118,7 @@ Then:
 |---|---|
 | `nh:` line | machine fields: cell id, `exec`, turn, retries, waits, undos; for nh's cell writer only, also `revisions` (QA revisions used/allowed). Never repeat the id to the user |
 | `--- check this ---` | surprises: rows went to 0, over half the rows removed, rows grew after a merge, an all-null new column, unchanged shape despite a drop. Lead your reply with these |
-| `--- output ---` | the real output (head and tail, at most 2,000 characters; full copy under `.nh/outputs/`) and up to 2 images |
+| `--- output ---` | the real output (head and tail, at most 2,000 characters; full copy under `.nh/outputs/`) and up to 2 images. Both show secrets as `[redacted:NAME]`; never copy a marker into code (E125) |
 | `--- error ---` | the error and the failing code line, when the cell failed |
 | `--- self-check ---` | before → after: frame shapes and nulls, new and removed names |
 | `--- readability hints (advisory) ---` | up to 5 hints quoting the code; offer "tidy" |

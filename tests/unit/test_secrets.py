@@ -7,10 +7,13 @@ time from pieces, so secret scanners reading the repo don't flag them.
 
 from __future__ import annotations
 
+import html
+import os
 import reprlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -104,6 +107,145 @@ def test_long_paths_and_names_in_dotenv_stay_visible(tmp_path: Path) -> None:
     assert r.redact(text) == text
 
 
+def test_places_labels_and_file_paths_stay_visible_but_not_a_key_that_looks_like_one(
+    tmp_path: Path,
+) -> None:
+    kept = {
+        "DATA_DIRECTORY": "/srv/shared/churn/data",
+        "TRANSFORMERS_CACHE": "/Volumes/models/hf-cache",
+        "REPORT_TITLE": "Quarterly Revenue Report",
+        "CHART_LABEL": "Monthly active users",
+        "SLACK_CHANNEL": "#data-science-alerts",
+        "INPUT_CSV": "data/raw/customers_2024.csv",  # a file path with an extension
+    }
+    dotenv = "".join(f"{name}={value}\n" for name, value in kept.items())
+    key = "/wJalrXUtnFEMIK7MDENG" + "bPxRfiCYFAKEKEY12"  # base64 may start with "/"
+    r = redactor(tmp_path, dotenv + f"S3_CREDS={key}\nUPLOAD_SPEC=/data/in/q3@2026.csv\n")
+    assert r.names == ["S3_CREDS", "UPLOAD_SPEC"]  # no "." in a key; "@" is no path
+    text = " ".join(kept.values())
+    assert r.redact(text) == text
+    assert r.redact(f"FileNotFoundError: {kept['INPUT_CSV']}") == (
+        f"FileNotFoundError: {kept['INPUT_CSV']}"
+    )
+    assert r.redact(f"creds {key}") == "creds [redacted:S3_CREDS]"
+
+
+def test_a_secret_named_value_that_the_file_shows_under_a_plain_name_is_weak(
+    tmp_path: Path,
+) -> None:
+    # docker-compose style: the user, the password and the database are one word
+    r = redactor(
+        tmp_path, "POSTGRES_USER=superset\nPOSTGRES_PASSWORD=superset\nPOSTGRES_DB=superset\n"
+    )
+    assert len(r) == 0
+    assert r.redact("import superset; FROM superset.orders") == (
+        "import superset; FROM superset.orders"
+    )
+    # not set under a name nh shows: still redacted, and a long plain value isn't "shown"
+    r = redactor(
+        tmp_path,
+        "POSTGRES_USER=analytics\nPOSTGRES_PASSWORD=warehouse99\n"
+        "BACKUP_NOTE=a-long-plain-value-99\nOLD_SECRET=a-long-plain-value-99\n",
+    )
+    assert r.names == ["BACKUP_NOTE", "POSTGRES_PASSWORD"]
+    assert r.redact("warehouse99 analytics") == "[redacted:POSTGRES_PASSWORD] analytics"
+
+
+def test_a_key_file_path_is_no_secret_but_the_key_is(tmp_path: Path) -> None:
+    path = "/Users/someone/keys/sa-project.json"
+    environ = {
+        "GOOGLE_APPLICATION_CREDENTIALS": path,
+        "AWS_SECRET_ACCESS_KEY": "/wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYFAKEKEY",
+    }
+    r = redactor(tmp_path, "SSL_KEY_FILE_SECRET=~/certs/client.pem\n", environ)
+    assert r.names == ["AWS_SECRET_ACCESS_KEY"]
+    assert r.redact(f"FileNotFoundError: {path}") == f"FileNotFoundError: {path}"
+    inline = '{"type": "service_account", "private_key_id": "0fake1fake2fake3"}'
+    r = redactor(tmp_path, f"GOOGLE_APPLICATION_CREDENTIALS={inline}\n")
+    assert r.names == ["GOOGLE_APPLICATION_CREDENTIALS"]
+    assert r.redact(inline) == "[redacted:GOOGLE_APPLICATION_CREDENTIALS]"
+
+
+def test_a_url_that_may_carry_credentials_is_redacted_whatever_its_name(tmp_path: Path) -> None:
+    sas = (
+        "https://acct.blob.core.windows.net/c/sales.csv?sv=2024-01-01&se=2026-12-31&sp=r"
+        "&sig=FAKEsigAbCdEf0123456789FAKEsig%3D"
+    )
+    s3 = (
+        "https://bkt.s3.amazonaws.com/sales.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Signature=fa4e0000deadbeef1111fake2222cafe3333"
+    )
+    bot = "https://api.example.com/bot1234567:AAHfakeFAKEfake0123/getUpdates"
+    r = redactor(
+        tmp_path,
+        f"DATA_URL={sas}\nS3_URL={s3}\nBOT_URL={bot}\n"
+        "PLAIN_URL=https://host/data/sales_2026.csv\n"
+        "MLFLOW_TRACKING_URI=http://localhost:5000\nDOCS_URL=https://example.com/a/b/c/d\n",
+    )
+    assert sorted(r.names) == ["BOT_URL", "DATA_URL", "S3_URL"]
+    assert r.redact(f"403 Client Error: Forbidden for url: {sas}") == (
+        "403 Client Error: Forbidden for url: [redacted:DATA_URL]"
+    )
+    assert r.redact(s3) == "[redacted:S3_URL]"
+    kept = "https://host/data/sales_2026.csv http://localhost:5000 https://example.com/a/b/c/d"
+    assert r.redact(kept) == kept
+    assert secrets.url_may_hold_credentials(sas) and secrets.url_may_hold_credentials(bot)
+    assert not secrets.url_may_hold_credentials("https://host/data/sales_2026.csv")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://host/data/sales_2026.csv",
+        "s3://bucket/raw/sales.parquet",
+        "https://acct.blob.core.windows.net/c/x.csv?sv=1&sig=FAKEsig0123",
+        "https://host/x.csv#access_token=FAKE0123",
+        "https://api.example.com/bot1234567:AAHfakeFAKEfake0123/getUpdates",
+        "https://host/files/0f8fad5b-d9cb-469f-a165-70867728950e.csv",
+        "postgresql://me:ab/cd@db/sales",
+        "https://user:pw@host/x.csv",
+        "http://[::1",
+    ],
+)
+def test_scaffold_and_the_redactor_read_a_data_url_alike(url: str) -> None:
+    """Scaffold sends a data URL that may carry credentials to .env as DATA_URL, and the
+    redactor hides that same URL: one set of rules (review of C3)."""
+    from nh_gateway._shared.scaffold import core
+
+    try:
+        to_env = core.split_secret_url(url)[1]
+    except ValueError:  # scaffold refuses a URL it can't parse; the redactor hides it
+        to_env = True
+    assert to_env is secrets.url_may_hold_credentials(url)
+
+
+def test_a_url_password_is_its_own_value_so_a_cut_inside_it_is_caught(tmp_path: Path) -> None:
+    url = (
+        "postgresql://reporting:Wd8kLq2mZp4xR7vN@warehouse-prod.cluster-fake00"
+        ".us-east-1.rds.example.com:5432/sales"
+    )
+    vars_view = reprlib.Repr()
+    vars_view.maxstring = 80  # nh_inspect's vars view
+    shown = vars_view.repr(url)
+    assert "Wd8kLq2mZp4xR7" in shown  # the head cut falls inside the password
+    for r in (
+        redactor(tmp_path, f"DATABASE_URL={url}\n"),  # a URL: exempt from the length rule
+        redactor(tmp_path, environ={"MONGO_URI": url}),  # a URL's password, any name
+    ):
+        out = r.redact(shown)
+        assert "Wd8kLq2mZp4xR7"[:8].lower() not in out.lower(), out
+        assert r.redact("password Wd8kLq2mZp4xR7vN ok") == f"password [redacted:{r.names[0]}] ok"
+    # short enough that the tail piece holds the password's end, with no "://" before it
+    short = "postgresql://u:Wd8kLq2mZp4xR7vNaB3cD4eF5gH6@db.internal.example:5432/sales_prod_2026"
+    r = redactor(tmp_path, f"DATABASE_URL={short}\n")
+    out = r.redact(vars_view.repr(short))
+    assert "eF5gH6" not in out and "Wd8kLq" not in out, out
+    # a port is no password, and a plain address stays
+    r = redactor(tmp_path, "LAB_URL=http://127.0.0.1:8888/lab/tree/work\n")
+    assert len(r) == 0
+    assert r.redact("'http://127.0.0.1:8888...'") == "'http://127.0.0.1:8888...'"
+
+
 def test_process_env_values_count_only_when_secret_named(tmp_path: Path) -> None:
     environ = {
         "GITHUB_TOKEN": "gh-env-value-123",
@@ -113,9 +255,11 @@ def test_process_env_values_count_only_when_secret_named(tmp_path: Path) -> None
         "MY_SECRET": "short",
     }
     assert env_values(environ) == [("GITHUB_TOKEN", "gh-env-value-123")]
-    assert env_values({"SMTP_PASSWORD": 'Pa"ss\\w0rd99'}) == [  # and as --json escapes it
+    assert env_values({"SMTP_PASSWORD": 'Pa"ss\\w0rd99'}) == [  # and as --json escapes it,
         ("SMTP_PASSWORD", 'Pa"ss\\w0rd99'),
         ("SMTP_PASSWORD", 'Pa\\"ss\\\\w0rd99'),
+        ("SMTP_PASSWORD", 'Pa"ss\\\\w0rd99'),  # as repr shows it,
+        ("SMTP_PASSWORD", "Pa&quot;ss\\w0rd99"),  # and HTML-escaped
     ]
     r = redactor(tmp_path, environ=environ)
     text = "gh-env-value-123 in /Users/me/the-secret-project, home /Users/someone-with-a-long-home"
@@ -159,10 +303,52 @@ def test_a_dotenv_value_is_also_redacted_as_the_file_writes_it(tmp_path: Path) -
     assert dotenv_values([("API_SECRET", decoded)]) == [
         ("API_SECRET", decoded),
         ("API_SECRET", 'line-one\\nline-\\"two\\"-99'),
+        ("API_SECRET", 'line-one\\nline-"two"-99'),  # repr
+        ("API_SECRET", "line-one\nline-&quot;two&quot;-99"),  # html.escape
     ]
     assert r.redact(f"value: {decoded}") == "value: [redacted:API_SECRET]"
     shown = 'API_SECRET="line-one\\nline-\\"two\\"-99"'  # cat .env
     assert r.redact(shown) == 'API_SECRET="[redacted:API_SECRET]"'
+
+
+@pytest.mark.parametrize(
+    ("line", "value"),
+    [
+        (
+            'DB_PASSWORD="Sup3r\'S3cret\\"Passw0rd-2026"',
+            "Sup3r'S3cret\"Passw0rd-2026",
+        ),  # both quotes
+        ("DB_PASSWORD='Sup3r\"S3cret\\Passw0rd-2026'", 'Sup3r"S3cret\\Passw0rd-2026'),  # " and \\
+        (
+            'DB_PASSWORD="Sup3r\'S3\\"cret\\\\Passw0rd-2026"',
+            "Sup3r'S3\"cret\\Passw0rd-2026",
+        ),  # all 3
+    ],
+)
+def test_a_value_is_redacted_as_python_shows_it(tmp_path: Path, line: str, value: str) -> None:
+    r = redactor(tmp_path, line + "\n")
+    assert repr(value)[1:-1] not in (value, secrets._encode(value))  # neither form matches it
+    assert r.redact(repr(value)) == "'[redacted:DB_PASSWORD]'"
+    assert r.redact(repr({"pw": value})) == "{'pw': '[redacted:DB_PASSWORD]'}"
+    assert r.redact(repr([value])).count("[redacted:DB_PASSWORD]") == 1
+
+
+def test_a_value_is_redacted_html_escaped(tmp_path: Path) -> None:
+    value = "Sup3r&S3cret<Passw0rd>2026'q\""
+    r = redactor(tmp_path, f"DB_PASSWORD={value}\n")
+    table = f"<td>{html.escape(value)}</td><td>{html.escape(value, quote=False)}</td>"
+    assert r.redact(table) == "<td>[redacted:DB_PASSWORD]</td><td>[redacted:DB_PASSWORD]</td>"
+
+
+def test_a_value_is_redacted_in_any_case(tmp_path: Path) -> None:
+    r = redactor(tmp_path, f"DB_PASSWORD={PASSWORD}\nAPI_TOKEN=0123456789abcdef0123\n")
+    text = f"{PASSWORD.upper()} {PASSWORD.lower()} {PASSWORD.swapcase()} 0123456789ABCDEF0123"
+    assert r.redact(text) == " ".join(["[redacted:DB_PASSWORD]"] * 3 + ["[redacted:API_TOKEN]"])
+    # İ lowers to two chars: the ASCII-only fallback keeps the offsets, and still finds it
+    assert r.redact(f"İ {PASSWORD.upper()} İ") == "İ [redacted:DB_PASSWORD] İ"
+    # values that differ only in case are one value, under the first name
+    r = redactor(tmp_path, "A_TOKEN=abcdefgh12\nB_TOKEN=ABCDEFGH12\n")
+    assert r.names == ["A_TOKEN"] and r.redact("AbCdEfGh12") == "[redacted:A_TOKEN]"
 
 
 def test_a_weak_value_is_never_redacted_as_a_value(tmp_path: Path) -> None:
@@ -244,7 +430,77 @@ def test_parse_env() -> None:
 
 def test_an_unclosed_quote_takes_the_rest() -> None:
     assert parse_env("A='open\nB=2") == [("A", "open"), ("B", "2")]
-    assert parse_env('A="open\nB=2') == [("A", "open\nB=2")]
+    # the rest, and the opening line alone; then on at the next line, as python-dotenv
+    # (which skips a statement it can't parse) still loads B
+    assert parse_env('A="open\nB=2') == [("A", "open\nB=2"), ("A", "open"), ("B", "2")]
+
+
+def test_an_unclosed_quote_doesnt_hide_the_later_secrets(tmp_path: Path) -> None:
+    r = redactor(
+        tmp_path, 'NOTE="see the wiki\nDB_PASSWORD=zyxwvuts98765\nHF_TOKEN=abcdEFGH1234zz\n'
+    )
+    assert r.redact("pw zyxwvuts98765 tok abcdEFGH1234zz") == (
+        "pw [redacted:DB_PASSWORD] tok [redacted:HF_TOKEN]"
+    )
+
+
+def test_parse_env_also_reads_as_python_dotenv_does() -> None:
+    text = "\n".join(
+        [
+            "\ufeffBOM_TOKEN=zyxwvuts98765",  # a byte-order mark
+            "'API_TOKEN'=abcdEFGH1234zz",  # a quoted name
+            "DB_PASSWORD='it\\'s-a-secret-123'",  # an escaped single quote
+            "SERVICE_SECRET='line1-aaaaaaaa",  # a single quote across lines
+            "line2-bbbbbbbb'",
+            "NEXT=1",
+        ]
+    )
+    assert parse_env(text) == [
+        ("BOM_TOKEN", "zyxwvuts98765"),
+        ("API_TOKEN", "abcdEFGH1234zz"),
+        ("DB_PASSWORD", "it\\"),  # the literal reading
+        ("DB_PASSWORD", "it's-a-secret-123"),  # and python-dotenv's
+        ("SERVICE_SECRET", "line1-aaaaaaaa"),
+        ("SERVICE_SECRET", "line1-aaaaaaaa\nline2-bbbbbbbb"),
+        ("NEXT", "1"),
+    ]
+
+
+def test_a_bom_or_quoted_reading_is_redacted(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_bytes(
+        "\ufeffDB_PASSWORD=zyxwvuts98765\nSERVICE_SECRET='line1-aaaaaaaa\nline2-bbbbbbbb'\n"
+        "OTHER_PASSWORD='it\\'s-a-secret-123'\n".encode()
+    )
+    r = Redactor.for_project(tmp_path, {})
+    text = "zyxwvuts98765 / line1-aaaaaaaa\nline2-bbbbbbbb / it's-a-secret-123"
+    assert r.redact(text) == (
+        "[redacted:DB_PASSWORD] / [redacted:SERVICE_SECRET] / [redacted:OTHER_PASSWORD]"
+    )
+
+
+def test_a_variable_is_expanded_both_ways(tmp_path: Path) -> None:
+    dotenv = (
+        "DB_PASSWORD=filepw-12345\n"
+        "DSN=postgres://u:${DB_PASSWORD}@h/x\n"
+        "API_KEY=${KEY_PREFIX:-dflt}-Zq8Wx7Vc6Bn5\n"
+        "LITERAL_SECRET='${DB_PASSWORD}-not-expanded'\n"
+    )
+    pairs, used = secrets._expanded(secrets._readings(dotenv), {"DB_PASSWORD": "envpw-67890"})
+    assert pairs == [
+        ("DB_PASSWORD", "filepw-12345"),
+        ("DSN", "postgres://u:${DB_PASSWORD}@h/x"),
+        ("DSN", "postgres://u:filepw-12345@h/x"),  # dotenv_values: the file wins
+        ("DSN", "postgres://u:envpw-67890@h/x"),  # load_dotenv: the environment wins
+        ("API_KEY", "${KEY_PREFIX:-dflt}-Zq8Wx7Vc6Bn5"),
+        ("API_KEY", "dflt-Zq8Wx7Vc6Bn5"),
+        ("LITERAL_SECRET", "${DB_PASSWORD}-not-expanded"),
+    ]
+    assert used == ("DB_PASSWORD", "KEY_PREFIX")
+    r = redactor(tmp_path, dotenv, {"KEY_PREFIX": "live"})
+    assert r.redact("live-Zq8Wx7Vc6Bn5") == "[redacted:API_KEY]"
+    # a used variable that changes rebuilds the redactor
+    again = Redactor.for_project(tmp_path, {"KEY_PREFIX": "test"})
+    assert again is not r and again.redact("test-Zq8Wx7Vc6Bn5") == "[redacted:API_KEY]"
 
 
 # --- secret-shaped names ----------------------------------------------------------------------
@@ -392,6 +648,20 @@ def test_name_parts() -> None:
         ('SECRET_KEY = "django-insecure-0a1b2c3d"', 'SECRET_KEY = "[redacted:key]"'),
         (f"STRIPE_KEY = '{STRIPE}'", "STRIPE_KEY = '[redacted:key]'"),
         ("OPENAI_KEY=Abc12345678", "OPENAI_KEY=[redacted:key]"),
+        # a quoted phrase runs to the quote that opened it, the other quote inside it
+        ('password="p@ss\'word-FAKE-2026x"', 'password="[redacted:password]"'),
+        ("password='p@ss\"word-FAKE-2026x'", "password='[redacted:password]'"),
+        ('{\\"password\\": \\"a\'b-FAKE-2026\\"}', '{\\"password\\": \\"[redacted:password]\\"}'),
+        ("client_secret = 'it\"s-FAKE-2026' # x", "client_secret = '[redacted:secret]' # x"),
+        # a lookup key's value stops at ";": it can't swallow the next pair
+        ("sort_key=abc1;api_key=realsecret123", "sort_key=abc1;api_key=[redacted:key]"),
+        ("sort_key=abcdefgh1,api_key=realsecret123", "sort_key=abcdefgh1,api_key=[redacted:key]"),
+        # a URL cut inside its password (reprlib, pandas): the "@" never came
+        (
+            "'postgresql://reporting:Wd8kLq2mZp4xR7...us-east-1.rds.example.com:5432/sales'",
+            "'postgresql://[redacted:url-userinfo]...us-east-1.rds.example.com:5432/sales'",
+        ),
+        ("redis://:hunter2x…", "redis://[redacted:url-userinfo]…"),
         # İ lowercases to two characters: the offsets must still be the text's
         ("İstanbul token=abc123def", "İstanbul token=[redacted:token]"),
         (
@@ -473,6 +743,12 @@ def test_each_pattern(text: str, expected: str) -> None:
         "partition_key='user_12345678'",
         "key=value12345678",
         'special = {"pad_token": "[PAD]", "cls_token": "[CLS]"}',
+        # a host and port cut short: an all-digit "password" is a port
+        "'http://localhost:8888...'",
+        "http://127.0.0.1:8888/lab…",
+        "https://[::1]:8888...",
+        "postgresql://app:{password}...",
+        "sort_key=abcdefgh;cache_key=abcdefgh",
     ],
 )
 def test_patterns_leave_code_placeholders_and_public_keys_alone(text: str) -> None:
@@ -484,6 +760,8 @@ def test_the_case_insensitive_patterns_scan_a_lowercase_copy_of_the_same_length(
     # (v0.2's first cut) send every pattern down a 30x slower path
     assert secrets._fold("İstanbul TOKEN=Ab") == "istanbul token=ab"
     assert secrets._fold("ÀÉ Straße ǅ") == "àé straße ǆ"
+    # Σ lowers by its context (final sigma): folded alone and inside a text, it must agree
+    assert secrets._fold("ΑΣ ΑΣΒ") == "ασ ασβ"
 
 
 def test_an_unterminated_private_key_is_redacted_up_to_its_end() -> None:
@@ -540,6 +818,27 @@ def test_pieces_of_a_cut_secret_are_redacted(tmp_path: Path) -> None:
         assert "[redacted:DB_PASSWORD]" in out, text
         assert value[:12] not in out and value[-12:] not in out, out
     assert r.redact(reprlib.repr(value)) == "'[redacted:DB_PASSWORD]...[redacted:DB_PASSWORD]'"
+
+
+def test_pieces_of_a_secret_bearing_value_are_redacted(tmp_path: Path) -> None:
+    hook = "https://hooks.slack.com/services/T0FAKE00000/B0FAKE00000/fAkEwEbHoOkSeCrEt0123456"
+    dsn = "https://0fake1fake2fake3fake4fake5fake6f@o000000.ingest.sentry.io/0000000"
+    r = redactor(tmp_path, f"SLACK_WEBHOOK_URL={hook}\nSENTRY_DSN={dsn}\n")
+    vars_view = reprlib.Repr()
+    vars_view.maxstring = 80
+    assert r.redact(vars_view.repr(hook)) == (
+        "'[redacted:SLACK_WEBHOOK_URL]...[redacted:SLACK_WEBHOOK_URL]'"
+    )
+    assert r.redact(f"0  alerts  {dsn[:45]}...") == "0  alerts  [redacted:SENTRY_DSN]..."
+
+
+def test_a_piece_is_caught_when_the_value_has_a_dot_where_it_was_cut(tmp_path: Path) -> None:
+    value = "Fk9x7Q2zLm4R.t8Vw3Yb6Nc1.Pd5Hs0Jq"
+    r = redactor(tmp_path, f"API_SECRET={value}\n")
+    assert r.redact(f"{value[:12]}...") == "[redacted:API_SECRET]..."  # the value goes on ".t8V"
+    assert r.redact(f"...{value[-9:]}") == f"...{value[-9:]}"  # under FRAGMENT_MIN
+    assert r.redact(f"x...{value[-13:]}") == "x...[redacted:API_SECRET]"  # after ".", a cut
+    assert r.redact(f"{value[:24]}…") == "[redacted:API_SECRET]…"
 
 
 def test_short_or_unmarked_pieces_stay(tmp_path: Path) -> None:
@@ -687,6 +986,67 @@ def test_for_project_is_cached_until_dotenv_env_or_added_values_change(tmp_path:
     assert Redactor.for_project(other, {}).names == ["JUPYTER_TOKEN"]  # its own slot
 
 
+def test_a_failed_read_is_not_cached(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file")
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("DB_PASSWORD=zyxwvuts98765\n")
+    dotenv.chmod(0o000)
+    try:
+        assert len(Redactor.for_project(tmp_path, {})) == 0
+    finally:
+        dotenv.chmod(0o600)  # only the ctime changes
+    assert Redactor.for_project(tmp_path, {}).redact("zyxwvuts98765") == "[redacted:DB_PASSWORD]"
+
+
+def test_a_same_size_edit_with_its_old_mtime_is_seen(tmp_path: Path) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("DB_PASSWORD=zyxwvuts98765\n")
+    first = Redactor.for_project(tmp_path, {})
+    before = dotenv.stat()
+    time.sleep(0.05)
+    dotenv.write_text("DB_PASSWORD=abcdefgh54321\n")  # the same size
+    os.utime(dotenv, ns=(before.st_atime_ns, before.st_mtime_ns))  # cp -p, touch -r, rsync -t
+    assert dotenv.stat().st_mtime_ns == before.st_mtime_ns
+    second = Redactor.for_project(tmp_path, {})
+    assert second is not first and second.redact("abcdefgh54321") == "[redacted:DB_PASSWORD]"
+
+
+def test_only_the_first_mib_of_dotenv_is_read(tmp_path: Path) -> None:
+    pad = "# " + "x" * 98 + "\n"
+    head = "DB_PASSWORD=zyxwvuts98765\n"
+    body = pad * (secrets.DOTENV_MAX_BYTES // len(pad) + 1)  # past the cap
+    (tmp_path / ".env").write_text(head + body + "LATE_SECRET=abcdefgh54321\n")
+    r = Redactor.for_project(tmp_path, {})
+    assert r.names == ["DB_PASSWORD"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes")
+@pytest.mark.parametrize("link", [False, True])
+def test_a_named_pipe_dotenv_is_never_opened(tmp_path: Path, link: bool) -> None:
+    # 1Password mounts .env as a named pipe: reading it blocks until its writer answers
+    pipe = tmp_path / ("env.pipe" if link else ".env")
+    os.mkfifo(pipe)
+    if link:
+        (tmp_path / ".env").symlink_to(pipe)
+    script = (
+        "import sys; sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "from nh_gateway._shared import secrets\n"
+        "r = secrets.Redactor.for_project(Path(sys.argv[2]), {'API_TOKEN': 'env-token-123'})\n"
+        "print(r.names, r.redact('env-token-123'))\n"
+        "print(secrets._read_dotenv(Path(sys.argv[2]) / '.env'))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(SERVER_SRC), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,  # a blocked open would hang here
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["['API_TOKEN'] [redacted:API_TOKEN]", "None"]
+
+
 def test_current_is_patterns_only_until_installed(tmp_path: Path) -> None:
     assert secrets.current() is PATTERNS_ONLY
     assert secrets.redact("token=abc123") == "token=[redacted:token]"  # never the identity
@@ -730,12 +1090,46 @@ def test_a_keyed_pattern_is_compiled_only_once_a_text_holds_its_word() -> None:
     ]
 
 
+# --- scan time: linear on long runs -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "-".join(f"task-{i}" for i in range(110_000)),  # words ending in "sk" before "-"
+        "sk-" * 350_000,
+        "x" + "github_pat_" * 95_000,
+        "axoxb-" * 175_000,
+        "a_key=" * 175_000,  # a key with no digit in its value
+        "x-api-key:" * 105_000,
+        ";".join(["cache_key=abc", "sort_key=def", "lookup_key=ghi"] * 25_000),
+        "://" + "a" * 250 + ":" + "b" * 511 + "x" * 1_000_000,  # a userinfo that never ends
+    ],
+    ids=["task", "sk", "github_pat", "xoxb", "a_key", "x-api-key", "key-config", "userinfo"],
+)
+def test_a_megabyte_of_near_misses_scans_in_time(text: str) -> None:
+    assert len(text) >= 1_000_000
+    started = time.perf_counter()
+    PATTERNS_ONLY.redact(text)
+    assert time.perf_counter() - started < 2.0  # quadratic took over 60 s (review of C3)
+
+
+def test_a_key_needs_a_digit_within_its_first_64_chars() -> None:
+    inside = "a" * (secrets.KEY_DIGIT_WITHIN - 1) + "1"
+    past = "a" * secrets.KEY_DIGIT_WITHIN + "1"
+    assert PATTERNS_ONLY.redact(f"api_key={inside}") == "api_key=[redacted:key]"
+    assert PATTERNS_ONLY.redact(f"api_key={past}") == f"api_key={past}"
+
+
 # --- Python 3.9 (the hooks and nhctl) ---------------------------------------------------------
 
 
 @pytest.mark.skipif(shutil.which("/usr/bin/python3") is None, reason="no /usr/bin/python3")
 def test_it_imports_and_redacts_under_the_system_python(tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    (tmp_path / ".env").write_bytes(
+        f"\ufeffDB_PASSWORD={PASSWORD}\nDATABASE_URL=postgresql://u:Wd8kLq2mZp4xR7vN@h/db\n"
+        "API_KEY=${KEY_PREFIX:-dflt}-Zq8Wx7Vc6Bn5\n".encode()
+    )
     script = (
         "import sys; sys.path.insert(0, sys.argv[1])\n"
         "from pathlib import Path\n"
@@ -751,11 +1145,16 @@ def test_it_imports_and_redacts_under_the_system_python(tmp_path: Path) -> None:
             script,
             str(SERVER_SRC),
             str(tmp_path),
-            f"{PASSWORD} token=ab12",
+            f"{PASSWORD.upper()} token=ab12 'postgresql://u:Wd8kLq2m... dflt-Zq8Wx7Vc6Bn5 sk-"
+            + "a" * 30,
         ],
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.splitlines() == ["True", "[redacted:DB_PASSWORD] token=[redacted:token]"]
+    assert proc.stdout.splitlines() == [
+        "True",
+        "[redacted:DB_PASSWORD] token=[redacted:token] '[redacted:DATABASE_URL]... "
+        "[redacted:API_KEY] sk-" + "a" * 30,
+    ]

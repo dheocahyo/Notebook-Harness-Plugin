@@ -63,6 +63,25 @@ def test_uv_sync_failure_reports_log_tail(env, project):
     assert not (project / ".nh/state/env.json").exists()
 
 
+def test_a_failed_syncs_log_tail_is_redacted_on_disk_too(env, project):
+    """envsync writes common.tail into .nh/state/env-sync.json, which print_result never sees
+    (design §6.8; review of C3)."""
+    scaffolded(env, project)
+    secret = "Fk7Qm2Wz" + "9Lp4Xv8R"  # fake
+    with open(project / ".env", "a") as handle:
+        handle.write(f"\nPRIVATE_INDEX_TOKEN={secret}\n")
+    env.script("uv", f"""
+        if [ "$1" = "--version" ]; then echo "uv 0.10.6 (fake)"; exit 0; fi
+        echo "error: 401 from https://pypi.example/simple with token {secret}" >&2
+        exit 2
+        """)  # fmt: skip
+    proc = env.run("env", "sync", "--json", cwd=project)
+    assert proc.returncode == 1, proc.stderr
+    status = (project / ".nh/state/env-sync.json").read_text()
+    assert "with token [redacted:PRIVATE_INDEX_TOKEN]" in json.loads(status)["log_tail"]
+    assert secret not in status + proc.stdout + proc.stderr
+
+
 def test_too_old_jupyterlab_is_an_error(env, project):
     scaffolded(env, project)
     fake_uv(env, {"python": "3.12.1", "jupyterlab": "4.2.0", "jupyter_collaboration": None})

@@ -106,7 +106,7 @@ def _split_array(inner: str):
 def _mini_loads(text: str) -> dict[str, Any]:
     root: dict[str, Any] = {}
     table = root
-    for raw_line in text.splitlines():
+    for number, raw_line in enumerate(text.splitlines(), 1):
         line = _strip_comment(raw_line)
         if not line:
             continue
@@ -118,5 +118,9 @@ def _mini_loads(text: str) -> dict[str, Any]:
             continue
         pair = _PAIR.match(line)
         if pair:
-            table[pair.group(1)] = _value(pair.group(2))
+            try:
+                table[pair.group(1)] = _value(pair.group(2))
+            except (ValueError, SyntaxError):
+                # names the line, never the value: doctor prints this, and it may be a password
+                raise ValueError(f"Invalid value for {pair.group(1)} (at line {number})") from None
     return root

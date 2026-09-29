@@ -122,6 +122,10 @@ work, run `/nh:status` and see [docs/troubleshooting.md](docs/troubleshooting.md
 - Blocking shell commands that edit notebooks is best effort. For Claude
   Code's own edit tools, the deny rule `/nh:init` offers makes the block a hard
   permission rule.
+- nh shows the agent secrets from `.env` and the environment as
+  `[redacted:NAME]` (outputs, errors, cell code, nhctl's output); the notebook
+  keeps the real values. It can miss a secret inside an image, an encoded one
+  (base64, URL-encoded) and a short value (under 8 characters).
 
 ## Repository layout
 

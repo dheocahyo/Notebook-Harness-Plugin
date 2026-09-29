@@ -30,6 +30,11 @@ PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; the project's .env holds it
 MARK = "[redacted:DB_PASSWORD]"
 RUN = "wf_run-1"
 E125_FIRST = CATALOGUE["E125"][0]
+# Spelled out: nh doesn't load .env into the kernel, so os.environ alone misses a .env value.
+E125_NEXT = (
+    "Next: Read the value from the environment or the project's .env without printing it, "
+    "or ask the user to edit that line in JupyterLab."
+)
 
 LOAD = dict(
     title="Load sales data",
@@ -71,7 +76,7 @@ async def test_e125_refuses_a_main_add_and_counts_no_lint_reject(nh: Harness) ->
         result = await nh.call("nh_add_cell", "p1", **MARKED)
         lines = text(result).splitlines()
         assert result.is_error and lines[:2] == [E125_FIRST, "nh: E125"], lines
-        assert lines[-1].startswith("Next: Read the value from the environment")
+        assert lines[-1] == E125_NEXT
         assert WRITER_LINE not in lines
     assert nh.cells() == []  # nothing written
     added = await nh.call("nh_add_cell", "p1", **LOAD)
@@ -122,6 +127,40 @@ async def test_e125_refuses_the_writers_edit_with_the_writer_line(nh: Harness) -
     assert lines[-1] == WRITER_LINE
     assert json.dumps(nh.cells()) == before
     assert lint_rejects(nh, "p1") == 0
+
+
+# E125 comes before the notebook is resolved and before lint: code that also breaks a hard rule
+# gets E125, and counts no lint reject (review of C3)
+BROKEN = dict(MARKED, notes=[f"Point {i}." for i in range(1, 7)])  # 6 bullets: L004
+
+
+async def test_e125_comes_before_lint_in_an_add(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    for _ in range(3):
+        lines = text(await nh.call("nh_add_cell", "p1", **BROKEN)).splitlines()
+        assert lines[:2] == [E125_FIRST, "nh: E125"], lines
+    missing = await nh.call("nh_add_cell", "p1", notebook="missing.ipynb", **BROKEN)
+    assert text(missing).splitlines()[:2] == [E125_FIRST, "nh: E125"]  # not E132
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    assert lint_rejects(nh, "p1") == 0
+
+
+async def test_e125_comes_before_lint_in_an_edit(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    [cell] = code_cells(nh)
+    nh.turns.prompt("p2")
+    broken = {k: v for k, v in BROKEN.items() if k in ("code", "title", "notes")}
+    for _ in range(3):
+        result = await nh.call("nh_edit_cell", "p2", cell_id=cell["id"], **broken)
+        assert text(result).splitlines()[:2] == [E125_FIRST, "nh: E125"], text(result)
+    missing = await nh.call(
+        "nh_edit_cell", "p2", cell_id=cell["id"], notebook="missing.ipynb", **broken
+    )
+    assert text(missing).splitlines()[:2] == [E125_FIRST, "nh: E125"]
+    edited = await nh.call("nh_edit_cell", "p2", cell_id=cell["id"], code=LOAD["code"] + "\n1")
+    assert not edited.is_error, text(edited)
+    assert lint_rejects(nh, "p2") == 0
 
 
 # --- raw vs redacted ------------------------------------------------------------------------
@@ -300,6 +339,100 @@ async def test_a_user_change_shown_by_e141_is_redacted(nh: Harness) -> None:
     assert result.is_error and "nh: E141" in body
     assert f"+password = '{MARK}'" in body
     assert_clean(body)
+
+
+# A private key pasted into a cell: its END line is past the 6 lines E141 shows. Each site
+# redacts the whole source before it cuts, or the key's body lines reach Claude (review of C3).
+KEY_LINES = [
+    f"MIIE{i:02d}FAKEkeyMATERIALnotREAL0123456789abcdefghijklmnopqrstuvwxyz" for i in range(20)
+]
+KEY = "\n".join(["-----BEGIN PRIVATE KEY-----", *KEY_LINES, "-----END PRIVATE KEY-----"])
+KEY_CELL = f'KEY = """{KEY}"""\nprint(len(KEY))'
+
+
+def assert_no_key(body: str) -> None:
+    assert "[redacted:private-key]" in body, body
+    assert "FAKEkeyMATERIAL" not in body and "notREAL" not in body, body
+
+
+async def test_e141_shows_a_pasted_key_redacted(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    [cell] = code_cells(nh)
+    nh.backend.user_edit(NOTEBOOK, cell["id"], KEY_CELL)
+    nh.turns.prompt("p2")
+    result = await nh.call("nh_edit_cell", "p2", cell_id=cell["id"], code=LOAD["code"] + "\n1")
+    body = text(result)
+    assert result.is_error and "nh: E141" in body
+    assert '+KEY = """[redacted:private-key]"""' in body
+    assert_no_key(body)
+
+
+async def test_the_cell_now_reads_shows_a_pasted_key_redacted(nh: Harness) -> None:
+    human = nh.backend.user_insert(NOTEBOOK, 0, "mine = 1\nmine")
+    nh.turns.prompt("p1")
+    view = text(await nh.call("nh_inspect", "p1", view="cell", cell_id=human))
+    sha = next(line for line in view.splitlines() if "sha=" in line).split("sha=")[1].split()[0]
+    nh.backend.user_edit(NOTEBOOK, human, KEY_CELL)
+    result = await nh.call(
+        "nh_edit_cell", "p1", cell_id=human, code="mine = 2\nmine", base_sha=sha, intent="two"
+    )
+    body = text(result)
+    assert result.is_error and "nh: E141" in body and "The cell now reads:" in body
+    assert_no_key(body)
+
+
+async def test_an_edited_notes_key_is_redacted_in_e141(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    [note] = [c for c in nh.cells() if c["cell_type"] == "markdown"]
+    [cell] = code_cells(nh)
+    nh.backend.user_edit(NOTEBOOK, note["id"], f"### Load sales data\n\n{KEY}")
+    nh.turns.prompt("p2")
+    result = await nh.call(
+        "nh_edit_cell", "p2", cell_id=cell["id"], code=LOAD["code"], title="Load the sales"
+    )
+    body = text(result)
+    assert result.is_error and "nh: E141" in body and "the note above" in body
+    assert_no_key(body)
+
+
+async def test_undos_e141_shows_a_pasted_key_redacted(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    [cell] = code_cells(nh)
+    nh.backend.user_edit(NOTEBOOK, cell["id"], KEY_CELL)
+    nh.turns.prompt("p2")
+    body = text(await nh.call("nh_undo", "p2"))
+    assert "nh: E141" in body
+    assert_no_key(body)
+
+
+HIDDEN = dict(LOAD, code=LOAD["code"] + '\npassword = "Hunter2-Very-Long-Pass"')
+HIDDEN_ONLY = "  (only a hidden [redacted:…] value changed)"
+
+
+async def test_e141_says_when_only_a_hidden_value_changed(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **HIDDEN)).is_error
+    [cell] = code_cells(nh)
+    nh.backend.user_edit(NOTEBOOK, cell["id"], HIDDEN["code"].replace("Hunter2", "Tiger99"))
+    nh.turns.prompt("p2")
+    result = await nh.call("nh_edit_cell", "p2", cell_id=cell["id"], code=LOAD["code"] + "\n1")
+    lines = text(result).splitlines()
+    assert result.is_error and "nh: E141" in lines
+    assert HIDDEN_ONLY in lines and not any(line.startswith(("  -", "  +")) for line in lines)
+    assert "Tiger99" not in text(result) and "Hunter2" not in text(result)
+
+
+async def test_undos_e141_says_when_only_a_hidden_value_changed(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **HIDDEN)).is_error
+    [cell] = code_cells(nh)
+    nh.backend.user_edit(NOTEBOOK, cell["id"], HIDDEN["code"].replace("Hunter2", "Tiger99"))
+    nh.turns.prompt("p2")
+    lines = text(await nh.call("nh_undo", "p2")).splitlines()
+    assert "nh: E141" in lines and HIDDEN_ONLY in lines, lines
 
 
 async def test_an_internal_error_is_redacted_before_its_cut(

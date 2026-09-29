@@ -7,7 +7,10 @@ import json
 import os
 import subprocess
 
+import pytest
 from nhctl_testlib import SERVER
+
+from nh_gateway._shared import tomlread
 
 
 def codes(report: dict) -> dict[str, bool]:
@@ -102,6 +105,34 @@ def test_nh_project_checks(env, project, tmp_path):
     assert "unknown key turnz" in problem["message"] and "preset" not in problem["message"]
     assert report["lab"] == {"running": False}
     assert report["settings"] == {"deny_rules": False}
+
+
+def test_what_doctor_prints_is_redacted_with_the_projects_env(env, project, tmp_path):
+    """doctor installs the project's redactor (design §6.8): D131 echoes what it finds in
+    harness.toml, which may hold a .env value (review of C3)."""
+    machine(env)
+    env.json("scaffold", cwd=project)
+    secret = "Sup3rS3cret-" + "Passw0rd-2026"  # fake
+    with open(project / ".env", "a") as handle:
+        handle.write(f"\nDB_PASSWORD={secret}\n")
+    with open(project / "harness.toml", "a") as handle:
+        handle.write(f"\n[{secret}]\n")
+    data = str(ready_runtime(tmp_path))
+    proc = env.run("doctor", "--json", "--plugin-data", data, cwd=project)
+    problem = next(p for p in json.loads(proc.stdout)["problems"] if p["code"] == "D131")
+    assert "unknown key [redacted:DB_PASSWORD]" in problem["message"]
+    human = env.run("doctor", "--plugin-data", data, cwd=project)
+    assert "unknown key [redacted:DB_PASSWORD]" in human.stdout
+    assert secret not in proc.stdout + proc.stderr + human.stdout + human.stderr
+
+
+@pytest.mark.parametrize("line", ["password = {}", 'password = "{}'])
+def test_the_fallback_toml_parser_names_a_bad_value_by_its_line(line):
+    """Python 3.9's parser echoed an unquoted value into doctor's D131 (review of C3)."""
+    secret = "Sup3rS3cret-" + "Passw0rd-2026"  # fake
+    with pytest.raises(ValueError) as caught:
+        tomlread._mini_loads(f"[jupyter]\nurl = 'x'\n{line.format(secret)}\n")
+    assert str(caught.value) == "Invalid value for password (at line 3)"
 
 
 def test_nbstripout_git_filter(env, project, tmp_path):

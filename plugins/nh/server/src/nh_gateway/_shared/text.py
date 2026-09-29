@@ -1,4 +1,5 @@
-"""Word counting and note normalisation shared by lint, render, metrics and evals."""
+"""Word counting and note normalisation shared by lint, render, metrics and evals, and output
+text as a terminal shows it (shaping and docsafe)."""
 
 from __future__ import annotations
 
@@ -13,6 +14,14 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`(\"'])")
 _MARKDOWN_SPECIAL = re.compile(r"(?<!\\)([$~])")
 _ESCAPED_SPECIAL = re.compile(r"\\([$~])")
 _CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.S)
+_ANSI = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI: colours, cursor movement
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC: titles, hyperlinks
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"  # DCS, SOS, PM, APC
+    r"|\x1b[@-Z\\-_]"  # other two-byte escapes
+)
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 def count_words(text: str) -> int:
@@ -92,6 +101,27 @@ def render_note(title: str, bullets: list[str], level: int = 3) -> str:
     head = f"{heading} {escape_markdown(normalize_title(title))}"
     body = "\n".join(f"- {escape_markdown(bullet)}" for bullet in bullets)
     return f"{head}\n\n{body}" if body else head
+
+
+def strip_ansi(text: str) -> str:
+    """``text`` without ANSI escapes (colours, cursor moves, hyperlinks)."""
+    return _ANSI.sub("", text)
+
+
+def collapse_cr(text: str) -> str:
+    """Progress bars: keep what a terminal shows, the text after the last \\r on each line."""
+    if "\r" not in text:
+        return text
+    lines = text.replace("\r\n", "\n").split("\n")
+    return "\n".join(line.rstrip("\r").rsplit("\r", 1)[-1] for line in lines)
+
+
+def terminal_text(text: str) -> str:
+    """``text`` as a terminal shows it: no ANSI escapes, each line's text after its last \\r,
+    no other control characters, a lone surrogate as U+FFFD. The redactor must see this form:
+    a colour code inside a value hides it (review of C3)."""
+    text = collapse_cr(strip_ansi(text))
+    return _SURROGATE.sub("\ufffd", _CONTROL.sub("", text))
 
 
 def clip(text: str, limit: int) -> str:

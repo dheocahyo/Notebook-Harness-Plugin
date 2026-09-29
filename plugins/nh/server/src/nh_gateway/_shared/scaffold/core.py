@@ -23,6 +23,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .. import secrets
+
 HERE = Path(__file__).resolve().parent
 TEMPLATES = HERE / "templates"
 DEFAULTS_TOML = HERE.parents[1] / "defaults.toml"
@@ -63,9 +65,6 @@ _READER_BY_SUFFIX = {
 }  # fmt: skip
 _COMPRESSION = (".gz", ".bz2", ".xz", ".zip", ".zst")
 _URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
-_SQL_SCHEME = re.compile(
-    r"^(?:postgres(?:ql)?|mysql|mariadb|mssql|oracle|sqlite|snowflake|redshift)(?:\+\w+)?$", re.I
-)
 _LOADER_CALL = re.compile(r"\b(?:read_[a-z_]+|scan_[a-z_]+|load_dataset|loadtxt|genfromtxt)\s*\(")
 
 UV_FALLBACK_DIRS = ("~/.local/bin", "~/.cargo/bin", "/opt/homebrew/bin", "/usr/local/bin")
@@ -210,22 +209,20 @@ def split_secret_url(url: str) -> tuple[str, bool]:
 
     Secrets hide in too many places to recognise (``?code=``, ``?jwt=``, ``#access_token=``,
     signed-URL parameters, ``/bot123:AAH…/`` path tokens), so any userinfo, query string or
-    fragment counts, and so does a path segment that looks like a token (:func:`_token_like`,
-    which includes any ``@``): the committed files get ``scheme://host[:port]/path`` with those
-    segments shown as ``…``, and the full URL goes to ``.env``.
+    fragment counts, and so does a path segment that looks like a token
+    (:func:`secrets.url_token_like`, which includes any ``@``): the committed files get
+    ``scheme://host[:port]/path`` with those segments shown as ``…``, and the full URL goes to
+    ``.env``. The redactor reads the same rules (:func:`secrets.url_may_hold_credentials`), so
+    such a DATA_URL is hidden from Claude whole (design §6.8).
 
     SQLAlchemy reads a database password up to its ``@``, so it may hold ``/``, ``?`` or ``#``
     (``postgresql://me:ab/cd@db/sales``), which ``urlsplit`` would take for the path. For a
     database URL everything up to the last ``@`` is cut, and the record starts ``scheme://…@``
     when the cut text held one of those characters.
     """
-    parts = urllib.parse.urlsplit(url)
-    cut = ""
-    if _SQL_SCHEME.match(parts.scheme) and "@" in url:
-        cut, _, location = url.partition("://")[2].rpartition("@")
-        parts = urllib.parse.urlsplit(f"{parts.scheme}://{location}")
+    parts, cut = secrets.split_url(url)
     segments = parts.path.split("/")
-    shown = ["…" if _token_like(segment) else segment for segment in segments]
+    shown = ["…" if secrets.url_token_like(segment) else segment for segment in segments]
     secret = cut or "@" in parts.netloc or parts.query or parts.fragment or shown != segments
     if not secret:
         return url, False
@@ -243,31 +240,13 @@ def split_secret_url(url: str) -> tuple[str, bool]:
     return f"{parts.scheme}://{host}{'/'.join(shown)}", True
 
 
-_UUID = re.compile(r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}", re.I)
-
-
-def _token_like(segment: str) -> bool:
-    """A URL path segment that may be a credential: one with ``:`` or ``@`` (``bot123:AAH…``),
-    a UUID, or a long random-looking piece between ``-_.~`` (16+ characters mixing letters and
-    digits, or any 24+). Names such as ``sales_2024-01.csv`` pass; a false alarm only moves the
-    URL to ``.env``."""
-    text = urllib.parse.unquote(segment)
-    if ":" in text or "@" in text or _UUID.search(text):
-        return True
-    for piece in re.split(r"[-_.~]", text):
-        mixed = re.search(r"[A-Za-z]", piece) and re.search(r"[0-9]", piece)
-        if len(piece) >= 24 or (len(piece) >= 16 and mixed):
-            return True
-    return False
-
-
 def plan_data(project: Path, data: str, mode: str = "auto", adopt: bool = False) -> DataPlan:
     data = data.strip()
     if not data:
         return DataPlan("", "none", "", "none", "")
     if is_url(data):
         parts = urllib.parse.urlsplit(data)
-        reader = "sql" if _SQL_SCHEME.match(parts.scheme) else reader_for(parts.path)
+        reader = "sql" if secrets.SQL_SCHEME.match(parts.scheme) else reader_for(parts.path)
         source, secret = split_secret_url(data)
         plan = DataPlan(data, "url", reader, "url", source, secret_url=data if secret else None)
         if mode == "copy":

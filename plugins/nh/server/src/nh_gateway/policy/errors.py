@@ -107,7 +107,8 @@ CATALOGUE: dict[str, tuple[str, str]] = {
     ),
     "E125": (
         "Not written: the code holds nh's [redacted:…] marker, not the real value.",
-        "Read the value from the environment without printing it, "
+        # nh doesn't load .env into the kernel: os.environ alone misses a .env value (C3 review)
+        "Read the value from the environment or the project's .env without printing it, "
         "or ask the user to edit that line in JupyterLab.",
     ),
     "E130": (

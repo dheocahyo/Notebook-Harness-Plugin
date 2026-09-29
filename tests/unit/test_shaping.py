@@ -15,6 +15,7 @@ from hypothesis import strategies as st
 from PIL import Image
 
 from nh_gateway._shared import secrets
+from nh_gateway._shared.text import clip, strip_ansi
 from nh_gateway.exec.shaping import (
     MAX_HTML_CHARS,
     PNG_LIMIT,
@@ -22,7 +23,6 @@ from nh_gateway.exec.shaping import (
     prune_outputs_dir,
     redact,
     shape_outputs,
-    strip_ansi,
     summarize_outputs,
 )
 
@@ -589,6 +589,29 @@ def test_summary_heads_are_redacted_before_they_are_cut(tmp_path):
     assert summary.text_head == "[redacted:DB_PASSWORD] rest"
     summary = summarize_outputs([error("RuntimeError", f"{'x ' * 50}{PASSWORD}", [])])
     assert summary.error is not None and PASSWORD[:4] not in summary.error
+
+
+@pytest.mark.parametrize("inside", [4, 11])  # under FRAGMENT_MIN: no cut-piece rule catches it
+@pytest.mark.parametrize("pad", ["\n", " \x01\n", "\x1b[0m\n"])  # blank as a terminal shows it
+def test_the_first_line_is_never_cut_inside_a_secret(tmp_path, inside, pad):
+    """The window once began at the text's start: with only ``inside`` chars of the secret in
+    it, their head became text_head (review of C3)."""
+    install_secret(tmp_path)
+    margin = secrets.current().margin
+    blank = (pad * (4000 + margin))[: 4000 + margin - inside]
+    summary = summarize_outputs([stream(blank + PASSWORD + " rest\n")])
+    assert summary.text_head == "[redacted:DB_PASSWORD] rest"
+
+
+def test_the_first_line_window_grows_until_the_line_ends(tmp_path):
+    install_secret(tmp_path)
+    margin = secrets.current().margin
+    line = "word " * ((4000 + margin) // 5 - 2) + PASSWORD  # the secret sits across the edge
+    summary = summarize_outputs([stream(line + "\nnext\n")])
+    assert summary.text_head is not None and PASSWORD[:4] not in summary.text_head
+    assert summary.text_head.startswith("word word") and len(summary.text_head) <= 80
+    long_line = "x" * 5_000_000  # a line with no end: the window stops growing at 1 MiB
+    assert summarize_outputs([stream(long_line)]).text_head == clip("x" * 81, 80)
 
 
 def test_prune_keeps_the_newest_files(tmp_path):

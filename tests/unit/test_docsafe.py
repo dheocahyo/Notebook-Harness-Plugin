@@ -145,6 +145,45 @@ def test_output_summary_is_redacted_before_it_is_cut(tmp_path):
     assert password[:6] not in summary.error and password[:6] not in summary.text_head
 
 
+@pytest.mark.parametrize(
+    "shown",
+    [
+        lambda pw: pw.replace("2026", "\x1b[1;36m2026\x1b[0m"),  # a highlighter colours a number
+        lambda pw: pw[:5] + "\x1b]8;;http://x\x07" + pw[5:],  # a hyperlink escape inside it
+        lambda pw: "progress 10%\r" + pw[:9] + "\x01" + pw[9:],  # a \r line and a control char
+    ],
+    ids=["colour", "osc", "cr-control"],
+)
+def test_output_summary_redacts_a_value_split_by_a_terminal_code(tmp_path, shown):
+    password = "Sup3r" + "S3cret-Passw0rd-2026"  # fake
+    (tmp_path / ".env").write_text(f"DB_PASSWORD={password}\n")
+    secrets.install(secrets.Redactor.for_project(tmp_path, {}))
+    text = shown(password)
+    assert password not in text
+    outputs = [
+        {"output_type": "stream", "name": "stdout", "text": f"  {text} ok\n"},
+        {"output_type": "error", "ename": "LoginError", "evalue": text, "traceback": []},
+    ]
+    summary = docsafe.output_summary(outputs)
+    assert summary.text_head == "[redacted:DB_PASSWORD] ok"
+    # a terminal shows only what follows the \r, the error's name included
+    shown_error = "" if "\r" in text else "LoginError: "
+    assert summary.error == shown_error + "[redacted:DB_PASSWORD]"
+
+
+def test_output_summary_cleans_only_a_window(tmp_path):
+    password = "Sup3r" + "S3cret-Passw0rd-2026"  # fake
+    (tmp_path / ".env").write_text(f"DB_PASSWORD={password}\n")
+    secrets.install(secrets.Redactor.for_project(tmp_path, {}))
+    margin = secrets.current().margin
+    colour = "\x1b[1;36m" * ((200 + margin) // 7)  # no visible text: the window grows past it
+    text = "\n" * 50_000 + colour + password + " ok\n" + "z" * 8_000_000
+    summary = docsafe.output_summary([{"output_type": "stream", "text": text}])
+    assert summary.text_head is not None
+    assert summary.text_head.startswith("[redacted:DB_PASSWORD] ok\nzzz")
+    assert len(summary.text_head) == 200
+
+
 GH = "ghp_" + "Q1w2E3r4T5y6U7i8O9p0" + "A1s2D3f4G5h6J7k8"  # fake; a pattern-only secret
 PLAIN = "Pq7Rs8Tu9Vw0" + "Xy1Za2Bc3De4"  # fake; a plain-named .env value: no fragment rule
 
