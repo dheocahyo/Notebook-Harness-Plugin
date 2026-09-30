@@ -1,4 +1,4 @@
-"""Readability hints (L101–L123): advisory by default, errors in strict mode, off per rule."""
+"""Hints (L014, L101–L123): advisory by default, errors in strict mode, off per rule."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ import pytest
 
 from nh_gateway.config import Config, load
 from nh_gateway.lint import lint as lint_module
+from nh_gateway.lint import secret_scan
 from nh_gateway.lint.lint import LintReport, lint_cell
+from tests.unit.test_lint_hard import EVERYDAY, scan_returns
 
 NOTE = {
     "title": "Summarise prices by region",
@@ -42,6 +44,7 @@ def lines(*parts: str) -> str:
 
 # (rule, cell that should get the hint, similar cell that should not)
 CASES = [
+    ("L014", "print(api_key)", "print(bool(api_key))"),
     (
         "L101",
         "label_total = '" + "x" * 100 + "'\nlabel_total",
@@ -215,6 +218,363 @@ CASES = [
 def test_hint_fires_on_positive_only(rule: str, positive: str, negative: str) -> None:
     assert rule in hints(positive)
     assert rule not in hints(negative)
+
+
+# L014 -------------------------------------------------------------------------------------------
+# Design §6.7's L014 word lists, spelled out: a word taken out of secret_scan.py fails a row.
+TOKEN_QUALIFIERS = [
+    "access",
+    "refresh",
+    "id",
+    "auth",
+    "api",
+    "bearer",
+    "session",
+    "csrf",
+    "xsrf",
+    "oauth",
+    "jwt",
+    "bot",
+    "hf",
+    "github",
+    "gh",
+    "gitlab",
+    "slack",
+    "client",
+    "private",
+    "personal",
+    "app",
+    "service",
+    "security",
+]
+TOKEN_WORDS = [
+    "bos",
+    "eos",
+    "pad",
+    "unk",
+    "sep",
+    "cls",
+    "mask",
+    "special",
+    "start",
+    "end",
+    "stop",
+    "next",
+    "last",
+    "first",
+    "prev",
+    "new",
+    "current",
+]
+NOT_THE_SECRET_LAST = [
+    "counts",
+    "num",
+    "freq",
+    "freqs",
+    "frequency",
+    "usage",
+    "limit",
+    "limits",
+    "budget",
+    "lengths",
+    "sizes",
+    "prob",
+    "probs",
+    "logprob",
+    "logprobs",
+    "logit",
+    "logits",
+    "score",
+    "scores",
+    "embedding",
+    "embeddings",
+    "emb",
+    "type",
+    "types",
+    "list",
+    "df",
+    "hash",
+    "digest",
+    "policy",
+    "env",
+    "var",
+    "vars",
+    "names",
+    "strength",
+    "field",
+    "prompt",
+    "pattern",
+]
+# (cell, the name L014 reports)
+L014_SHOWN = [
+    ('api_key = "sk-placeholder"\nprint(api_key)', "api_key"),
+    ("print(db_password)", "db_password"),
+    ('print(f"password: {db_password}")', "db_password"),
+    ('print("token=%s" % hf_token)', "hf_token"),
+    ('print("key: " + OPENAI_API_KEY)', "OPENAI_API_KEY"),
+    ("config.OPENAI_API_KEY", "config.OPENAI_API_KEY"),
+    ("settings.client_secret", "settings.client_secret"),
+    ("display(credentials)", "credentials"),
+    ("pprint(private_key)", "private_key"),
+    ("print(api_key.strip())", "api_key"),
+    ("print(str(access_token))", "access_token"),
+    ("print(api_key[:4])", "api_key"),
+    ("print(api_key_prefix)", "api_key_prefix"),
+    ("print([github_token, 'x'])", "github_token"),
+    ("print(api_key or 'none')", "api_key"),
+    ("logger.info('token %s', session_token)", "session_token"),
+    ("import sys\nsys.stdout.write(secret_key)", "secret_key"),
+    ("raise ValueError(api_token)", "api_token"),
+    ("!echo $db_password", "db_password"),
+    ("!echo {api_key}", "api_key"),
+    ("def show():\n    print(api_key)", "api_key"),
+    ("print(has_rows and api_key)", "api_key"),  # `a and b` shows b
+    ("print({api_key: 1})", "api_key"),  # a dict key that isn't a literal
+    ("print(masked_key)", "masked_key"),  # a masked preview still shows part of a key
+    ("print(redacted_key)", "redacted_key"),
+    ("print(db_pwd)", "db_pwd"),
+    ("print(secret_word)", "secret_word"),
+    ("print(new_password)", "new_password"),  # a token word without `token` still fires
+    # the same expression rules as L011
+    ("print(api_key if ready else None)", "api_key"),
+    ("print(-api_key)", "api_key"),
+    ("print((shown := api_key))", "api_key"),
+    ("print(*api_key)", "api_key"),
+    ("print([api_key for _ in range(2)])", "api_key"),
+    ("print({api_key for _ in range(2)})", "api_key"),
+    ("print(format(api_key))", "api_key"),
+    ("print(next(api_key))", "api_key"),
+    ("print(dict(api_key))", "api_key"),
+    ('print("".join(api_key))', "api_key"),
+    ("print(api_key + suffix)", "api_key"),
+    ("def show(v):\n    print(v)\nshow(api_key)", "api_key"),  # a function that shows it
+    ("print(get_cfg().api_key)", "api_key"),  # an attribute of a call
+    ("print(secret_token)", "secret_token"),  # a secret word of its own
+    # `token` as a credential: a qualifier, another secret word, an env var's capitals
+    *((f"print({word}_token)", f"{word}_token") for word in TOKEN_QUALIFIERS),
+    ("print(accessToken)", "accessToken"),
+    ("print(password_token)", "password_token"),
+    ("print(TOKEN)", "TOKEN"),
+    ("print(MY_TOKEN)", "MY_TOKEN"),
+    ("print(cfg.HF_TOKEN)", "cfg.HF_TOKEN"),
+]
+
+
+@pytest.mark.parametrize(("code", "name"), L014_SHOWN)
+def test_l014_shown_secret_names(code: str, name: str) -> None:
+    report = lint(code)
+    assert [h.rule for h in report.hints if h.rule in ("L011", "L014")] == ["L014"]
+    [hint] = [h for h in report.hints if h.rule == "L014"]
+    assert hint.key == "secret_name" and hint.severity == "hint"
+    assert f"`{name}`, whose name says it holds a secret" in hint.message
+    assert hint.fix == (
+        f"Show whether it is set instead, e.g. `print(bool({name}))`, or leave it out of the output."
+    )
+
+
+L014_CLEAN = [
+    "print(tokens[:10])",
+    "tokens",
+    "print(tokenizer)",
+    "tokenizer.decode(ids)",
+    "print(author)",
+    "print(df.author.value_counts())",
+    "print(max_tokens)",
+    "print(f'{max_tokens=}')",
+    "print(token_count)",
+    "print(n_tokens)",
+    "print(token_ids)",
+    "SORT_KEY",
+    "print(sort_key, primary_key, cache_key)",
+    "print(tok.eos_token)",
+    "print(tokenizer.pad_token, tokenizer.bos_token)",
+    'print(df["token"].head())',
+    'df["password"].isna().sum()',
+    "print(len(api_key))",
+    "print(api_key is None)",
+    "print(bool(token))",
+    "print(api_key.startswith('sk-'))",
+    "print('api_key' in config)",
+    "engine = connect(password=db_password)\nengine",
+    "login(token=hf_token)",
+    "client = OpenAI(api_key=api_key)\nclient.models",
+    "print(get_token())",
+    "api_key = load_key()",
+    "api_key;",
+    "x = !echo {api_key}",
+    "!echo {len(api_key)}",
+    "print(DATA_URL)",
+    "print(keys)",
+    "print(auth)",
+    "print(has_api_key)",
+    "has_key = 'OPENAI_API_KEY' in env_names\nhas_key",
+    "print(api_key_set, isKeySet, token_found, secret_status)",
+    "print(api_key and has_rows)",  # `a and b` shows only b
+    "print({'api_key': 1})",
+    "print(api_key.keys())",
+    # a tokenizer's special tokens, and a token's place in a sequence, even in capitals or
+    # beside a credential word
+    *(f"print({word.upper()}_TOKEN)" for word in TOKEN_WORDS),
+    *(f"print(access_{word}_token)" for word in TOKEN_WORDS),
+    # `token` with no credential word: an NLP token
+    "print(token)",
+    "print(df.token.value_counts())",
+    *(
+        f"print({name})"
+        for name in [
+            "token_str",
+            "token_text",
+            "token_string",
+            "token_idx",
+            "token_index",
+            "token_pos",
+            "token_offset",
+            "token_col",
+            "token_column",
+            "token_label",
+            "token_labels",
+            "token_map",
+            "token_vocab",
+            "token_stats",
+            "token_info",
+            "token_data",
+            "token_dist",
+            "token_matrix",
+            "token_counter",
+            "token_array",
+            "token_tensor",
+            "token_weights",
+            "token_level",
+            "token_span",
+            "token_spans",
+            "token_seq",
+            "token_expiry",
+            "expires_token",
+            "token_expires_at",
+            "pred_token",
+            "decoded_token",
+            "input_token",
+            "output_token",
+            "top_token",
+            "word_token",
+            "sampled_token",
+            "generated_token",
+            "target_token",
+            "query_token",
+            "gold_token",
+        ]
+    ),
+    'token_classification = pipeline("token-classification")\ntoken_classification',
+    "print(not api_key)",
+    "print(api_key.__len__())",
+    'print(", ".join())',
+    'import os\napi_key = os.getenv("K")\nos.system("echo \'$api_key\'")',  # no Python fill
+    "!echo {api_key} | wc -c",  # only a count is shown
+    "!echo {api_key} > out.txt",
+    # a fact about the secret, not the secret
+    *(f"print({word}_api_key)" for word in ["is", "has", "have", "can", "should", "use"]),
+    *(
+        f"print(api_key_{word})"
+        for word in ["set", "present", "exists", "found", "missing", "ok", "valid"]
+    ),
+    *(f"print(api_key_{word})" for word in ["loaded", "configured", "available", "defined"]),
+    "print(api_key_status)",
+    # a measure, a container or a label of the secret
+    *(f"print(api_key_{word})" for word in NOT_THE_SECRET_LAST),
+    *(f"print(API_KEY_{word.upper()})" for word in ["env", "var", "vars"]),
+    "print(password_strength, password_field, password_prompt, password_pattern)",
+    "print(secret_names)",
+    "pwd = os.getcwd()\npwd",
+    "print(token_ids, SECRET_NAME, token_file)",
+]
+
+
+@pytest.mark.parametrize("code", L014_CLEAN)
+def test_l014_must_not_match(code: str) -> None:
+    assert "L014" not in hints(code)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'import os\napi_key = os.environ["OPENAI_API_KEY"]\nprint(api_key)',
+        'import os\nOPENAI_API_KEY = os.getenv("OPENAI_API_KEY")\nOPENAI_API_KEY',
+        "!echo $OPENAI_API_KEY",
+        'import os\ndb_password = os.getenv("PW")\n!echo {db_password}',
+    ],
+)
+def test_l014_leaves_what_l011_reports(code: str) -> None:
+    report = lint(code)
+    assert [e.rule for e in report.errors] == ["L011"]
+    assert "L014" not in {h.rule for h in report.hints}
+    with_l011_hint = lint(code, cfg=_rules(secret_print="hint"))
+    assert [h.rule for h in with_l011_hint.hints if h.rule in ("L011", "L014")] == ["L011"]
+    without_l011 = lint(code, cfg=_rules(secret_print="off"))
+    assert without_l011.errors == [] and "L014" in {h.rule for h in without_l011.hints}
+
+
+def test_l014_still_reports_another_name_beside_l011() -> None:
+    code = 'import os\nkey = os.getenv("K")\nprint(key, db_password)'
+    report = lint(code)
+    assert [e.rule for e in report.errors] == ["L011"]
+    assert "`db_password`" in next(h.message for h in report.hints if h.rule == "L014")
+
+
+def test_l014_messages() -> None:
+    assert hints("api_key = load_key()\napi_key")["L014"] == (
+        "The last line shows `api_key`, whose name says it holds a secret."
+    )
+    assert hints("cfg.api_key.strip()")["L014"] == (
+        "The last line `cfg.api_key.strip()` shows `cfg.api_key`, whose name says it holds "
+        "a secret."
+    )
+    assert hints("print(api_key, db_password)\nprint(hf_token)")["L014"] == (
+        "`print(api_key, db_password)` shows `api_key`, whose name says it holds a secret "
+        "(+2 more)."
+    )
+
+
+def test_l014_is_the_first_hint() -> None:
+    order = [rule for rule, _, _ in lint_module._CHECKS]
+    first_hint = next(r for r, key, _ in lint_module._CHECKS if load(None).rule(key) == "hint")
+    assert first_hint == "L014" and order.index("L014") < order.index("L120")
+    code = lines("df2 = sales.copy()", "print(api_key)", "t = '" + "x" * 100 + "'")
+    assert [h.rule for h in lint(code).hints][0] == "L014"
+
+
+@pytest.mark.parametrize(
+    "code", ["!echo {api_key} | wc -c", "!echo {api_key} > out.txt", "!echo $(date)"]
+)
+def test_l014_shell_lines_record_no_name_they_do_not_show(code: str) -> None:
+    assert scan_returns(code).shown == []
+
+
+def test_l014_scan_never_raises() -> None:
+    """The scan and the names read from what it shows, with no catch-all around them."""
+    for code in [*(code for code, _ in L014_SHOWN), *L014_CLEAN]:
+        for cell in (code, f"{EVERYDAY}\n{code}"):
+            for shown in scan_returns(cell).shown:
+                list(secret_scan.secret_names(shown.expr))
+
+
+def test_l014_strict_mode_makes_it_an_error() -> None:
+    cfg = load(None)
+    cfg.data["lint"]["mode"] = "strict"
+    report = lint("print(api_key)", cfg=cfg)
+    assert [e.rule for e in report.errors] == ["L014"]
+    assert report.errors[0].severity == "error" and not report.ok
+    assert "L014" not in {
+        h.rule for h in lint("print(api_key)", cfg=_rules(secret_name="off")).hints
+    }
+    assert [e.rule for e in lint("print(api_key)", cfg=_rules(secret_name="error")).errors] == [
+        "L014"
+    ]
+
+
+def _rules(**rules: str) -> Config:
+    cfg = load(None)
+    cfg.data["lint"]["rules"].update(rules)
+    return cfg
 
 
 def test_l101_respects_max_line_length() -> None:
@@ -512,6 +872,7 @@ def test_every_hint_has_its_config_key() -> None:
     for rule, key, _ in lint_module._CHECKS:
         assert key in keys, (rule, key)
     assert {r for r, _, _ in lint_module._CHECKS} >= {
+        "L014",
         "L101",
         "L102",
         "L103",

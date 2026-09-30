@@ -21,9 +21,9 @@ works in the same notebook you are looking at.
   writer may fix the cell from QA's findings (twice by default) before
   Claude replies. It is still one cell per message, and one undo removes it.
 - **Guardrails.** No package installs from cells, no raw edits to `.ipynb`
-  files, no writes from subagents except nh's own cell writer inside
-  `/nh:qa-cell`. nh's server enforces every rule and refuses what it can't
-  verify.
+  files, no cells that print an env var's value, no writes from subagents
+  except nh's own cell writer inside `/nh:qa-cell`. nh's server enforces
+  every rule and refuses what it can't verify.
 
 ## Requirements
 

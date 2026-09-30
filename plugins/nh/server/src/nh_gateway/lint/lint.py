@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import io
 import re
 import sys
@@ -20,6 +21,7 @@ from nh_gateway._shared.patterns import CELL_NOTEBOOK_WRITES, CELL_PACKAGE_INSTA
 from nh_gateway._shared.text import count_words, normalize_bullet, normalize_title, split_notes
 from nh_gateway.config import Config
 from nh_gateway.dataflow import EVERYTHING, Flow, base_name, flow_of
+from nh_gateway.lint import secret_scan
 from nh_gateway.lint.magics import Masked, lines_of, mask
 
 Severity = Literal["error", "hint"]
@@ -210,6 +212,11 @@ class _Cell:
     @property
     def python(self) -> bool:
         return self.masked.cell_magic is None or self.masked.cell_magic in PYTHON_CELL_MAGICS
+
+    @functools.cached_property
+    def secrets(self) -> secret_scan.Scan:
+        """What would show a secret; L011 and L014 share one scan."""
+        return secret_scan.scan(self.masked, self.lines, self.tree, self.names_above)
 
     @property
     def empty(self) -> bool:
@@ -621,7 +628,83 @@ def _markdown_output(cell: _Cell) -> Finding | None:
     return None
 
 
+def _secret_print(cell: _Cell) -> Finding | None:
+    """Code that would show an env var's value (design 6.7). Names the var, never a value."""
+    hits = cell.secrets.hits
+    if not hits:
+        return None
+    hit, taint = hits[0], hits[0].taint
+    what = _secret_what(taint)
+    if taint.holder:
+        what = f"`{taint.holder}`, which holds {what}"
+    if hit.last and hit.sink == taint.holder:  # the last line is the variable itself
+        where = "The last line"
+    else:
+        where = f"The last line {_quote(hit.sink)}" if hit.last else _quote(hit.sink)
+    return f"{where} would show {what}{_more(len(hits))}.", _secret_fix(taint)
+
+
+def _secret_what(taint: secret_scan.Taint) -> str:
+    if taint.whole:
+        return "every value in `.env`" if taint.dotenv else "every env var's value"
+    if taint.var and taint.dotenv:
+        return f"the value of `{taint.var}` from `.env`"
+    if taint.var:
+        return f"the value of env var `{taint.var}`"
+    return "a value from `.env`" if taint.dotenv else "an env var's value"
+
+
+def _secret_fix(taint: secret_scan.Taint) -> str:
+    holds_mapping = taint.kind == "mapping" and taint.holder
+    if taint.whole or holds_mapping:  # a variable of values, e.g. env_lines, gets no sorted()
+        source = "dotenv_values()" if taint.dotenv else "os.environ"
+        names = taint.holder if holds_mapping else taint.mapping or source
+        return (
+            f"Show only the names, e.g. `sorted({names})`, or check one without its value, "
+            f'e.g. `print("NAME" in {names})`.'
+        )
+    if taint.holder and not taint.var:
+        holder = taint.holder
+        return (
+            f"Check it without showing the value, e.g. `print({holder} is not None)` "
+            f"or `print(bool({holder}))`."
+        )
+    name = taint.var or "NAME"
+    if taint.dotenv:
+        values = taint.mapping or "dotenv_values()"
+        return (
+            f'Check it without showing the value, e.g. `print("{name}" in {values})` '
+            f'or `print(bool({values}.get("{name}")))`.'
+        )
+    return (
+        f'Check it without showing the value, e.g. `print("{name}" in os.environ)` '
+        f'or `print(bool(os.getenv("{name}")))`.'
+    )
+
+
 # readability hints -------------------------------------------------------------------------------
+def _secret_name(cell: _Cell) -> Finding | None:
+    """A shown name that says it holds a secret (L014); L011 already names the tainted ones."""
+    scan = cell.secrets
+    reported = scan.reported if _level(cell.cfg, "secret_print") else set()
+    found: dict[str, secret_scan.Shown] = {}  # name -> where it is shown first
+    for shown in scan.shown:
+        for name in secret_scan.secret_names(shown.expr):
+            if name not in reported:
+                found.setdefault(name, shown)
+    if not found:
+        return None
+    name, shown = next(iter(found.items()))
+    if shown.last and shown.sink == name:
+        where = "The last line"
+    else:
+        where = f"The last line {_quote(shown.sink)}" if shown.last else _quote(shown.sink)
+    return (
+        f"{where} shows `{name}`, whose name says it holds a secret{_more(len(found))}.",
+        f"Show whether it is set instead, e.g. `print(bool({name}))`, or leave it out of the output.",
+    )
+
+
 def _long_line(cell: _Cell) -> Finding | None:
     limit = cell.cfg["lint"]["max_line_length"]
     long = [line for line in cell.lines if len(line) > limit]
@@ -1155,6 +1238,8 @@ _CHECKS: list[tuple[str, str, Callable[[_Cell], Finding | None]]] = [
     ("L008", "notebook_write", _notebook_write),
     ("L009", "package_install", _package_install),
     ("L010", "markdown_output", _markdown_output),
+    ("L011", "secret_print", _secret_print),
+    ("L014", "secret_name", _secret_name),
     ("L120", "kernel_only_name", _kernel_only_name),
     ("L111", "non_idempotent", _non_idempotent),
     ("L118", "hidden_warnings", _hidden_warnings),

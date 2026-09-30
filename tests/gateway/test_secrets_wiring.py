@@ -309,6 +309,10 @@ async def test_a_failing_code_line_is_redacted(nh: Harness) -> None:
 
 async def test_nothing_is_running_reports_a_redacted_error(nh: Harness) -> None:
     env = with_env(nh)
+    # L011 refuses raising a value read from .env; with it off, as harness-toml.md documents for
+    # a user who wants values shown, redaction (6.8) is what keeps the value from Claude.
+    toml = nh.project / "harness.toml"
+    toml.write_text(toml.read_text() + '[lint.rules]\nsecret_print = "off"\n')
     nh.turns.prompt("p1")
     reads = dict(  # the value comes from the file: the code holds no secret
         LOAD,

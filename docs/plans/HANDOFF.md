@@ -35,7 +35,7 @@ Two workflows were stopped for the move. Their work is saved here; both patches 
   4. Gates Gu and Gp, then the full eval suite.
   5. Read the diff and commit, deleting the patch in that commit.
 
-### 2. C4, secret lint rules L011/L014 (then): `c4-wip.patch` and `c4-review.json`
+### 2. C4, secret lint rules L011/L014: done (reviewed, fixed, committed; the patch and review file are removed)
 
 - **What it holds.** The whole C4 delta after an implement agent and three reviewers:
   - design §6.7;

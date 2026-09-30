@@ -51,9 +51,17 @@ Fix every listed problem and call again, except for L009 (see its row).
 | L008 | the cell writes an `.ipynb` | never; nh owns the notebook |
 | L009 | a package install: `!pip install`, `%pip install`, `%conda install`, `!uv add` and the like | don't call again yet. Ask the user whether to install it; after a yes, run `uv add <pkg>` (or the project's conda install) with Bash, then write the cell without the install |
 | L010 | `%%markdown`/`%%html`, or `Markdown()`/`HTML()`/`Latex()` with prose | put the text in the chat reply |
+| L011 | code that would show an env var's value, secret or not: `print(os.environ["KEY"])`, `os.getenv("KEY")` as the last line, a variable holding one, `os.environ.keys()` shown, `%env`, `!env`, `!printenv`, `!echo $KEY`, `!cat .env`, `.env` read and shown | check it without showing the value: `print("KEY" in os.environ)` or `print(bool(os.getenv("KEY")))`; list names with `sorted(os.environ)`; pass it on (`create_engine(url)`) without printing it |
+| L014 | only under `[lint] mode = "strict"`: a shown name that says it holds a secret (`print(api_key)`) | show `bool(api_key)` instead, or leave it out of the output |
 
 After 3 rejections in one message: `E121`. Stop, tell the user what you are
 trying to write, and ask how to proceed.
+
+Hints come after the run and don't block, unless `harness.toml` sets
+`[lint] mode = "strict"`: then every hint is refused as E120 like the rows
+above. L014 (a shown name that says it holds a secret, such as `print(api_key)`)
+matters most: don't show that name again; show `bool(api_key)` when the user
+needs to know it is set.
 
 ## Refusals
 

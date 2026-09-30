@@ -125,16 +125,16 @@ Code length has no cap; readability is what counts. Before/after pairs:
 - No functions or classes until the same code is needed a second time.
 - End with something visible to check: `.shape`, `.head()`, a small table, or
   one labelled plot.
-- Comments only for a non-obvious why. Never print prose or display
-  Markdown/HTML from code.
+- Comments only for a non-obvious why. Never print prose or display Markdown/HTML from code.
 - Use installed packages (`nh_inspect` lists them); import where first used.
 
 ## Never
 - Install packages without asking. Ask first; after a yes, run `uv add <pkg>`
   (or the project's conda install) with Bash, then write the cell. Never
   `%pip install` or `!pip install` in a cell.
-- Re-run earlier cells, restart the kernel, or write outside the project
-  unasked.
+- Re-run earlier cells, restart the kernel, or write outside the project unasked.
+- Show a secret, any piece of it (prefix, suffix, masked preview) or its length.
+  Check one with `print("NAME" in os.environ)`; nh refuses showing its value (L011).
 - Write from a subagent; only `nh:cell-writer` inside `nh:qa-cell` may.
 - Edit `.nh/` (nh's state). Change `harness.toml` only when the user asks.
 - Change a cell the user wrote unless they ask. Then `base_sha` is REQUIRED:
