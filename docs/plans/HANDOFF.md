@@ -56,6 +56,32 @@ Two workflows were stopped for the move. Their work is saved here; both patches 
   5. Ge: secret-print-refused, two consecutive rounds of 3 with every run at 1.0, then the full suite.
   6. Read the diff and commit, deleting `c4-wip.patch` and `c4-review.json` in the C4 commit.
 
+### Cloud session status (2026-09-30), stopped at the user's request after C4
+
+- **Committed and pushed:** 17ae694 (step 1, error-retry) and 13c01ef (C4). A PR from `release/0.2.0` to `master` is open.
+- **C12's independent parts, built early and not committed:** `c12-early-wip.patch` (base 17ae694; apply with `git apply -3` after C4). It holds:
+  - the a7 and a8 integration tests (`tests/integration/test_large_outputs.py`, `test_lab_restart.py`);
+  - the drift.yml `file-issue` job and the ci.yml artifact path (`--basetemp "$RUNNER_TEMP/pytest-integration"`);
+  - three gateway fixes the tests exposed:
+    - a room save request after nh's writes (cells were lost when Lab restarted mid-run);
+    - websocket-client's pure-Python UTF-8 frame check replaced (50 MB stream exec 11 s → 0.8 s);
+    - `prune_outputs_dir(keep=)`;
+  - the plan's V11 "trim" fallback in `exec/shaping.py`, which brought a7's 50 MB stream overhead from 2.4 s to 0.6 s p95 on this slower machine;
+  - its §6.13 text in `docs/plans/c12-design-6.13.md` (inside the patch).
+- **Its second review was cut off by a container restart:** `c12-early-review.json` holds two of the three reviewers' findings:
+  - redaction: 3 blockers and 1 major in the trim (a pattern secret longer than the margin before the tail window; HTML over its share; joined error frames; progress-bar output emptied);
+  - gateway: 8 minors.
+  Rerun the tests/docs reviewer, then fix and verify, before committing it.
+- **Scopes for C5–C12** are drafted in `scopes/`. `workflows/chunk.js` is the chunk workflow (implement, 2–3 reviewers, fix, verify) they were written for; its args are `repo`, `scratch`, `evalDocs`, `chunk`, `head`, `evalCases`, `scope`, `lenses` and `extraRules`.
+- **Environment fixes this container needed** (not in the repo):
+  - uv ≥ 0.10 (`pip install -U uv`);
+  - `apt-get install rsync shellcheck`;
+  - `/etc/jupyter/jupyter_server_config.json` with `{"ServerApp": {"allow_root": true}}`, because JupyterLab refuses to run as root;
+  - the eval docs from https://code.claude.com/docs/en/plugin-evals.md.
+
+  At HEAD f9af3f0 the unit suite passed (2341) and integration passed 45 of 46: one 2 s probe, `test_vars_probe_never_calls_a_user_len`, fails under load and passes alone.
+- **C5 note:** `test_error_retry_mocks_are_agents_on_one_description` allows agent mocks only in error-retry. A case that needs one must generalise that test.
+
 ### 3. Then C5 → C12, per `v0.2.md`
 
 - **C12's independent parts** can be built early in a parallel workflow and committed with C12:

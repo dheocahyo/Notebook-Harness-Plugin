@@ -1,0 +1,2756 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 001395f..70fa0d9 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -70,12 +70,20 @@ jobs:
+         with:
+           enable-cache: true
+       - run: uv sync --project plugins/nh/server --locked --all-groups
+-      - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300
++      # An explicit basetemp: pytest's default is under /tmp on Linux but $TMPDIR on macOS.
++      - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300 --basetemp "$RUNNER_TEMP/pytest-integration"
+       - if: failure()
+         uses: actions/upload-artifact@v6
+         with:
+           name: integration-logs-${{ matrix.os }}
+-          path: /tmp/pytest-of-*/**/jupyterlab.log
++          # tests/integration/conftest.py start_lab writes jupyterlab-<port>-<token prefix>.log;
++          # labs started by `nhctl lab start` (tests/nhctl) log under the project's hidden .nh/logs.
++          # pytest's <name>current symlinks would upload each log twice.
++          path: |
++            ${{ runner.temp }}/pytest-integration/**/jupyterlab-*.log
++            ${{ runner.temp }}/pytest-integration/**/.nh/logs/*.log
++            !${{ runner.temp }}/pytest-integration/*current/**
++          include-hidden-files: true
+           if-no-files-found: ignore
+ 
+   plugin:
+diff --git a/.github/workflows/drift.yml b/.github/workflows/drift.yml
+index e9dcb69..398055e 100644
+--- a/.github/workflows/drift.yml
++++ b/.github/workflows/drift.yml
+@@ -40,3 +40,52 @@ jobs:
+           node-version: 24
+       - run: npm install -g @anthropic-ai/claude-code@latest && claude --version
+       - run: claude plugin validate --strict plugins/nh && claude plugin validate --strict .
++
++  # A failed night comments on the open issue labelled drift, or opens one: one issue at a time.
++  # failure() is true when a job this one needs failed; not when they passed or were cancelled.
++  file-issue:
++    needs: [upstream-latest, claude-code-latest]
++    if: failure()
++    runs-on: ubuntu-latest
++    permissions:
++      issues: write
++    # One filer at a time, so two failed runs close together can't both open an issue.
++    concurrency:
++      group: drift-file-issue
++      cancel-in-progress: false
++    env:
++      GH_TOKEN: ${{ github.token }}
++      GH_REPO: ${{ github.repository }}
++      EVENT: ${{ github.event_name }}
++      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
++      UPSTREAM: ${{ needs.upstream-latest.result }}
++      CLAUDE_CODE: ${{ needs.claude-code-latest.result }}
++    steps:
++      - name: comment on the open drift issue, or open one
++        run: |
++          failed=""
++          if [ "$UPSTREAM" = failure ]; then failed="upstream-latest"; fi
++          if [ "$CLAUDE_CODE" = failure ]; then failed="${failed:+$failed, }claude-code-latest"; fi
++          body="The drift check failed ($EVENT run): $RUN_URL
++
++          Failed: $failed
++
++          - upstream-latest: $UPSTREAM
++          - claude-code-latest: $CLAUDE_CODE"
++          # The label as the repo spells it; created when missing (--force: no error if it
++          # appeared since).
++          label=$(gh label list --search drift --limit 100 --json name \
++            --jq '.[] | select((.name | ascii_downcase) == "drift") | .name')
++          if [ -z "$label" ]; then
++            label=drift
++            gh label create "$label" --force --color B60205 --description "The nightly drift check failed"
++          fi
++          # REST, not `gh issue list --label` (a search, which lags new issues): newest first,
++          # pull requests left out.
++          issue=$(gh api "repos/$GH_REPO/issues?labels=$label&state=open&per_page=30" \
++            --jq '[.[] | select(.pull_request | not)][0].number // empty')
++          if [ -n "$issue" ]; then
++            gh issue comment "$issue" --body "$body"
++          else
++            gh issue create --title "Nightly drift check failed" --label "$label" --body "$body"
++          fi
+diff --git a/docs/design.md b/docs/design.md
+index 6a6865c..36aaedb 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -190,16 +190,19 @@ class Shaped:
+     images: list[ShapedImage]      # ≤ max_images, each ≤ image_max_px on the long side (PNG; JPEG q80 if PNG > 150 KB)
+     dropped_images: int
+     truncated: bool
+-    full_path: str | None          # project-relative path of the untruncated copy in .nh/outputs/
++    full_path: str | None          # project-relative path of the full copy in .nh/outputs/ (past TRIM_CHARS: trimmed, §6.8)
+     error: ErrorInfo | None        # from output_type == "error" (ANSI-stripped; line from "Cell In[n], line N" / "line N")
+     summary: OutputSummary
+ 
+ def strip_ansi(text: str) -> str
+ def shape_outputs(outputs: list[dict], *, max_chars: int, max_images: int, image_max_px: int,
+                   save_dir: Path | None) -> Shaped
++    # cleans, redacts and keeps at most TRIM_CHARS (8,000,000) raw chars of text per call (§6.8 Trim)
+ def summarize_outputs(outputs: list[dict]) -> OutputSummary    # cheap: no base64 decoding
+ def redact(text: str) -> str               # FR-14: secrets.current().redact from v0.2 (§6.8)
+-def prune_outputs_dir(save_dir: Path, max_files: int = 200, max_bytes: int = 50 * 2**20) -> None
++def prune_outputs_dir(save_dir: Path, max_files: int = 200, max_bytes: int = 50 * 2**20, *,
++                      keep: Collection[str] = ()) -> None
++    # newest first; the names in keep (what the calling shape_outputs just wrote) are never deleted (§6.13)
+ ```
+ Mime preference: `error`, then `text/plain`, then `text/markdown`, `text/latex`, then images (`image/png`, `image/jpeg`), then `text/html`. HTML becomes text only when there is no `text/plain`; tables become TSV via `html.parser`. Then `application/json` (compact), Plotly as `[plotly figure: N traces]`, widgets as `[widget]`, SVG as `[SVG figure omitted]`. `\r` progress bars keep the text after the last `\r` on each line. Consecutive streams with the same name are coalesced.
+ 
+@@ -913,7 +916,7 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
+   - 12+ chars of its start, right before `...`, `…` or the end of the text;
+   - 12+ chars of its end, right after `...`, `…`, a newline or the start of the text.
+   A value with a `.` right where it was cut (`Wd8kLq2mZp4x.R7vN` shown as `Wd8kLq2mZp4x...`) runs on into the cut's dots, so the match steps back out of them (for a tail, out of the dots before it).
+-  This only runs on texts of up to 2 MB. nh's own stream cut (docsafe, below) never leaves such a piece. For a URL nh has no value for, the `url-userinfo` pattern also takes `scheme://user:pass` cut right before `...` or `…` (an all-digit "password" there is a port, and stays).
++  This only runs on texts of up to 2 MB. nh's own cuts never leave such a piece: docsafe's stream cut (below) starts at a boundary, and the trim's (Trim, below) are made inside redacted windows. For a URL nh has no value for, the `url-userinfo` pattern also takes `scheme://user:pass` cut right before `...` or `…` (an all-digit "password" there is a port, and stays).
+ - **One pass, longest first.** Every value and cut piece is found with `str.find` on one lowercased copy of the text with the same offsets (`_fold`, which the keyed patterns scan too), so `value.upper()` and `value.lower()` are caught at no extra cost; values that differ only in case count as one, and the first name wins. Every value, cut piece and pattern is located on the original text's offsets. Overlapping spans merge into one marker, named after the heaviest span in the group: the longest value (a pattern weighs nothing), and among equals the first to start, then the longest. A value holding `[` or `]` is looked for again, up to three times, since a marker next to it can complete it (`[redacted:A]]x`). The output never contains an input value. It is idempotent: a marker is never matched again. Nothing else is shortened or dropped.
+ - **`redact_head(text, limit)`**, for callers that then cut at `limit`, redacts a window of `text` and doesn't scan the rest. The window starts at `limit + margin` chars, where margin = max(1024, the longest value + 1), and doubles until its redacted form still reaches `limit + margin` (markers are shorter than what they replace) or it holds the whole text. So a secret that crosses the cut is replaced whole, and the window's own raw edge stays past the caller's cut.
+ - **docsafe's cuts start at a boundary** (`docsafe.snap_cut`). When docsafe drops the head of a stream too long for the notebook, or of a traceback line over `BUNDLE_MAX_CHARS`, the cut moves forward to the next newline, else whitespace, else one of `,;"'&<>()[]{}`, looking at most min(4096, `STREAM_KEEP_CHARS`/2) chars past it. A cut mid-token would keep a tail no pattern matches (`…E3r4T5` of a GitHub token, the end of a plain-named value). The window depends only on the kept text, so each flush still only appends.
+@@ -930,9 +933,9 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
+ 
+ | Site | What is redacted |
+ |---|---|
+-| `shaping.redact`, which delegates to `secrets.current().redact`, called by `_clean` | Every stream; every text/plain, markdown, LaTeX and JSON body; each error's name, value and traceback frames. This covers the shaped text and the full copy under `.nh/outputs`, which is joined from the already-redacted sections: `_write_once` makes no second pass, and `_save_originals` writes image bytes untouched |
++| `shaping.redact`, which delegates to `secrets.current().redact`, called by `_clean` | Every stream; every text/plain, markdown, LaTeX and JSON body; each error's name, value and traceback frames. This covers the shaped text and the full copy under `.nh/outputs`, which is joined from the already-redacted sections: `_write_once` makes no second pass, and `_save_originals` writes image bytes untouched. Past `TRIM_CHARS` of text in one call, a long text's head and tail windows are what gets cleaned and redacted (Trim, below) |
+ | `shaping._html_to_text` | HTML markup over 1 MB: `redact_head` runs before the 1 MB cut |
+-| `shaping.summarize_outputs` | The error summary, and `text_head`: `_first_line` starts its window at the first non-blank character, cleans it as `_clean` does (terminal codes stripped, then redacted) and takes the first line only from the part that stays a margin clear of the window's raw edge, doubling the window until that line ends inside it (or runs past the 80-char cut, or the window reaches 1 MiB). So a secret across the window's edge goes whole |
++| `shaping.summarize_outputs` | The error summary (its value within 256 KiB, trimmed like a text past that), and `text_head`: `_first_line` starts its window at the first non-blank character, cleans it as `_clean` does (terminal codes stripped, then redacted) and takes the first line only from the part that stays a margin clear of the window's raw edge, doubling the window until that line ends inside it (or runs past the 80-char cut, or the window reaches 1 MiB). So a secret across the window's edge goes whole |
+ | `docsafe.output_summary` | The error (160 chars) and `text_head` (200 chars): terminal codes are stripped first, as `shaping._clean` does (`_shared/text.terminal_text`: ANSI codes, `\r` overwrites, control characters), so a value split by a color code is still found; then a window growing like `redact_head`'s is redacted, then cut. The outline, the turn summaries and `nh_run(mode="wait")` read these ("Nothing is running: … failed with …" is built from this summary, and `text_result` redacts it again) |
+ | `docsafe._cap_one` | Nothing itself: its cuts start at a boundary (`snap_cut`, above) |
+ | `render.error_summary`, `render.cell_label`, `render._short`, `render._describe`, `render._diff` | The text before each cut: error summaries (`redact_head`), the label's title and first code line, and the scalar reprs; then each name summary and change line whole (`@_redacted`), so the var view and run reports |
+@@ -977,7 +980,7 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
+   - The keyed ones run with `finditer` on one lowercased copy of the text with the same offsets (`_fold`: İ, the only character whose lowercase is longer, becomes "i" first). Every skip rule is inside the regex, so a benign hit (`max_token=512`, `{"token": "the"}`, `token=tokenizer.eos_token`) never reaches Python. Python 3.9's `re` has no atomic groups or possessive quantifiers, so the code rules use a lookahead's capture matched again by reference, `(?=(?P<x>…))(?P=x)`, which is never backtracked into. Only the case-dependent checks (`_code_word`, `key`'s name) run in Python, on the hits.
+   - The userinfo regexes (the `@` form and the cut form) are bounded (256 chars of user, 512 of password), so they never run away on a long line. The cut form runs only when the text holds `...` or `…`, which it needs: scanning every `://` for it cost ~80 ms per 50 MB of URLs. The same goes for `key`'s digit check, which looks at most 64 chars ahead: an unbounded one rescanned a long digit-free run (`a_key=a_key=…`, a `;`-joined config) at every `key` in it (1 MB of `a_key=` takes 0.33 s on Python 3.9 with 64, 0.93 s with 256).
+   - The keyed regexes are compiled the first time a text holds their literal (`token`, `pass`, `secret`, `key`, `authorization`), not at import: a hook runs in a fresh process, and compiling all five took ~8 ms on Python 3.9, which pushed session-start's p95 to 150 ms.
+-  - Image base64 and bytes are never scanned, the full copy gets no second pass, and head-only sites use `redact_head`.
++  - Image base64 and bytes are never scanned, the full copy gets no second pass, head-only sites use `redact_head`, and past `TRIM_CHARS` a call's text is trimmed before it is cleaned (Trim, below).
+ - **Budget:** turn overhead p95 ≤ 1.5 s, for a 50 MB stream and a 20 MB image bundle.
+ - **V11 re-measured** (`spikes/v0.2/v11_redaction.py`, p50/p95 in ms, `shape_outputs` end to end on Python 3.13.8, off (an identity redactor) vs patterns only vs a ~30-value `.env`). The 50 MB profiles each repeat one line: `key=value` logs full of benign token keys (token-kv), JSON records with a short `"token"` value (json-records), NLP token dumps (nlp-tokens), e-mails and URLs, a real token on every line (token-dense, 1.35 million secrets), and an `.env` value on every line (value-dense):
+ 
+@@ -996,8 +999,42 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
+ - Every planted secret (one per pattern and three `.env` values) is gone from the shaped text and the full copy.
+ - `Redactor.redact` alone (`--redactor-only`), with the `.env`, p50/p95 on Python 3.9.6 (hooks and nhctl, which redact short heads and tails) and 3.13.8 (the gateway): 50 MB stream 659/699 and 585/603 ms; 5 MB bundle 66/69 and 59/62 ms; token-kv 1310/1492 and 1115/1121 ms; value-dense 985/987 and 911/926 ms; token-dense 2630/2780 and 2031/2098 ms.
+ - The review of C3 (values matched in any case, their escaped, `repr` and HTML forms, the cut userinfo form, pieces of secret-named values, terminal text) costs, against the C3 commit measured the same day, `.env` p95: 50 MB stream 927 → 976 ms, token-kv 1402 → 1487 ms, emails+urls 883 → 1054 ms, value-dense 1223 → 1282 ms, 5 MB bundle 170 → 172 ms. Most of it is the values' search in the folded text; patterns only on the redactor alone, 50 MB stream 296 → 328 ms p50.
+-- The budget holds with no cache or trim for every profile but token-dense: the worst adds 1.10 s at p95 (token-kv), where the C0 prototype's 50 MB planted stream took 1.58 s. token-dense costs about 1.3 µs per secret found (each hit is a Python-level span and a marker), so an output with a real secret on every line goes over (a known gap).
+-- value-dense uses the longest `.env` value: under a shorter value, whose marker is longer than the value, the redacted full copy grows past `prune_outputs_dir`'s 50 MiB cap and is pruned at once (the spike then finds no full copy).
++- On V11's machine the budget held with no cache or trim for every profile but token-dense: the worst added 1.10 s at p95 (token-kv), where the C0 prototype's 50 MB planted stream took 1.58 s. token-dense costs about 1.3 µs per secret found (each hit is a Python-level span and a marker), so an output with a real secret on every line went over.
++- value-dense uses the longest `.env` value: under a shorter value, whose marker is longer than the value, the untrimmed redacted full copy grew past `prune_outputs_dir`'s 50 MiB cap and was pruned at once (the spike then found no full copy). Since C12 neither happens: a call's own copies survive its prune (`keep`, §6.13), and a trimmed copy holds about `TRIM_CHARS` chars.
++- C12's a7 (§6.13) ran V11's 50 MB stream through the RTC path on a Linux machine that runs the gateway's shaping 2.1-2.5 times slower than V11's: turn overhead 1.94-2.68 s per call, over the budget at any load, and `shape_outputs` was 85-90% of it (one profiled: `terminal_text` 0.47 s, `redact` 0.94 s, the copy's write 0.25 s, its sha256 0.13 s). V11's own bench there: 2462 ms p95. Hence the plan's fallback (V11 "If it fails: cache or trim"): the trim.
++
++**Trim** (C12, `exec/shaping.py`)
++- One call cleans (`terminal_text`, then redaction), keeps and writes at most `TRIM_CHARS` (8,000,000) raw characters of output text, whatever its outputs hold (the summary's `text_head` window and error value are bounded on their own). `shape_outputs` plans every text first: nothing is cleaned before its share is known. `_shared/secrets.py` is unchanged: the windows go through `redact` as any text does.
++
++| Step | What happens |
++|---|---|
++| Plan (`_trim_plan`) | The texts: each stream (after coalescing), each bundle's shown text (text/plain, Markdown, LaTeX, JSON), HTML markup (counted up to `MAX_HTML_CHARS`), and each error (name, value and frames together). All within `TRIM_CHARS`: every text whole, as before. Else shares by `_water_fill`: short texts whole, long ones split the rest. If even `TRIM_MIN_SHARE` (256 KiB) each is too much, texts from the middle are left out whole, the first and last kept as in the result's `_fit`, the error always |
++| A text over its share (`_clean_share`) | The head keeps 30% and the tail 70% of share − 2 × margin, with nh's `[… N chars cut …]` between. The head window is the raw text's first head + margin chars, the tail window its last tail + margin. Each window is cleaned as `_clean` does, then cut in its cleaned form at least margin chars inside its raw edge. The cut moves to a line break in its last 40% (head) or first 40% (tail) when there is one, and never splits a `[redacted:…]` marker |
++| Texts left out | Each run of them becomes one line, `[… N chars cut …]` (N: their raw length). Image lines stay where they were |
++| An error over its share (`_error_info`) | Its name, value and joined frames split the share by `_water_fill`, each trimmed alone. `summarize_outputs` cleans the error's value within 256 KiB the same way |
++| HTML over its share | `_html_to_text` cuts the markup at the share instead of at 1 MB (`redact_head` first, as before) |
++
++- **Margin:** max(the redactor's margin, `PEM_MAX_CHARS` + 1024): 17,408 chars, more only for a longer `.env` value.
++- **The cut edges.** As in `redact_head`, each cut is at least a margin inside its window's raw edge:
++  - a secret that crosses a cut lies whole in its window, so it is one marker there, and a marker the cut would split is left out whole;
++  - a secret that crosses a window's raw edge leaves at most a piece shorter than the margin inside the window, and that margin is dropped. A value is shorter than the redactor's margin. `url-userinfo` spans at most 772 chars. A private key's END line is looked for within 16 KiB of its BEGIN line, so a key that crosses the head's cut ends inside the window, and a key that crosses the tail window's edge leaves a body and END line under 17,408 chars;
++  - a keyed pattern reads its key name at most 256 chars back, so a value that starts in the kept part, a margin past the window's edge, has its key in the window.
++  - So the kept text holds no secret, and no piece of one, that redacting the whole text would have caught. A window can catch more: cut pieces are matched in windows of up to 2 MB.
++- **Counts.** A trim marker's N is the text's raw length minus the chars kept. The kept pieces are measured cleaned, so a marker or colour code in them moves N by a few chars. The tool result's `[… N chars cut …]` counts what the trim left out too: `_cut` and `_cut_traceback` never show part of a trim marker, and each one they cut counts as its N (`_shown`).
++- **The full copy** is still `.nh/outputs/<sha16>.txt`: the trimmed text, redacted, whose `[… N chars cut …]` lines say what it left out. It is written whenever a text was trimmed or left out, and `Shaped.truncated` is then set.
++- **Unchanged:** a call whose text fits `TRIM_CHARS` (its result, full copy and copy name, byte for byte); images and their originals; docsafe's caps (the room and the `.ipynb` keep what they kept); the result's budget and wording.
++- **Why 8,000,000.** The largest of the caps below at which V11's worst profile, token-dense (a real token on every line), keeps a7's turn overhead under 1.5 s: a7 spends ~0.3 s outside `shape_outputs` (§6.13), and at 16 MB token-dense takes 1.4-1.5 s alone. The copy of one long text then keeps 2,389,555 chars of head and 5,575,629 of tail. `shape_outputs` p50/p95 in ms on V11's texts with its 30-value `.env`, 7 runs each (the a7 machine: Linux, 4 CPUs, Intel Xeon 2.8 GHz, Python 3.11.15; load 1.1, rising to 2.95 during the last row):
++
++| `TRIM_CHARS` | 50 MB stream | 50 MB token-kv | 50 MB token-dense |
++|---|---|---|---|
++| none (whole, before C12) | 1818/2059 | 2670/2852 | 4468/4700 |
++| 4,000,000 | 163/176 | 207/215 | 342/363 |
++| 8,000,000 | 267/285 | 388/446 | 652/704 |
++| 16,000,000 | 575/626 | 824/897 | 1407/1549 |
++
++  V11's own bench the same day (`spikes/v0.2/v11_redaction.py`, 50 MB stream, 10 runs): `.env` 2044/2140 → 261/284 ms, patterns only 1501/1683 → 193/250, off 846/1093 → 139/184. Its 5 MB bundle, under the cap, is unchanged (`.env` 318/371 → 300/350). Measured cost per char is about 1.7 times higher when a call's texts split the cap into windows of 2 MB or less, which also match cut pieces.
++
++- **Still proportional to the output:** joining nbformat's line lists and coalescing streams (C-speed copies), and the receive path (§6.13). `summarize_outputs` and the mime choice no longer copy a long text to test it for blanks or a bare object repr (`_leading_space`, `_object_repr`).
+ 
+ **Known gaps**
+ - Encoded secrets: base64 and URL-encoded (`%40`, except a URL password, which is also registered decoded). JSON-escaped only in part: a `.env` or environment value's escaped, `repr` and HTML forms and `\"key\": \"value\"` are caught, `\u…` escapes are not; a patterns-only secret's `repr` or HTML form is caught only where the pattern still reads it.
+@@ -1016,8 +1053,13 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
+ - `.nh/logs/jupyterlab.log` holds kernels' fd-level output raw until the next `nhctl lab start` (see Kept raw).
+ - Secrets drawn in images or held in binary outputs.
+ - A value that is itself part of a marker ("redacted", or the secret's own name).
+-- Cost: an output with a real secret on nearly every line. A 50 MB stream of 1.35 million tokens adds ~2.0 s at p95, over the 1.5 s budget (see Performance). Benign-dense outputs (token keys, NLP tokens, e-mails, `.env` values) stay under it.
+-- A full copy over 50 MiB is pruned as soon as it is written (v0.1's `prune_outputs_dir` cap). Markers longer than their values can push a copy that was just under the cap over it.
++- Cost: an output with a real secret on nearly every line. The trim bounds it: V11's 50 MB token-dense stream (1.35 million tokens) costs 652/704 ms in `shape_outputs` on the a7 machine, where it cost 4468/4700 ms whole.
++- The full copy of a call over `TRIM_CHARS` holds each long text's head and tail only: the middle is in no file nh keeps (the notebook keeps a stream's last 1 MB, raw).
++- Texts the trim leaves out whole (with more than 30 texts over 256 KiB, or many small ones over 8 MB in all, a fragmented output) are one `[… N chars cut …]` line per run in the copy, which doesn't say how many outputs it stands for; the result's "more outputs not shown" counts them.
++- A trim marker's N is off by what cleaning changed in the kept pieces (a few chars per marker or colour code).
++- A terminal escape opened before a window's edge (an OSC or DCS sequence, which runs to its terminator) is not seen as one: the text it would hide shows (still redacted).
++- A single secret longer than the margin (17,408 chars) that starts before the tail window.
++- A call's own copies are never pruned by that call (`keep`, §6.13), so `.nh/outputs` can hold more than 50 MiB until the next call's prune.
+ 
+ **Docs:** E125 rows in `skills/notebook/reference/errors.md` and `docs/troubleshooting.md` (for a `[redacted:NAME]`, read NAME from the environment or `.env` without printing it; a `[redacted:<kind>]` names no variable, so ask the user; never retype a marker; why a non-secret was hidden and how to rename it). `harness-toml.md` and `reference/tools.md` say the `.nh/outputs` copy is redacted like the result while the notebook stays raw, and both READMEs say what nh hides from the agent and the main gaps. The troubleshooting log table points at `nhctl lab status --log`. The re-measure goes in `spikes/RESULTS.md` under V11.
+ 
+@@ -1036,6 +1078,15 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
+   - the hooks' `test_hook_prompt.py` (the title before its cut, and the whole reminder) and `test_hook_session.py`, plus the hook failure log in `test_hook_shim.py`;
+   - nhctl's `test_freshrun.py` (labels and `failing_report` called directly, on both Pythons), `test_cli.py` (printed and usage errors, the `NHCTL_DEBUG=1` traceback, `--json` strings before escaping, `scrub_data`) and `test_settings.py` (a printed diff);
+   - `test_log.py` and `test_lab.py`, whose `***` marks become `[redacted:token]`.
++- The trim (`test_shaping.py`, C12):
++  - a 50 MB stream passes at most `TRIM_CHARS` (plus the summary's first-line window) through `terminal_text` and the redactor, spied on;
++  - the copy keeps whole lines of the head and tail, the text's raw head and tail as printed, and one `[… N chars cut …]` whose N is the raw length minus what is kept; the result's marker counts the whole text;
++  - a text of exactly the cap is kept whole and one char more is trimmed; a text just under the real cap is copied byte for byte;
++  - a `.env` value, a GitHub token, a private key (and one over 8 KB), and a URL's userinfo, each planted across each edge (the head's cut, the head window's end, the tail's cut, the tail window's start) with 1, half or all but 1 of its chars before it: no 6 chars of it in the result or the copy. Two mutants fail it: a 16-char margin, and pieces cleaned alone without windows;
++  - texts the cap can't share are left out from the middle as one line per run (the error and an image line kept in place), and the result's "more outputs not shown" counts every output a run stands for;
++  - a long error keeps its line and is trimmed in its value and frames; the error summary cleans at most 256 KiB of a long value; `_cut` never shows part of a trim marker; HTML is cut at its share after `redact_head`;
++  - cost: 16 MB costs under 3 times what 2 MB does once both are trimmed (relative, best of 3).
++  A differential run against the pre-trim `shaping.py` (6,000 random output lists with secrets, terminal codes, images and errors, and one near the cap) gave the same text, flags, error, summary, images and copy bytes.
+ - E125: add and edit, from the main conversation and the writer (with `WRITER_LINE`); nothing written; no lint reject counted. Its place in the gate order: marked code that also fails lint gets E125 and counts no reject, and marked code for a missing notebook gets E125, not E132.
+ - E141 (`test_secrets_wiring.py`): a private key whose END line is past line 6 is one marker in edit's diff, in "The cell now reads" and in undo's diff, and a change only inside a hidden value says so, for edit and undo. `test_shaping.py`'s `_first_line` cases pad the head so under 12 chars of a secret fall inside the first window; `test_docsafe.py` splits a value with an ANSI code; nhctl's tests show each nhctl site on its own (`scrub_data` for a value with a control character, the line net with `scrub_data` patched out, `tail`, envsync's `env-sync.json`, D199's message before `print_result`, `lab status --log`, doctor's D131 on both Pythons).
+ - Raw vs redacted: with the fake backend, the notebook, the history and a cell view's `base_sha` hold the raw value while the tool result and the `.nh/outputs` copy hold the marker, and the ledger holds no raw text. An integration test (`tests/integration/test_redaction.py`, marked `integration`) shows the same against a real JupyterLab: the `.ipynb` and the RTC document are raw, the tool result is redacted, and a cell that prints the discovered Jupyter token (built from two halves) shows `[redacted:JUPYTER_TOKEN]`.
+diff --git a/docs/plans/c12-design-6.13.md b/docs/plans/c12-design-6.13.md
+new file mode 100644
+index 0000000..38e0d70
+--- /dev/null
++++ b/docs/plans/c12-design-6.13.md
+@@ -0,0 +1,168 @@
++### 6.13 a7, a8 and drift issue filing
++
++Chunk C12 (plan D13), built early as C12-early: a7, a8, the drift.yml issue job and the ci.yml artifact glob. The rest of C12 (README, troubleshooting pass, acceptance) comes later. a7 and a8 each exposed gateway bugs, fixed minimally here: a8 the unsaved room (`backend/rtc.py`, `backend/rtc_backend.py`), a7 the kernel websocket's pure-Python UTF-8 check (`backend/kernel.py`) and the prune that deleted a call's own image originals (`exec/shaping.py`). a7 also measured V11's 50 MB stream over the 1.5 s budget on this machine, so V11's fallback, the trim, is built here too (`exec/shaping.py`; designed in design.md §6.8 Trim, directly). Tests: `tests/integration/test_large_outputs.py` (new, a7), `tests/integration/test_lab_restart.py` (new, a8), `tests/integration/conftest.py`, `tests/integration/test_rtc_document.py`, `tests/unit/test_rtc_save.py` (new), `tests/unit/test_kernel_utf8.py` (new), `tests/unit/test_shaping.py`. Also `.github/workflows/drift.yml`, `.github/workflows/ci.yml` and `spikes/RESULTS.md`. No new code in §6.0 d, no model-facing text: the trim reuses nh's `[… N chars cut …]` marker.
++
++**For the merge into design.md:** the `shaping.py` lines are done in design.md already (the trim's work was allowed to edit them): §3.2's `shaping.py` block (the one this note used to call §4's) has `prune_outputs_dir(..., *, keep: Collection[str] = ())`, the trim cap and the full copy's comment; §6.8 has the Trim block, and its two lines that said a full copy over 50 MiB is pruned at once are rewritten: the gap "A full copy over 50 MiB is pruned as soon as it is written" and V11's value-dense note "the redacted full copy grows past `prune_outputs_dir`'s 50 MiB cap and is pruned at once (the spike then finds no full copy)". Left for C12's docs pass: `docs/harness-toml.md`'s `max_chars` row says "The full text is saved under `.nh/outputs/`", which past `TRIM_CHARS` is its head and tail. `skills/notebook/reference/tools.md` ("full copy under `.nh/outputs/`") is model-facing and still true (the copy's own markers say what it left out), so it is unchanged. What remains to merge is this section.
++
++**a7: very large outputs** (`tests/integration/test_large_outputs.py`)
++- **Its own JupyterLab**, started with `--ZMQChannelsWebsocketConnection.iopub_data_rate_limit=1e10`. At jupyter_server's default (1 MB/s over a 3 s window) the server drops any stream message over 3 MB before it reaches a client, nh or the user's tab, and sends "IOPub data rate exceeded" on stderr instead: with a default server nothing that large reaches nh. So a7 measures the case where the user raised the limit, as users do when they print this much.
++- **Project:** V11's ~30-value `.env` (secret names, 16-45 chars), the gateway (MCP over `RtcBackend`), an observer peer for the user's tab. A first message adds a helpers cell, so the kernel is up and the gateway warm. That cell also registers IPython `pre_run_cell`/`post_run_cell` hooks that append each later cell's own run time to a file (nh's probes run silent and don't count).
++- **Cases**, each a cell added in one message and re-run in the next ones:
++
++| Case | Cell | Calls | Budgeted |
++|---|---|---|---|
++| 50 MB stream | ten 5 MB prints of V11's log line; the `.env` value `DB_PASSWORD` ends each, and a GitHub token follows it in the fifth and the last (so the trimmed copy keeps one) | 10 (add, 9 re-runs) | yes |
++| 20 MB image bundle | a short stream holding `DB_PASSWORD`, then four noise PNGs: base64 of ~5.67 MB (over the bundle cap), then three of ~4.80 MB | 10 | yes |
++| Both in one cell | the stream, then the images. Before the trim its full copy (~50 MB) and image originals (~15 MB) were over `.nh/outputs`' 50 MiB cap together (see pruned originals below); trimmed (~8 MB and ~15 MB) they are under it, so `test_shaping.py` keeps that case | 10 | yes, since the trim: its turn overhead is the two cases' work in one call, p95 1.09-1.27 s at load 1.2-4.4 (6.8's budget names the two cases apart; this one has the least headroom, see Known gaps) |
++
++- **Checks**, in the room (the observer) and in the saved `.ipynb`:
++
++| Cap (`exec/docsafe.py`) | Holds |
++|---|---|
++| Stream tail, `STREAM_KEEP_CHARS` (1 MB) | "[nh: N earlier characters of this output were not saved in the notebook]", then at most 1 MB of the raw tail, ending with the last line (the notebook keeps the secret: 6.8) |
++| Bundle, `BUNDLE_MAX_CHARS` (5 MB) | the 5.67 MB image is "[nh: this output (5.4 MB) is too large to save in the notebook]", with no image data |
++| Cell, `CELL_MAX_CHARS` (8 MB) | the second image is kept (≤ 5 MB); the third and fourth are one stderr notice, "[nh: 2 more output(s) were not saved; this cell's output is over 8 MB]"; the outputs' `approx_size` sum ≤ 8 MB |
++
++  The combined cell holds the capped stream (its tail ends with the images' first line), then the same three. The disk check waits for JupyterLab's last save: a save made while the cell ran holds that moment's outputs.
++- **Checks on what Claude sees:**
++
++| What | Holds |
++|---|---|
++| The output section | ≤ `[output] max_chars` (2000), last line `[full output: .nh/outputs/<sha16>.txt]` |
++| Images | "[image 1: 1190x1190 png, sent at 768x768]", "[image 2: …, sent at 768x768]", "[image 4: …, not sent (limit 2)]"; two images attached (`max_images`) |
++| Originals | every "original: .nh/outputs/<sha16>.png" the full copy names is on disk (4 per call) |
++| The trim (6.8) | the full copy holds at most `TRIM_CHARS` of the stream and one `[… N chars cut …]` line: the kept head and tail are the raw stream's (rebuilt in the test) as printed, but for each planted secret; N is the stream's raw length minus what is kept; the result's own marker counts the whole stream too (its raw length minus what it shows) |
++| Redaction (C3) | no planted value or token in the result or the full copy; every one the trim keeps is its marker; the shown text ends "part 9 db [redacted:DB_PASSWORD] key [redacted:github-token]", and "four figures, db [redacted:DB_PASSWORD]" for the images |
++
++- **Time, per call:**
++
++| Measure | Is | Budget |
++|---|---|---|
++| Turn overhead | call wall time − the run's `exec.ms` (its `cell_added`/`cell_rerun` event: from nh seeing the kernel start the cell until nh holds every output, the final flush included): the pre-run work (kernel status and attach probe, snapshot, lint, insert, the before-probe), the post-run work (the after-probe, `shape_outputs` with its redaction and full copy, render) and the MCP round trip. V11 timed the same work as `harness_ms` plus `shape_outputs`. It is not what `nhctl metrics` reports for these calls: the event's `harness_ms` is the pre-run part only (`tools/write.py` computes it before `_wait`), and `nhctl metrics` reads that field first, falling back to total − exec only for events without it. Here `harness_ms` is 75-127 ms, a tenth or less of the overhead | p95 ≤ 1.5 s (6.8) |
++| Receive path | `exec.ms` − the kernel's own run time: the outputs travelling kernel → JupyterLab → nh's kernel websocket → nh's output hook. Outside V11's measure, so held to the same 1.5 s on its own | p95 ≤ 1.5 s |
++| Call − kernel | the two together, printed | — |
++
++  p95 is by nearest rank, over 10 calls: the max of the 10 (V11's p95 over 10 runs was its max too). The test also prints `shape_outputs`' own time (what V11 timed), `harness_ms` and the load average. Runtime ~60 s.
++- **Measured with the trim** (design §6.8 Trim, `TRIM_CHARS` 8,000,000), per call: three runs alone, each started once the 1-minute load was under 1.5 (other workflows share this machine; in the first they came back and the load rose to 4.4), one in the full integration suite, and a first try at load 4.7-5.9. Load is what the test printed during the case:
++
++| Case | Run (load) | Turn overhead (s) | p95 (s) | `shape_outputs` (s) | Receive p95 (s) |
++|---|---|---|---|---|---|
++| 50 MB stream | alone 1 (1.2-2.3) | 0.50-0.60 | 0.604 | 0.25-0.32 | 0.727 |
++| 50 MB stream | alone 2 (1.4-1.5) | 0.48-0.57 | 0.568 | 0.26-0.32 | 0.434 |
++| 50 MB stream | alone 3 (1.5-1.7) | 0.48-0.55 | 0.553 | 0.25-0.31 | 0.437 |
++| 50 MB stream | full suite (1.5-1.7) | 0.47-0.57 | 0.567 | 0.25-0.31 | 0.436 |
++| 50 MB stream | first try (4.7-5.3) | 0.58-0.79 | 0.788 | 0.30-0.44 | 0.870 |
++| 20 MB image bundle | alone 1 (2.3-3.1) | 0.62-0.92 | 0.923 | 0.35-0.51 | 0.121 |
++| 20 MB image bundle | alone 2 (1.5-1.9) | 0.59-0.73 | 0.731 | 0.35-0.43 | 0.094 |
++| 20 MB image bundle | alone 3 (1.6) | 0.62-0.71 | 0.712 | 0.34-0.43 | 0.103 |
++| 20 MB image bundle | full suite (1.6) | 0.62-0.80 | 0.797 | 0.36-0.46 | 0.118 |
++| 20 MB image bundle | first try (5.3) | 0.64-0.80 | 0.802 | 0.37-0.47 | 0.230 |
++| Both in one cell | alone 1 (3.1-4.4) | 0.97-1.27 | 1.274 | 0.60-0.81 | 0.305 |
++| Both in one cell | alone 2 (2.0-2.2) | 0.98-1.09 | 1.085 | 0.59-0.74 | 0.131 |
++| Both in one cell | alone 3 (1.6-2.1) | 0.94-1.10 | 1.102 | 0.59-0.69 | 0.210 |
++| Both in one cell | full suite (1.7-2.1) | 0.97-1.22 | 1.223 | 0.62-0.77 | 0.221 |
++| Both in one cell | first try (5.5-5.9) | 1.16-1.92 | 1.919: over | 0.72-1.30 | 0.517 |
++
++  All four runs passed, with every check. `harness_ms` 81-168 ms; kernel time 0.39-0.58 s (stream), 0.35-0.46 s (images), 0.76-0.98 s (both). A trimmed stream's turn overhead is ~0.25-0.3 s besides `shape_outputs`, which is what design §6.8 counts on when it chooses the cap.
++- **Measured before the trim**, after the two fixes below (same machine), per call; three runs alone (load 0.4-1.6), then one in the full integration suite (load 3.1-5.0):
++
++| Case | Run | Kernel (s) | Receive (s) | Turn overhead (s) | `shape_outputs` (s) | p95 (s): turn overhead; receive |
++|---|---|---|---|---|---|---|
++| 50 MB stream | alone | 0.38-0.56 | 0.23-0.49 | 1.94-2.51 | 1.70-2.26 | 2.376, 2.505, 2.326: over; 0.413, 0.490, 0.420 |
++| 50 MB stream | full suite | 0.38-0.55 | 0.32-0.59 | 2.02-2.68 | 1.75-2.35 | 2.681: over; 0.586 |
++| 20 MB image bundle | alone | 0.36-0.47 | 0.06-0.11 | 0.62-0.79 | 0.35-0.48 | 0.718, 0.737, 0.786; 0.092, 0.111, 0.093 |
++| 20 MB image bundle | full suite | 0.38-0.51 | 0.03-0.13 | 0.68-0.82 | 0.37-0.45 | 0.820; 0.125 |
++| Both in one cell | alone | 0.75-0.95 | 0.08-0.14 | 2.81-3.19 | 2.35-2.74 | (not budgeted) |
++| Both in one cell | full suite | 0.92-1.08 | 0.23-0.30 | 3.61-3.62 | 3.04-3.14 | (not budgeted) |
++
++  `harness_ms` 82-110 ms. V11's own bench (`spikes/v0.2/v11_redaction.py`, its 50 MB stream case) on this machine: `shape_outputs` with the `.env` 2010/2285 ms p50/p95 at load ~6 and 2039/2462 ms at load ~1.6; redaction off 880/1263 and 913/1216 ms; against 946/976 and 356/361 ms on V11's machine (macOS arm64, Python 3.13.8). A profile of one 50 MB `shape_outputs` here: `terminal_text` 0.47 s, `redact` 0.94 s, writing the copy 0.25 s, its sha256 0.13 s; no step runs twice. So V11's own case is over 1.5 s on this machine, under load or not: it runs the gateway's shaping about 2.1-2.5 times slower. The RTC path adds nothing to it: `shape_outputs` is ~85-90% of a7's turn overhead.
++- **Found: the receive path.** Before the fix the 50 MB stream's `exec.ms` was 10.6-12.3 s for a cell the kernel ran in ~0.45 s, and the image bundle's 4.4-5.1 s for ~0.4 s: websocket-client checks every text frame's UTF-8 in a pure-Python loop (~0.19 s per MB) unless `wsaccel` is installed, and jupyter-kernel-client runs it without `skip_utf8_validation`. It ran on the gateway's receive thread and held the GIL. V11's measure left all of it out.
++- **Fix:**
++
++| Where | Change |
++|---|---|
++| `backend/kernel.validate_utf8(data)` | the same check by the C decoder (`str(data, "utf-8")`; a `str` is encoded with `surrogatepass` first, as websocket-client does). Refuses what websocket-client refused: overlong forms, surrogates, bytes past U+10FFFF, and a sequence cut at the end (which its own check let through to `WebSocketApp`'s decode) |
++| `kernel.py`, at import | `websocket._abnf.validate_utf8 = validate_utf8`: the name websocket-client's frame reader (`continuous_frame.extract`, and `ABNF.validate` for close frames) calls. Only jupyter-kernel-client uses websocket-client in the gateway (the room client uses `websockets`) |
++
++  After: receive 0.23-0.49 s for the 50 MB stream, 0.06-0.11 s for the image bundle; a7's runtime went from ~77 s (3 + 5 calls) to ~60 s (22 calls). `test_kernel_utf8.py` checks the name websocket-client's frame reader calls; against its latest release (the drift job runs the integration suite, not the unit tests) a7's receive budget is what fails if it renames it.
++- **Found: pruned originals.** With both in one output list, `prune_outputs_dir` (50 MiB) kept the newest file, the ~50 MB full copy, and deleted the call's four image originals the moment they were written: the full copy named four files that were gone.
++- **Fix:** `prune_outputs_dir(..., *, keep=())`: the files named in `keep` sort first, count toward the caps, and are never deleted. `shape_outputs` passes what it just wrote (the originals and the full copy), so older calls' files make room. A call's own copies over 50 MiB together now stay until a later call's prune.
++- **Found: V11's own case is over the budget here** (Measured before the trim, above). **Fix:** V11's fallback, the trim (design §6.8 Trim): one call cleans, redacts and keeps at most 8,000,000 raw chars of text, each long text's head (30%) and tail (70%) from windows that reach a margin past each cut, with `[… N chars cut …]` between. V11's bench on this machine, 50 MB stream with the `.env`: 2044/2140 → 261/284 ms p50/p95. a7's checks follow the trimmed copy: its head and tail are the raw stream's as printed but for the planted secrets, which are their markers wherever they are kept, and its marker's N is the rest.
++
++**a8: JupyterLab restarts mid-run** (`tests/integration/test_lab_restart.py`)
++- **Scenario:** its own JupyterLab, a project, the gateway, an observer. Message 1 adds a cell (ok) with the default soft timeout (100 s): its call also starts the kernel and connects nh. Message 2 adds a cell that prints every 0.1 s for a minute; with `soft_timeout_s = 5` (written to `harness.toml` before it) the call returns "still running". JupyterLab gets SIGTERM: it deletes its rooms and has its kernel shut down (the kernel is gone ~0.3 s later, its connection file ~0.5 s later), but with nh connected and a cell running it doesn't exit. `_stop(proc, runtime=…)` SIGKILLs its process group once no kernel connection file is left (it used to wait 15 s). jupyter_client starts kernels in a session of their own, outside that group. JupyterLab then starts again as the same server: root, runtime dir, port and token.
++- **Two variants** (`ystore` parameter):
++
++| Variant | Restart | What it catches |
++|---|---|---|
++| `same-ystore` | same directory: the rebuilt room loads the YStore, then the file where they differ ("out-of-sync … loaded from file") | the unsaved cells (below) |
++| `fresh-ystore` | `.jupyter_ystore.db*` deleted first, as when JupyterLab starts from another directory: the room loads the file alone | nh merging a stale copy of the notebook into the new room: with the same YStore the room already holds those items and the merge changes nothing (review's mutation: `same-ystore` passed, `fresh-ystore` found 11 ids, 9 unique) |
++
++  `test_backend_review.py` already covers a new token or port at the backend level with no running cell, and `test_kernel_exec.py` a kernel restart mid-run.
++- **Found:** in 4 of 7 runs, the restarted room held the title and message 3's cells only; the cells of messages 1 and 2, which nh had reported written, were gone. jupyter-collaboration 5.0.4:
++
++| Behaviour | Effect |
++|---|---|
++| Autosave: each change cancels the pending save and waits `document_save_delay` (1 s by default, 0.5 s in the tests) again | while a cell's outputs flow in (nh flushes every 200 ms, `flusher.PERIOD_S`), nothing is saved: not the outputs, and not the cells nh or anyone else added since the last quiet moment |
++| Shutdown stops the rooms and cancels the pending save | no last save |
++| A room rebuilt after a restart loads the YStore, then takes the file when the two differ | whatever was never saved is gone |
++
++  The lab log of a failing run shows no "Saving the content" between the room's start and the SIGTERM. The same holds for a user's own cell that prints for a long time; nh made it likely because nh's writes were followed at once by its own flushes.
++- **Fix: nh asks the room to save after its writes and after each run:**
++
++| Where | Change |
++|---|---|
++| `rtc.save_message(request_id)` | jupyter-collaboration's RAW save request: message type 2, the string "save", a request id; what JupyterLab sends for File → Save in a collaborative session. The server saves at once (`save_now`, no delay) and answers with a RAW JSON `{"type": "save", "responseTo", "status"}` |
++| `NhNbModelClient.request_save() -> bool` | sends it on the room's websocket, which `_on_message` keeps from the first message the room delivers; False before that. `_on_message` drops the RAW answers |
++| `RtcDocument.save()` | when synced: `settle()` (the write's update goes out first), then the request. A failure (the connection dropped) is logged at info, never raised: autosave still runs and the next write asks again |
++| `RtcBackend.insert_cells`, `update_cells`, `delete_cells`, `set_notebook_meta`, `_reset_stuck` | `await doc.save()` after the write, in place of `settle()` |
++| `RtcBackend._run_done(cell_id, doc)`, the run's `on_done` | also schedules `doc.save()` (kept in `_saves`), so a finished run's outputs, count and idle state are saved even when the next run starts printing within the save delay |
++
++- **Cost:** jupyter-collaboration answers a save inside its message handler, and tornado reads nh's next message only after it: nh's writes that follow a save reach the room once the file is written (tens of ms on the test notebooks). A peer that connects right after `update_cells` returns can see the source from before the update for that long, so `test_rtc_document.py`'s non-ASCII test now waits for the patch to arrive, then checks it as before.
++- **Not saved by nh:** `begin_run` (cleared outputs) and the flusher's periodic writes. After a restart mid-run the running cell is there with its source (saved at insert) but without the output it printed. nh's awareness sets no `autosave`, which the room reads as on, so the room already autosaved whenever nh was connected; an explicit save changes when, not whether.
++- **After the restart** (with the fix; both variants passed in each of 4 runs: three of the file alone at load 0.3-4.9, one in the full integration suite; `same-ystore` also in the glob proof below):
++
++| Step | Result |
++|---|---|
++| `nh_run(mode="wait")` on the running cell | status lost: "Waited for …; the kernel went away while it ran (<reason>)." and the lost next block ("The kernel restarted, died or disconnected while …"). The reason is what the runner saw first: "the connection to the kernel was lost", or "the kernel was restarted" when the server's shutdown sent the kernel's shutdown reply first |
++| Message 3's `nh_add_cell` | ran ok: the gateway kept its server (same URL and token) and made a new room and a new kernel session ("nh started a kernel for this notebook") |
++| Cell ids | 7, unique, in a new observer (a tab reloads the document after a server restart; the old observer's connection closed with the server) and in the saved `.ipynb`; the first 5 as before the restart; the lost cell idle |
++
++- The lost run's own notice ("[nh] … output after this point was not saved.") isn't in the notebook: the runner's one reconnect try (10 s) meets a server that is down. The tool result says the cell was lost.
++- `test_cells_nh_wrote_are_saved_while_another_cell_streams` checks the root cause on the session's JupyterLab, with no restart: while message 2's cell prints, the `.ipynb` holds both messages' cells. It failed before the fix.
++- **Message 1's soft timeout.** The review saw message 1 come back "queued" once in 21 runs (load ~2.4) under the old 5 s timeout. Its lab log shows the attach probe's kernel client connect, its close when the run started (`retire("probe")`), and the exec client's connect; the third connect of a passing run is the after-probe's, which comes only after the run ends. So the kernel clients connected; the kernel, started 0.5 s before, sent nothing nh read as "busy" for 5 s. Why is not established. Message 1 now has the default 100 s.
++
++**drift.yml `file-issue` job**
++
++| Key | Value |
++|---|---|
++| `needs` | `[upstream-latest, claude-code-latest]` |
++| `if` | `failure()`: true when a needed job (any leg of the matrix) failed, false when they passed or were cancelled |
++| `permissions` | `issues: write` (the job's only permission; the workflow keeps `contents: read`) |
++| `concurrency` | `group: drift-file-issue`, `cancel-in-progress: false`: one filer at a time, so two failed runs close together (a `workflow_dispatch` and the night's) can't both open an issue. GitHub keeps one pending job per group: of three queued filers the middle one is cancelled |
++| `env` | `GH_TOKEN: github.token`, `GH_REPO` (no checkout), the run URL, `github.event_name`, and each needed job's `needs.<job>.result` |
++
++- The step (POSIX sh, `gh`): lists the failed jobs; finds the label `drift` in whatever case the repo spells it, or creates it (`--force`, so a label made meanwhile is no error); lists the open issues with that label through REST (`gh api repos/$GH_REPO/issues?labels=…&state=open`: newest first, pull requests left out; `gh issue list --label` is a search, which can lag a new issue); comments on the newest, or opens "Nightly drift check failed" with the label. The body: the event, the run URL, the failed jobs, and both jobs' results. The nightly cron stays.
++- Checked with actionlint 1.7.12 (shellcheck on): 0 errors in both workflows; the step's script also passes `shellcheck -s sh` and `-s bash`, and runs with a stand-in `gh` (with `jq` for `--jq`) under `dash -e` and `bash -e -o pipefail` through its paths: no label and no issue (label created, issue opened), label "Drift" with an open pull request #50 and issues #42 and #7 (comment on #42), label "Drift" and no issue (issue opened with "Drift"), `gh` failing (exit 1, nothing filed).
++
++**ci.yml artifact glob**
++- v0.1's `/tmp/pytest-of-*/**/jupyterlab.log` uploaded nothing: `start_lab`'s logs are `jupyterlab-<port>-<token prefix>.log`; the one kind named `jupyterlab.log` (labs `nhctl lab start` runs in `tests/nhctl/test_lab_real.py`) sits under the project's hidden `.nh/logs`, which upload-artifact skips by default; and on macOS pytest's base is under `$TMPDIR`, not `/tmp`.
++- The integration step passes `--basetemp "$RUNNER_TEMP/pytest-integration"` (`$RUNNER_TEMP` is `runner.temp` on both OSes).
++- Upload: `${{ runner.temp }}/pytest-integration/**/jupyterlab-*.log` and `…/**/.nh/logs/*.log` (nhctl's labs, and gateway logs), minus `…/*current/**` (pytest's `<name>current` symlinks would upload each log twice), with `include-hidden-files: true`.
++- `start_lab` appends to its log, so a restart of the same lab (same port and token, so the same file name) keeps the first server's output; it also takes extra `args`.
++- Proof, locally: the step's command with `RUNNER_TEMP` set, on one session-lab test, a8's `same-ystore` case and `test_lab_real.py::test_token_never_reaches_the_log`; then the path input through `@actions/glob` 0.5.1 with upload-artifact v6's options (`followSymbolicLinks`, `implicitDescendants`, `omitBrokenSymbolicLinks`, `excludeHiddenFiles: !include-hidden-files`): the 4 logs (`jupyterlab0/jupyterlab-<port>-<tok>.log`, `test_a_jupyterlab_restart_mid_0/lab/jupyterlab-<port>-<tok>.log` with both servers' output, that test's `.nh/logs/gateway.log`, `test_token_never_reaches_the_l0/work/sales_study/.nh/logs/jupyterlab.log`). Without `include-hidden-files`: 2; without the exclude: 8.
++
++**Tests:**
++- `tests/integration/test_large_outputs.py` (a7) and `tests/integration/test_lab_restart.py` (a8 in two variants, and the save check), marked `integration`.
++- `tests/integration/conftest.py`: `start_lab(args=…)` and its appended log; `_stop(proc, runtime=None)` (above).
++- `tests/integration/test_rtc_document.py`: `test_source_patches_handle_non_ascii` waits until the observer sees the patched source, then asserts it equals the new source (see Cost above).
++- `tests/unit/test_rtc_save.py`: the save message as jupyter-collaboration's handler decodes it; the client sends nothing before the room answered, drops the RAW answer and numbers its requests; `RtcDocument.save()` asks only while synced and logs a failed send; each backend write is followed by a save; a finished run drops its record and schedules a save.
++- `tests/unit/test_kernel_utf8.py`: websocket-client's frame reader calls `kernel.validate_utf8` by the name nh replaces; valid text frames pass through it; invalid ones (overlong, surrogate, cut, stray continuation, past U+10FFFF) are refused by both and raise in the reader; bytearray, memoryview and `str` as websocket-client takes them.
++- `tests/unit/test_shaping.py`: `prune_outputs_dir` never deletes the files it is told to keep (under the file and byte caps); `shape_outputs` over a small byte cap keeps its full copy and every original it names, and prunes an older copy. The trim's tests are listed in design §6.8 (Tests).
++
++**Known gaps**
++- Before the trim a7's 50 MB stream case was over its 1.5 s budget on this machine, about 2.1-2.5 times slower than V11's, at any load (turn overhead 1.94-2.68 s per call; V11's own case 2.46 s p95 here). With the trim (V11's fallback) it is 0.47-0.60 s at load 1.2-2.3 and 0.79 s p95 at load ~5; the budget, its p95 method and V11 are unchanged. The trim's own gaps are in design §6.8.
++- The combined case is budgeted too and passed every run at load up to 4.4 (p95 1.09-1.27 s), but a first try at load 5.5-5.9 measured 1.92 s: it does both cases' work in one call (a trimmed stream, four image decodes and resizes, 15 MB of originals), so on a machine that loaded it is the first of a7's budgets to fail.
++- A save request sent while the room connection is still draining an earlier large message can overtake the write's own update; that save then misses the write, and the next save or autosave has it.
++- A running cell's output is lost when JupyterLab restarts mid-run (never saved while it prints); its cell and source stay.
++- A call's own copies (its full copy, now at most about 8,000,000 chars, and its image originals) over 50 MiB together stay on disk until a later call's prune.
+diff --git a/plugins/nh/server/src/nh_gateway/backend/kernel.py b/plugins/nh/server/src/nh_gateway/backend/kernel.py
+index cea0442..90df7b8 100644
+--- a/plugins/nh/server/src/nh_gateway/backend/kernel.py
++++ b/plugins/nh/server/src/nh_gateway/backend/kernel.py
+@@ -20,11 +20,33 @@ from collections.abc import Callable
+ from dataclasses import dataclass, field
+ from typing import Any, Literal
+ 
++import websocket._abnf
+ from jupyter_kernel_client import JupyterKernelClient
+ 
+ from ..policy.errors import NhError, scrub
+ from .base import ServerInfo
+ 
++
++def validate_utf8(data: bytes | bytearray | memoryview | str) -> bool:
++    """websocket-client's check of each text frame nh's kernel clients receive, by the C decoder.
++
++    Its own is a pure-Python loop over every byte unless ``wsaccel`` is installed: ~0.2 s per MB
++    on the gateway's receive thread, holding the GIL (a 50 MB stream took ~10 s more than the
++    kernel did; design §6.13). It refuses what websocket-client refused: overlong forms,
++    surrogates, and a sequence cut at the end (which its own check let through to the decode).
++    """
++    if isinstance(data, str):  # as websocket-client's own: lone surrogates fail
++        data = data.encode("utf-8", "surrogatepass")
++    try:
++        str(data, "utf-8")
++    except UnicodeDecodeError:
++        return False
++    return True
++
++
++# The name websocket-client's frame reader calls (continuous_frame.extract, ABNF.validate).
++websocket._abnf.validate_utf8 = validate_utf8  # type: ignore[attr-defined]
++
+ PumpState = Literal["idle", "timeout", "abort", "lost"]
+ UUID_NAME = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+ RESTART_STATES = {"restarting", "dead"}
+diff --git a/plugins/nh/server/src/nh_gateway/backend/rtc.py b/plugins/nh/server/src/nh_gateway/backend/rtc.py
+index d9ccba1..9527cf3 100644
+--- a/plugins/nh/server/src/nh_gateway/backend/rtc.py
++++ b/plugins/nh/server/src/nh_gateway/backend/rtc.py
+@@ -23,7 +23,7 @@ from typing import Any, Literal, cast
+ 
+ import nbformat
+ from jupyter_nbmodel_client import NbModelClient
+-from pycrdt import Array, Awareness, Map, Text, YMessageType
++from pycrdt import Array, Awareness, Encoder, Map, Text, YMessageType
+ from pycrdt import read_message as _read_message
+ 
+ from ..exec.docsafe import output_summary, safe_text, sanitize_for_doc
+@@ -51,16 +51,43 @@ PRESENCE = {
+     "color": "#6d28d9",
+ }
+ WriteState = Literal["ok", "unsynced", "missing"]
++RAW_MESSAGE = 2  # jupyter-collaboration's message type for requests such as "save"
++
++
++def save_message(request_id: int) -> bytes:
++    """The room message that saves the notebook now: what JupyterLab sends for File → Save in a
++    collaborative session. jupyter-collaboration handles it at once, with no save delay."""
++    encoder = Encoder()
++    encoder.write_var_uint(RAW_MESSAGE)
++    encoder.write_var_string("save")
++    encoder.write_var_uint(request_id)
++    return encoder.to_bytes()
+ 
+ 
+ class NhNbModelClient(NbModelClient):
+-    """``NbModelClient`` that also applies peers' awareness, so presence works both ways.
++    """``NbModelClient`` that also applies peers' awareness, so presence works both ways, and can
++    ask the room to save.
+ 
+     The room server only relays awareness, and clients renew theirs every 15 s; nh re-announces
+     itself when a new peer appears, so a tab opened after nh connected shows nh right away.
+     """
+ 
++    _websocket: Any = None  # the room connection, known from the first message it delivers
++    _save_requests = 0
++
++    async def request_save(self) -> bool:
++        """Send the room a save request (:func:`save_message`); False before the room answered."""
++        websocket = self._websocket
++        if websocket is None:
++            return False
++        self._save_requests += 1
++        await websocket.send(save_message(self._save_requests))
++        return True
++
+     async def _on_message(self, websocket: Any, message: bytes) -> None:
++        self._websocket = websocket
++        if message and message[0] == RAW_MESSAGE:
++            return  # the room's answer to a save request: nothing to do
+         if message and message[0] == YMessageType.AWARENESS:
+             awareness = cast(Awareness, self._doc.awareness)
+             try:
+@@ -364,6 +391,24 @@ class RtcDocument:
+         await asyncio.sleep(0)
+         await asyncio.sleep(0)
+ 
++    async def save(self) -> None:
++        """Ask the room to write the notebook to disk now, after one of nh's writes (design §6.13).
++
++        jupyter-collaboration saves only after ``document_save_delay`` with no change, so while a
++        cell prints (nh flushes its outputs every 200 ms) nothing reaches the file, and it doesn't
++        save on shutdown; a room rebuilt after a JupyterLab restart then takes the file over its
++        YStore, and whatever was never saved is gone. A failed request is only logged: autosave
++        still runs, and the next write asks again.
++        """
++        nb = self.nb
++        if not self.synced or nb is None:
++            return
++        await self.settle()  # the write's update goes out before the request
++        try:
++            await nb.request_save()
++        except Exception as exc:  # the connection dropped; the next write reconnects
++            log.info("save request for %s not sent: %s", self.api_path, scrub(str(exc)))
++
+     def _client(self) -> NhNbModelClient:
+         if not self.synced or self.nb is None:
+             raise NhError("E135", detail="(the room disconnected; retry)")
+diff --git a/plugins/nh/server/src/nh_gateway/backend/rtc_backend.py b/plugins/nh/server/src/nh_gateway/backend/rtc_backend.py
+index c041a00..ef7a40d 100644
+--- a/plugins/nh/server/src/nh_gateway/backend/rtc_backend.py
++++ b/plugins/nh/server/src/nh_gateway/backend/rtc_backend.py
+@@ -115,6 +115,7 @@ class RtcBackend:
+         self._notices: dict[str, list[str]] = {}
+         self._disk = DiskReadBackend(layout.project, cfg_cache)
+         self._janitor: asyncio.Task[None] | None = None
++        self._saves: set[asyncio.Future[None]] = set()  # save requests after runs, kept alive
+ 
+     async def _retry(self, op: Callable[[], Awaitable[T]]) -> T:
+         """Run ``op``; when the server went away or changed its token, rediscover it and run it once more.
+@@ -295,7 +296,7 @@ class RtcBackend:
+             with contextlib.suppress(OSError):
+                 self._running_file(cell_id).unlink()
+         if stuck:
+-            await doc.settle()
++            await doc.save()
+             self._note(
+                 ref,
+                 f"{len(stuck)} nh cell(s) were still marked running from an earlier nh session; "
+@@ -378,25 +379,25 @@ class RtcBackend:
+         doc = await self._retry(lambda: self._doc(ref))
+         doc.set_meta(key, value)
+         self._after_write(ref, doc)
+-        await doc.settle()
++        await doc.save()
+ 
+     async def insert_cells(self, ref: NotebookRef, index: int, cells: list[NewCell]) -> None:
+         doc = await self._retry(lambda: self._doc(ref))
+         doc.insert(index, cells)
+         self._after_write(ref, doc)
+-        await doc.settle()
++        await doc.save()
+ 
+     async def update_cells(self, ref: NotebookRef, patches: list[CellPatch]) -> None:
+         doc = await self._retry(lambda: self._doc(ref))
+         doc.update(patches)
+         self._after_write(ref, doc)
+-        await doc.settle()
++        await doc.save()
+ 
+     async def delete_cells(self, ref: NotebookRef, ids: list[str]) -> list[CellView]:
+         doc = await self._retry(lambda: self._doc(ref))
+         deleted = doc.delete(ids)
+         self._after_write(ref, doc)
+-        await doc.settle()
++        await doc.save()
+         return deleted
+ 
+     # ------------------------------------------------------------------ kernel
+@@ -561,9 +562,13 @@ class RtcBackend:
+     def _running_file(self, cell_id: str) -> Path:
+         return self.layout.running / f"{safe_name(cell_id)}.json"
+ 
+-    def _run_done(self, cell_id: str) -> None:
++    def _run_done(self, cell_id: str, doc: RtcDocument) -> None:
++        """A run ended: drop its record and have the room save its outputs (design §6.13)."""
+         with contextlib.suppress(OSError):
+             self._running_file(cell_id).unlink()
++        task = asyncio.ensure_future(doc.save())
++        self._saves.add(task)
++        task.add_done_callback(self._saves.discard)
+ 
+     def _marked_running(self, ref: NotebookRef) -> set[str] | None:
+         """Ids of the cells the notebook marks running; None when nh has no synced copy of it."""
+@@ -651,7 +656,7 @@ class RtcBackend:
+             api=doc.api,
+             kernel_id=handle.kernel_id,
+             hard_timeout=hard_timeout,
+-            on_done=lambda _result: self._run_done(resolved),
++            on_done=lambda _result: self._run_done(resolved, doc),
+             on_lost=lambda: handle.retire("exec"),
+         )
+         execution = runner.start()
+diff --git a/plugins/nh/server/src/nh_gateway/exec/shaping.py b/plugins/nh/server/src/nh_gateway/exec/shaping.py
+index faf4cc2..9a9eeb2 100644
+--- a/plugins/nh/server/src/nh_gateway/exec/shaping.py
++++ b/plugins/nh/server/src/nh_gateway/exec/shaping.py
+@@ -1,7 +1,8 @@
+ """Turn a cell's nbformat outputs into what the agent reads: a text budget, a few images, the error.
+ 
+ Nothing here talks to the kernel or the notebook. When the text had to be cut or an image was
+-downsampled, the untruncated text and the original images go to ``.nh/outputs/`` so nothing is lost.
++downsampled, the text and the original images go to ``.nh/outputs/``. Past ``TRIM_CHARS`` of text
++in one call, only each long text's head and tail are cleaned, redacted and kept (design §6.8).
+ """
+ 
+ from __future__ import annotations
+@@ -14,10 +15,10 @@ import json
+ import os
+ import re
+ import tempfile
+-from collections.abc import Iterable
+-from dataclasses import dataclass
++from collections.abc import Collection, Iterable, Sequence
++from dataclasses import dataclass, field
+ from html.parser import HTMLParser
+-from pathlib import Path
++from pathlib import Path, PurePath
+ from typing import Any
+ 
+ from PIL import Image
+@@ -33,9 +34,13 @@ HEAD_SHARE = 0.3  # head+tail cuts keep 30% head, 70% tail
+ PNG_LIMIT = 150 * 1024  # larger PNGs are re-encoded as JPEG q80
+ MAX_DECODE_PIXELS = 40_000_000
+ MAX_HTML_CHARS = 1_000_000
++TRIM_CHARS = 8_000_000  # the most raw output text one call cleans, redacts and keeps (§6.8, Trim)
++TRIM_MIN_SHARE = 256 * 1024  # what each text gets before texts from the middle are left out
++MARKER_REACH = 512  # how far back a trim's cut looks for a marker it would split
+ 
+ # A bare object repr: "<Figure size 640x480 with 1 Axes>", "<IPython.core.display.HTML object>".
+ _OBJECT_REPR = re.compile(r"^<[^\n<>]*>$")
++_SPACE = re.compile(r"\s*")  # what str.strip() strips, found without copying a long text
+ _CHAIN = re.compile(
+     r"\n(?:The above exception was the direct cause of the following exception:"
+     r"|During handling of the above exception, another exception occurred:)\n"
+@@ -102,10 +107,13 @@ class _Image:
+ 
+ @dataclass
+ class _Section:
+-    label: str | None  # rendered as "[label] "; None for image lines
++    label: str | None  # rendered as "[label] "; None for image lines and left-out runs
+     body: str = ""
+     is_error: bool = False
+     image: _Image | None = None
++    trims: list[tuple[str, int]] = field(default_factory=list)  # (a trim's marker, chars it cut)
++    left_out: int | None = None  # raw chars of a text the trim left out whole
++    count: int = 1  # outputs it stands for (a run of left-out texts is one line)
+ 
+     @property
+     def overhead(self) -> int:
+@@ -118,6 +126,17 @@ class _Section:
+         return f"[{self.label}]{sep}{body}"
+ 
+ 
++@dataclass
++class _Text:
++    """One output's raw text, cleaned once the whole call's texts are planned (§6.8, Trim)."""
++
++    section: _Section
++    kind: str  # "text", "html" or "error" (``raw`` is then the output)
++    raw: Any
++    size: int  # what the plan counts: its length (HTML: at most MAX_HTML_CHARS)
++    chars: int  # its whole raw length
++
++
+ def redact(text: str) -> str:
+     """FR-14 (design §6.8): the installed redactor's ``redact``. Every text Claude reads from
+     an output passes here once, before any cut; image base64 and bytes never do."""
+@@ -134,25 +153,34 @@ def shape_outputs(
+ ) -> Shaped:
+     max_images, image_max_px = max(0, max_images), max(16, image_max_px)
+     sections: list[_Section] = []
++    texts: list[_Text] = []
+     images: list[_Image] = []
+-    error: ErrorInfo | None = None
++
++    def add_text(section: _Section, kind: str, raw: Any, size: int, chars: int) -> None:
++        sections.append(section)
++        texts.append(_Text(section, kind, raw, size, chars))
+ 
+     for out in _coalesce_streams(outputs):
+         otype = out.get("output_type")
+         if otype == "stream":
+-            sections.append(
+-                _Section(str(out.get("name") or "stdout"), _clean(_text(out.get("text"))))
+-            )
++            raw = _text(out.get("text"))
++            add_text(_Section(str(out.get("name") or "stdout")), "text", raw, len(raw), len(raw))
+         elif otype == "error":
+-            info = _error_info(out)
+-            error = error or info
+-            sections.append(_Section("error", _traceback_body(info), is_error=True))
++            size = _error_size(out)
++            add_text(_Section("error", is_error=True), "error", out, size, size)
+         elif otype in _BUNDLE_TYPES:
+             data = _bundle(out)
+             mime = next((m for m in _IMAGE_MIMES if data.get(m)), None)
+-            text = _bundle_text(data, has_image=mime is not None)
+-            if text is not None:
+-                sections.append(_Section("out" if otype == "execute_result" else "display", text))
++            found = _bundle_text(data, has_image=mime is not None)
++            if found is not None:
++                kind, raw = found
++                section = _Section("out" if otype == "execute_result" else "display")
++                if kind == "fixed":
++                    section.body = raw
++                    sections.append(section)
++                else:
++                    size = min(len(raw), MAX_HTML_CHARS) if kind == "html" else len(raw)
++                    add_text(section, kind, raw, size, len(raw))
+             if mime is not None:
+                 send = sum(1 for i in images if i.sent) < max_images
+                 image = _take_image(
+@@ -163,6 +191,9 @@ def shape_outputs(
+         else:
+             sections.append(_Section(None, f"[{otype or 'unknown'} output]"))
+ 
++    error = _clean_texts(texts)
++    sections = _join_left_out(sections)
++    trimmed = any(section.trims for section in sections)
+     saved_images = _save_originals(images, save_dir)
+     for section in sections:
+         if section.image is not None:
+@@ -170,11 +201,16 @@ def shape_outputs(
+     plain = "\n".join(s.render(s.body) for s in sections)
+ 
+     full_path = None
+-    if save_dir is not None and (len(plain) > max_chars or saved_images):
+-        full = "\n".join(s.render(s.image.line(full=True) if s.image else s.body) for s in sections)
++    if save_dir is not None and (len(plain) > max_chars or saved_images or trimmed):
++        full = plain  # the same text unless an image line names its original
++        if saved_images:
++            full = "\n".join(
++                s.render(s.image.line(full=True) if s.image else s.body) for s in sections
++            )
+         data = full.encode("utf-8", "replace")
+         full_path = _write_once(save_dir, _sha_name(data, "txt"), data)
+-        prune_outputs_dir(save_dir)
++        written = [i.saved_as for i in images if i.saved_as] + ([full_path] if full_path else [])
++        prune_outputs_dir(save_dir, keep={PurePath(path).name for path in written})
+ 
+     footer = f"[full output: {full_path}]" if full_path else ""
+     budget = max_chars - (len(footer) + 1 if footer else 0)
+@@ -190,7 +226,7 @@ def shape_outputs(
+         text=text,
+         images=sent,
+         dropped_images=len(images) - len(sent),
+-        truncated=truncated,
++        truncated=truncated or trimmed,
+         full_path=full_path,
+         error=error,
+         summary=summarize_outputs(outputs),
+@@ -212,44 +248,55 @@ def summarize_outputs(outputs: list[dict]) -> OutputSummary:
+             kind = "error"
+             if summary.error is None:
+                 ename = _clean(str(out.get("ename") or "Error"))
+-                summary.error = error_summary(ename, _clean(str(out.get("evalue") or "")))
++                evalue = _clean_within(str(out.get("evalue") or ""), TRIM_MIN_SHARE)
++                summary.error = error_summary(ename, evalue)
+         elif otype in _BUNDLE_TYPES:
+             data = _bundle(out)
+             kind = _primary_mime(data)
+             if any(data.get(m) for m in _IMAGE_MIMES):
+                 summary.images += 1
+             plain = _text(data.get("text/plain"))
+-            text = "" if _OBJECT_REPR.match(plain.strip()) else plain
++            text = "" if _object_repr(plain) else plain
+         else:
+             kind = str(otype or "unknown")
+         if kind not in summary.types:
+             summary.types.append(kind)
+-        if not summary.text_head and text.strip():
++        if not summary.text_head and text and not text.isspace():
+             summary.text_head = _first_line(text, 80)
+     return summary
+ 
+ 
+-def prune_outputs_dir(save_dir: Path, max_files: int = 200, max_bytes: int = 50 * 2**20) -> None:
+-    """Delete the least recently written files beyond ``max_files`` or ``max_bytes``."""
++def prune_outputs_dir(
++    save_dir: Path,
++    max_files: int = 200,
++    max_bytes: int = 50 * 2**20,
++    *,
++    keep: Collection[str] = (),
++) -> None:
++    """Delete the least recently written files beyond ``max_files`` or ``max_bytes``.
++
++    The files named in ``keep``, what the current call just wrote and its result names, count
++    first and are never deleted: a call's own copies outlive at least that call (design §6.13).
++    """
+     try:
+         entries = list(os.scandir(save_dir))
+     except OSError:
+         return
+-    files: list[tuple[float, int, str]] = []
++    files: list[tuple[bool, float, int, str]] = []
+     for entry in entries:
+         if entry.name.startswith("."):  # in-flight temp files
+             continue
+         try:
+             if entry.is_file(follow_symlinks=False):
+                 stat = entry.stat(follow_symlinks=False)
+-                files.append((stat.st_mtime, stat.st_size, entry.path))
++                files.append((entry.name in keep, stat.st_mtime, stat.st_size, entry.path))
+         except OSError:
+             continue
+-    files.sort(reverse=True)
++    files.sort(reverse=True)  # kept first, then newest first
+     total = 0
+-    for index, (_mtime, size, path) in enumerate(files):
++    for index, (kept, _mtime, size, path) in enumerate(files):
+         total += size
+-        if index >= max_files or total > max_bytes:
++        if not kept and (index >= max_files or total > max_bytes):
+             with contextlib.suppress(OSError):
+                 os.unlink(path)
+ 
+@@ -273,6 +320,153 @@ def _clean(text: str) -> str:
+     return redact(terminal_text(text).rstrip("\n"))
+ 
+ 
++# --- trim (design §6.8) ---------------------------------------------------------------------
++
++
++def _trim_margin() -> int:
++    """How far a trim's windows reach past its cuts: the redactor's margin (past the longest
++    value), and at least a private key's reach (its END line is looked for within
++    PEM_MAX_CHARS of its BEGIN line)."""
++    return max(secrets.current().margin, secrets.PEM_MAX_CHARS + secrets.MIN_MARGIN)
++
++
++def _trim_plan(sizes: list[int], keep: Collection[int]) -> list[int | None]:
++    """Each text's share of TRIM_CHARS, planned before any text is cleaned; None: left out.
++
++    All whole when they fit. Else short texts stay whole and long ones split the rest
++    (``_water_fill``); if even TRIM_MIN_SHARE each is too much, texts from the middle are left
++    out: the first and last ones stay, and those in ``keep`` (the error).
++    """
++    if sum(sizes) <= TRIM_CHARS:
++        return list(sizes)
++    need = [min(size, TRIM_MIN_SHARE, TRIM_CHARS) for size in sizes]
++    kept = list(range(len(sizes)))
++    if sum(need) > TRIM_CHARS:
++        chosen, spent = set(keep), sum(need[i] for i in keep)
++        for i in _front_back([i for i in kept if i not in chosen]):
++            if spent + need[i] > TRIM_CHARS:
++                break
++            chosen.add(i)
++            spent += need[i]
++        kept = sorted(chosen)
++    plan: list[int | None] = [None] * len(sizes)
++    shares = _water_fill([sizes[i] for i in kept], TRIM_CHARS)
++    for i, share in zip(kept, shares, strict=True):
++        plan[i] = share
++    return plan
++
++
++def _clean_texts(texts: list[_Text]) -> ErrorInfo | None:
++    """Clean every text within its planned share (bodies and trims go on the sections); the
++    first error's info."""
++    plan = _trim_plan(
++        [t.size for t in texts], [i for i, t in enumerate(texts) if t.kind == "error"]
++    )
++    margin = 0
++    if any(share is not None and share < t.size for t, share in zip(texts, plan, strict=True)):
++        margin = _trim_margin()
++    error: ErrorInfo | None = None
++    for text, share in zip(texts, plan, strict=True):
++        section = text.section
++        if share is None:
++            section.left_out = text.chars
++        elif text.kind == "error":
++            info, section.trims = _error_info(text.raw, share, margin)
++            error = error or info
++            section.body = _traceback_body(info)
++        elif text.kind == "html":
++            section.body = _clean(_html_to_text(text.raw, min(share, MAX_HTML_CHARS)))
++        else:
++            section.body, trim = _clean_share(text.raw, share, margin)
++            section.trims = [trim] if trim else []
++    return error
++
++
++def _clean_share(raw: str, share: int, margin: int) -> tuple[str, tuple[str, int] | None]:
++    """``raw`` as ``_clean`` makes it when it fits ``share``. Else only a head window and a
++    tail window are cleaned, ``share`` raw chars in all: the head keeps 30% and the tail 70% of
++    ``share - 2 * margin``, with nh's cut marker between (and returned, with the chars it cut).
++
++    Each window reaches ``margin`` past its cut, and the cut is made in its cleaned form at least
++    ``margin`` chars inside the window's raw edge, as in ``redact_head``: a secret the cut
++    crosses is whole in its window, so one marker, and a secret the raw edge cuts leaves at most
++    a piece shorter than the margin, which is dropped. The cut moves to a line break in its last
++    40% when there is one, and never splits a marker. The count is the raw length minus the
++    chars kept.
++    """
++    if len(raw) <= share:
++        return _clean(raw), None
++    keep = max(0, share - 2 * margin)
++    head_len = int(keep * HEAD_SHARE)
++    tail_len = keep - head_len
++    head = tail = ""
++    ending = 0  # the trailing newlines ``_clean`` drops, which no count includes
++    if head_len:
++        window = redact(terminal_text(raw[: head_len + margin]))
++        head = window[: _head_end(window, min(head_len, len(window) - margin))]
++    if tail_len:
++        shown = terminal_text(raw[len(raw) - tail_len - margin :])
++        window = shown.rstrip("\n")
++        ending = len(shown) - len(window)
++        window = redact(window)
++        tail = window[_tail_start(window, max(margin, len(window) - tail_len)) :]
++    cut = len(raw) - ending - len(head) - len(tail)
++    marker = _cut_marker(cut)
++    return head + marker + tail, (marker, cut)
++
++
++def _clean_within(text: str, share: int) -> str:
++    return _clean(text) if len(text) <= share else _clean_share(text, share, _trim_margin())[0]
++
++
++def _head_end(text: str, stop: int) -> int:
++    """Where a head cut at ``stop`` ends: a line break in its last 40%, else not in a marker."""
++    if stop <= 0:
++        return 0
++    newline = text.rfind("\n", int(stop * 0.6), stop)
++    if newline != -1:
++        return newline
++    opened = _marker_before(text, stop)
++    return opened if opened != -1 and text.find("]", opened, stop) == -1 else stop
++
++
++def _tail_start(text: str, start: int) -> int:
++    """Where a tail cut at ``start`` begins: after a line break in its first 40%, else after
++    the marker it would split."""
++    if start >= len(text):
++        return len(text)
++    newline = text.find("\n", start, start + int((len(text) - start) * 0.4) + 1)
++    if newline != -1:
++        return newline + 1
++    opened = _marker_before(text, start)
++    closed = text.find("]", opened) if opened != -1 else -1
++    return closed + 1 if closed >= start else start
++
++
++def _marker_before(text: str, at: int) -> int:
++    """Where the last ``[redacted:`` that starts before ``at`` starts (-1: none near)."""
++    return text.rfind(secrets.MARKER, max(0, at - MARKER_REACH), at + len(secrets.MARKER) - 1)
++
++
++def _join_left_out(sections: list[_Section]) -> list[_Section]:
++    """Each run of texts the trim left out becomes one line: ``[… N chars cut …]``."""
++    joined: list[_Section] = []
++    for section in sections:
++        last = joined[-1] if joined else None
++        if section.left_out is None:
++            joined.append(section)
++        elif last is not None and last.label is None and last.left_out is not None:
++            last.left_out += section.left_out
++            last.count += 1
++        else:
++            joined.append(_Section(None, left_out=section.left_out))
++    for section in joined:
++        if section.label is None and section.left_out is not None:
++            section.body = _cut_marker(section.left_out).strip("\n")
++            section.trims = [(section.body, section.left_out)]
++    return joined
++
++
+ FIRST_LINE_WINDOW = 4000  # the first window _first_line cleans, past its margin
+ FIRST_LINE_MAX = 1 << 20  # and the most it grows to
+ 
+@@ -282,7 +476,7 @@ def _first_line(text: str, limit: int) -> str:
+     cleaned: it starts at the first non-blank character and grows until that line ends (or is
+     longer than ``limit``) in its safe part, the part more than the redactor's margin before its
+     raw edge, where a secret the edge cuts can't reach (review of C3)."""
+-    start = len(text) - len(text.lstrip())
++    start = _leading_space(text)
+     margin = secrets.current().margin
+     size = FIRST_LINE_WINDOW + margin
+     while True:
+@@ -304,6 +498,17 @@ def _first_line(text: str, limit: int) -> str:
+         size *= 2
+ 
+ 
++def _leading_space(text: str) -> int:
++    """How much whitespace ``text`` starts with (``len(text) - len(text.lstrip())``)."""
++    match = _SPACE.match(text)
++    return match.end() if match else 0
++
++
++def _object_repr(text: str) -> bool:
++    """``_OBJECT_REPR`` on ``text.strip()``, which is copied only when it starts with "<"."""
++    return text.startswith("<", _leading_space(text)) and bool(_OBJECT_REPR.match(text.strip()))
++
++
+ def _coalesce_streams(outputs: Iterable[Any]) -> list[dict]:
+     merged: list[dict] = []
+     for out in outputs:
+@@ -327,7 +532,7 @@ def _primary_mime(data: dict) -> str:
+         if data.get(mime):
+             return mime
+     plain = _text(data.get("text/plain"))
+-    if plain and not _OBJECT_REPR.match(plain.strip()):
++    if plain and not _object_repr(plain):
+         return "text/plain"
+     for mime in ("text/markdown", "text/latex", "text/html", "application/json", "image/svg+xml"):
+         if mime in data:
+@@ -335,37 +540,38 @@ def _primary_mime(data: dict) -> str:
+     return "text/plain" if plain else next(iter(data), "empty")
+ 
+ 
+-def _bundle_text(data: dict, *, has_image: bool) -> str | None:
+-    """The text shown for one mime bundle; None when its image says it all."""
++def _bundle_text(data: dict, *, has_image: bool) -> tuple[str, str] | None:
++    """The text shown for one mime bundle, raw, and how it is cleaned: "text", "html", or
++    "fixed" (nh's own placeholder, not cleaned). None when its image says it all."""
+     if data.get(_PLOTLY) is not None:
+         figure = data[_PLOTLY]
+         traces = figure.get("data") if isinstance(figure, dict) else None
+         count = len(traces) if isinstance(traces, list) else 0
+-        return f"[plotly figure: {count} trace{'' if count == 1 else 's'}]"
++        return "fixed", f"[plotly figure: {count} trace{'' if count == 1 else 's'}]"
+     if data.get(_WIDGET) is not None:
+-        return "[widget]"
++        return "fixed", "[widget]"
+     # A bare object repr says less than the richer mime types below it.
+     plain = _text(data.get("text/plain"))
+-    if plain and not _OBJECT_REPR.match(plain.strip()):
+-        return _clean(plain)
++    if plain and not _object_repr(plain):
++        return "text", plain
+     for mime in ("text/markdown", "text/latex"):
+         if data.get(mime):
+-            return _clean(_text(data[mime]))
++            return "text", _text(data[mime])
+     if has_image:
+         return None
+     if data.get("text/html"):
+-        return _clean(_html_to_text(_text(data["text/html"])))
++        return "html", _text(data["text/html"])
+     if "application/json" in data:
+         value = data["application/json"]
+         if not isinstance(value, str):
+             value = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+-        return _clean(value)
++        return "text", value
+     if data.get("image/svg+xml"):
+-        return "[SVG figure omitted]"
++        return "fixed", "[SVG figure omitted]"
+     if plain:
+-        return _clean(plain)
++        return "text", plain
+     mime = next(iter(data), None)
+-    return f"[{mime} output omitted]" if mime else None
++    return ("fixed", f"[{mime} output omitted]") if mime else None
+ 
+ 
+ class _HtmlText(HTMLParser):
+@@ -442,30 +648,56 @@ class _HtmlText(HTMLParser):
+         return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip("\n")
+ 
+ 
+-def _html_to_text(markup: str) -> str:
++def _html_to_text(markup: str, limit: int = MAX_HTML_CHARS) -> str:
++    """HTML as text, from at most ``limit`` chars of markup (the trim's share, or 1 MB)."""
+     parser = _HtmlText()
+-    if len(markup) > MAX_HTML_CHARS:  # redact before the cut, so no secret is cut in half
+-        markup_head = secrets.current().redact_head(markup, MAX_HTML_CHARS)[:MAX_HTML_CHARS]
++    if len(markup) > limit:  # redact before the cut, so no secret is cut in half
++        markup_head = secrets.current().redact_head(markup, limit)[:limit]
+     else:
+         markup_head = markup
+     parser.feed(markup_head)
+     parser.close()
+     text = parser.text()
+-    return text + "\n[… HTML cut …]" if len(markup) > MAX_HTML_CHARS else text
++    return text + "\n[… HTML cut …]" if len(markup) > limit else text
+ 
+ 
+ # --- errors ---------------------------------------------------------------------------------
+ 
+ 
+-def _error_info(out: dict) -> ErrorInfo:
+-    ename = _clean(str(out.get("ename") or "Error"))
+-    evalue = _clean(str(out.get("evalue") or ""))
++def _error_parts(out: dict) -> tuple[str, str, list[str]]:
+     frames = out.get("traceback")
+     frames = [frames] if isinstance(frames, str) else frames if isinstance(frames, list) else []
+-    traceback = "\n".join(_clean(str(frame)) for frame in frames)
+-    return ErrorInfo(
++    return str(out.get("ename") or "Error"), str(out.get("evalue") or ""), [str(f) for f in frames]
++
++
++def _error_size(out: dict) -> int:
++    ename, evalue, frames = _error_parts(out)
++    return len(ename) + len(evalue) + sum(len(frame) + 1 for frame in frames)
++
++
++def _error_info(
++    out: dict, share: int | None = None, margin: int = 0
++) -> tuple[ErrorInfo, list[tuple[str, int]]]:
++    """The error, cleaned; over the trim's ``share``, its name, value and joined frames split
++    the share (``_water_fill``) and each is trimmed alone (with the trims made)."""
++    ename, evalue, frames = _error_parts(out)
++    trims: list[tuple[str, int]] = []
++    if share is None or share >= _error_size(out):
++        ename, evalue = _clean(ename), _clean(evalue)
++        traceback = "\n".join(_clean(frame) for frame in frames)
++    else:
++        raw = (ename, evalue, "\n".join(frames))
++        shares = _water_fill([len(part) for part in raw], share)
++        cleaned = [
++            _clean_share(part, part_share, margin)
++            for part, part_share in zip(raw, shares, strict=True)
++        ]
++        (ename, _), (evalue, _), (traceback, _) = cleaned
++        trims = [trim for _, trim in cleaned if trim]
++    info = ErrorInfo(
+         ename=ename, evalue=evalue, traceback=traceback, line=_error_line(traceback, evalue)
+     )
++    return info, trims
+ 
+ 
+ def _error_line(traceback: str, evalue: str) -> int | None:
+@@ -515,13 +747,19 @@ def _cut_marker(count: int) -> str:
+     return f"\n[… {count:,} chars cut …]\n"
+ 
+ 
+-def _cut(text: str, limit: int) -> str:
+-    """Keep the head (30%) and tail (70%), snapped to line breaks where that costs little."""
++def _cut(text: str, limit: int, trims: Sequence[tuple[str, int]] = ()) -> str:
++    """Keep the head (30%) and tail (70%), snapped to line breaks where that costs little.
++
++    ``trims``: the trim markers in ``text`` (§6.8, Trim). Part of one is never shown, and one
++    the cut leaves out counts as the chars it stands for.
++    """
+     if len(text) <= limit:
+         return text
+-    room = limit - len(_cut_marker(len(text)))
++    spans = _trim_spans(text, trims)
++    total = len(text) + sum(count - (end - start) for start, end, count in spans)
++    room = limit - len(_cut_marker(total))
+     if room <= 0:
+-        return _cut_marker(len(text)).strip()[: max(0, limit)]
++        return _cut_marker(total).strip()[: max(0, limit)]
+     head_len = int(room * HEAD_SHARE)
+     head, tail = text[:head_len], text[len(text) - (room - head_len) :]
+     newline = head.rfind("\n")
+@@ -530,31 +768,76 @@ def _cut(text: str, limit: int) -> str:
+     newline = tail.find("\n")
+     if 0 <= newline <= len(tail) * 0.4:
+         tail = tail[newline + 1 :]
+-    return head + _cut_marker(len(text) - len(head) - len(tail)) + tail
++    if not spans:
++        return head + _cut_marker(len(text) - len(head) - len(tail)) + tail
++    pieces = [(0, len(head)), (len(text) - len(tail), len(text))]
++    [(_, head_end), (tail_start, _)], count = _shown(spans, pieces, len(text))
++    return text[:head_end] + _cut_marker(count) + text[tail_start:]
+ 
+ 
+-def _cut_traceback(text: str, limit: int) -> str:
++def _cut_traceback(text: str, limit: int, trims: Sequence[tuple[str, int]] = ()) -> str:
+     """Tracebacks keep the tail (the error) plus the frame in the user's cell when it fits."""
+     if len(text) <= limit:
+         return text
+-    room = limit - len(_cut_marker(len(text)))
++    spans = _trim_spans(text, trims)
++    total = len(text) + sum(count - (end - start) for start, end, count in spans)
++    room = limit - len(_cut_marker(total))
+     if room <= 0:
+-        return _cut(text, limit)
++        return _cut(text, limit, trims)
+     chained = list(_CHAIN.finditer(text))
+     last_exception = chained[-1].end() if chained else 0
+     frame = _USER_FRAME.search(text, last_exception) or _USER_FRAME.search(text)
+-    head, tail_start = "", len(text) - room
++    head, head_start, tail_start = "", 0, len(text) - room
+     if frame and frame.start() < tail_start:
+-        head = frame.group(0).rstrip("\n")[: int(limit * 0.45)]
++        head, head_start = frame.group(0).rstrip("\n")[: int(limit * 0.45)], frame.start()
+         tail_start = max(len(text) - (room - len(head)), frame.end())
+     tail = text[tail_start:]
+     newline = tail.find("\n")
+     if 0 <= newline <= len(tail) * 0.3:
+         tail = tail[newline + 1 :]
+-    marker = _cut_marker(len(text) - len(head) - len(tail))
++    count = len(text) - len(head) - len(tail)
++    if spans:
++        pieces = [(head_start, head_start + len(head)), (len(text) - len(tail), len(text))]
++        [(head_start, head_end), (tail_start, _)], count = _shown(spans, pieces, len(text))
++        head, tail = text[head_start:head_end], text[tail_start:]
++    marker = _cut_marker(count)
+     return head + marker + tail if head else marker.lstrip("\n") + tail
+ 
+ 
++def _trim_spans(text: str, trims: Sequence[tuple[str, int]]) -> list[tuple[int, int, int]]:
++    """Where each trim marker is in ``text`` (with its newlines), and the chars it stands for."""
++    spans = []
++    for marker, count in trims:
++        start = text.find(marker)
++        if start == -1:  # a traceback's blank lines were squeezed: the marker's own newlines too
++            marker = marker.strip("\n")
++            start = text.find(marker)
++        if start != -1:
++            spans.append((start, start + len(marker), count))
++    return spans
++
++
++def _shown(
++    spans: list[tuple[int, int, int]], pieces: list[tuple[int, int]], length: int
++) -> tuple[list[tuple[int, int]], int]:
++    """The kept ``pieces`` of a cut text, moved off any trim marker they would show in part, and
++    the chars the cut leaves out: a trim marker it leaves out counts as the chars it stands for."""
++    moved = []
++    for start, end in pieces:
++        for span_start, span_end, _ in spans:
++            if start < span_end and span_start < end and not start <= span_start < span_end <= end:
++                if span_start <= start:
++                    start = min(span_end, end)
++                else:
++                    end = span_start
++        moved.append((start, end))
++    count = length - sum(end - start for start, end in moved)
++    for span_start, span_end, chars in spans:
++        if not any(start <= span_start and span_end <= end for start, end in moved):
++            count += chars - (span_end - span_start)
++    return moved, count
++
++
+ def _water_fill(lengths: list[int], budget: int) -> list[int]:
+     """Max-min fair shares: short outputs stay whole, long ones split what is left."""
+     shares = [0] * len(lengths)
+@@ -578,7 +861,8 @@ def _fit(sections: list[_Section], budget: int) -> str:
+     error_len = sum(len(sections[i].body) for i in errors)
+     other_budget = avail - (min(error_len, int(avail * ERROR_SHARE)) if others else error_len)
+ 
+-    marker_cost = len(f"[… {len(others):,} more outputs not shown …]") + 1
++    outputs = sum(sections[i].count for i in others)
++    marker_cost = len(f"[… {outputs:,} more outputs not shown …]") + 1
+     need = {i: cost[i] + min(len(sections[i].body), MIN_SHARE) for i in others}
+     kept = others
+     if sum(need.values()) > other_budget:
+@@ -602,9 +886,10 @@ def _fit(sections: list[_Section], budget: int) -> str:
+     for index, section in enumerate(sections):
+         if index in shares:
+             cut = _cut_traceback if section.is_error else _cut
+-            parts.append(section.render(cut(section.body, shares[index])))
++            parts.append(section.render(cut(section.body, shares[index], section.trims)))
+         elif omitted and index == omitted[0]:
+-            parts.append(f"[… {len(omitted):,} more outputs not shown …]")
++            outputs = sum(sections[i].count for i in omitted)
++            parts.append(f"[… {outputs:,} more outputs not shown …]")
+     return "\n".join(parts)
+ 
+ 
+diff --git a/spikes/RESULTS.md b/spikes/RESULTS.md
+index e9a4e45..fac323a 100644
+--- a/spikes/RESULTS.md
++++ b/spikes/RESULTS.md
+@@ -137,6 +137,7 @@ Reusable tools, kept for the later v0.2 spikes (V13 E122, V14, V2 (c)), are in `
+ | V11 | D8 redactor prototype on a 5 MB stream, a 5 MB base64 PNG bundle and 2 KB outputs (20 runs, p50/p95): turn overhead p95 ≤ 1.5 s | PASS: 17/17 planted secrets removed in every mode, no hits in 5.2M chars of base64. 5 MB, 32 values: `str.replace` loop 30/32 ms vs one alternation 125/141 ms (100 values: 88/91 vs 735/804 ms). Literal-first per-pattern regexes: 145/149 ms planted, 51/60 ms secret-free. `shape_outputs` end to end, before → after: 5 MB planted stream 40/66 → 193/210 ms; 5 MB PNG bundle 79/116 → 80/90 ms (images skipped); 2 KB 0.16/0.26 → 0.16/0.23 ms. Worst redaction cost ~150 ms per call (~0.31 s per call with v0.1.1's `harness_ms` p95 of 97 ms); five such calls in one turn add ~0.75 s of redaction (~1.5 s if the p95s add up). 50 MB planted: 1.48/1.58 s (~30 ms/MB) | C3 proceeds: values by `str.replace` longest first (no big alternation); literal-first patterns with the word boundary checked in the callback, the token pattern on `text.lower()` for ASCII text; never redact image base64 or `_save_originals` bytes; no second pass in `_write_once`; a windowed `redact_head` for `docsafe.output_summary`; PEM also matches an unterminated key. Open for C3: non-secret `.env` values of 8+ chars (REGION=eu-west-1) get redacted; `_TOKEN` misses "Authorization: Bearer"; one output of 45 MB or more with every pattern present exceeds 1.5 s (50 MB planted p95 1.58 s, 5 runs); a7 uses a 50 MB stream, so C3 caps or chunks what reaches redact (plan fallback: cache or trim) |
+ | V11 (re-measure, C3) | `spikes/v0.2/v11_redaction.py`: the C3 redactor through `shape_outputs` end to end on Python 3.13.8, off vs patterns only vs a 30-value `.env`, on a 5 MB bundle (20 runs), a 50 MB stream and a 20 MB image bundle (10 runs each), and (after C3's review) 50 MB streams of one repeated line (5 runs each): benign token keys (token-kv), JSON records with a short `"token"` (json-records), NLP token dumps, e-mails and URLs, a real token on every line (token-dense, 1.35M secrets) and an `.env` value on every line (value-dense); secrets of every kind planted; `--redactor-only` on Python 3.9.6 and 3.13.8. Budget: turn overhead p95 ≤ 1.5 s | PASS except token-dense. p50/p95 ms, off → patterns only → `.env` (added at p95): 5 MB bundle 111.7/116.2 → 141.4/145.4 → 164.2/171.0 (+55); 50 MB stream 355.6/375.2 → 646.5/658.6 → 864.6/872.3 (+497); 20 MB image bundle 167.8/178.4 → 167.8/178.7 → 168.9/173.1 (+0, images are never scanned); token-kv 349.1/349.7 → 1172.4/1173.3 → 1387.6/1419.5 (+1070); json-records 350.0/351.7 → 746.0/757.1 → 949.6/974.3 (+623); nlp-tokens 356.7/358.5 → 772.7/775.6 → 963.1/979.3 (+621); emails+urls 359.4/364.2 → 671.1/702.4 → 891.1/897.6 (+533); value-dense 351.2/353.0 → 588.4/598.4 → 1193.7/1200.1 (+847); token-dense 358.7/362.6 → 2079.6/2108.6 → 2293.1/2325.7 (+1963, over). `Redactor.redact` alone with the `.env`, 3.9.6 and 3.13.8: 50 MB stream 560/580 and 505/515 ms; 5 MB bundle 56/57 and 51/52 ms; token-kv 1196/1198 and 1030/1034 ms; token-dense 2453/2467 and 1910/1918 ms. Every planted secret gone from the shaped text and the full copy. The review's first bench (skip rules in Python callbacks) had token-kv at +2.4 s and json-records at +1.8 s | No cache or trim: the whole stream still goes through the redactor. The skip rules live in the regexes, so benign hits never reach Python. token-dense (~1.3 µs per secret found) is a known gap in design §6.8. value-dense uses the longest `.env` value: with a shorter one the markers grow the 50 MB copy past `prune_outputs_dir`'s 50 MiB cap and it is pruned at once. The other open items are closed in C3: a `.env` value under a non-secret name needs 16+ chars (REGION=eu-west-1 is kept) and "Authorization: Bearer" has its own pattern |
+ | V11 (re-measure, C3 review fixes) | `spikes/v0.2/v11_redaction.py` as above, the C3 commit and the reviewed redactor run the same day on one machine (values matched in any case with their escaped, `repr` and HTML forms, the cut userinfo form, pieces of secret-named values, terminal text). Budget: turn overhead p95 ≤ 1.5 s | PASS except token-dense. Reviewed, p50/p95 ms, off → patterns only → `.env` (added at p95): 5 MB bundle 112.2/121.8 → 144.4/156.6 → 169.4/172.4 (+51); 50 MB stream 355.8/360.7 → 705.0/725.3 → 945.7/975.5 (+615); 20 MB image bundle 167.7/170.6 → 170.8/198.7 → 171.5/203.4 (+33); token-kv 353.9/386.7 → 1219.2/1238.1 → 1474.0/1486.5 (+1100); json-records 360.6/367.5 → 794.2/829.8 → 1040.5/1273.2 (+906); nlp-tokens 371.5/382.2 → 779.4/806.2 → 1012.2/1025.3 (+643); emails+urls 355.9/362.0 → 703.0/718.3 → 969.1/1053.5 (+692); value-dense 353.3/365.9 → 642.8/658.0 → 1253.0/1282.1 (+916); token-dense 354.7/430.9 → 2208.7/2509.9 → 2388.8/2418.1 (+1987, over). The C3 commit the same day, `.env` p95: 5 MB 169.5, stream 927.0, token-kv 1401.6, json-records 952.7, nlp-tokens 1023.4, emails+urls 882.7, value-dense 1223.1, token-dense 2339.9. `Redactor.redact` alone with the `.env`, 3.9.6 and 3.13.8: 50 MB stream 659/699 and 585/603 ms (C3: 561/574 and 514/552); 5 MB bundle 66/69 and 59/62 ms; token-kv 1310/1492 and 1115/1121 ms; value-dense 985/987 and 911/926 ms; token-dense 2630/2780 and 2031/2098 ms. Every planted secret gone from the shaped text and the full copy. The first reviewed bench scanned for the cut userinfo form on every text: +70 ms (stream) to +90 ms (emails+urls) per 50 MB, patterns only | Kept: the cut userinfo scan now runs only when the text holds `...` or `…` (patterns only, redactor alone, 50 MB stream 296 → 328 ms p50, was 370). The rest is the values' `str.find` in the folded text (case-insensitive values), a correctness fix. token-dense stays the known gap in design §6.8 |
++| V11 (re-measure, trim) | `spikes/v0.2/v11_redaction.py`'s 50 MB stream (10 runs) and 5 MB bundle (20 runs), p50/p95 ms, the pre-trim `shaping.py` and C12's trim (`TRIM_CHARS` 8,000,000, design §6.8) back to back on the a7 machine (Linux, 4 CPUs, Intel Xeon 2.8 GHz, Python 3.11.15, shared; load 1.1, 2026-09-29); then `shape_outputs` against the cap on the 50 MB stream, token-kv and token-dense with the `.env` (7 runs). Budget: turn overhead p95 ≤ 1.5 s | 50 MB stream, off → patterns only → `.env`: before 846/1093 → 1501/1683 → 2044/2140, after 139/184 → 193/250 → 261/284. 5 MB bundle (under the cap, so not trimmed): before 217/243 → 270/318 → 318/371, after 225/267 → 265/301 → 300/350. Against the cap, 4 / 8 / 16 MB / whole: stream 163/176, 267/285, 575/626, 1818/2059; token-kv 207/215, 388/446, 824/897, 2670/2852; token-dense 342/363, 652/704, 1407/1549, 4468/4700 (the load rose to 2.95 during the last). The bench's check passed: no planted secret in the shaped text or the full copy (most of the stream's are now in the trimmed middle; the edges are covered by `test_shaping.py`) | The trim at 8 MB: the largest of these caps at which token-dense still leaves a7 under 1.5 s (a7 spends ~0.3 s besides `shape_outputs`). a7 after it: the a7 rows below |
+ | V12 corpus | Shim pre-filter: 50 common DS commands and 20 should-ask commands as PreToolUse Bash JSON through `sh nh-hook pre-tool shell`: at most 5 benign reach Python, every should-ask does | PASS with the D6 tokens: benign 4/50, should-ask 20/20 (HEAD: 3/50, 0/20). Fast path median 15.5 ms. Not caught by the D6 tokens: `>/etc/foo` with no space, cp to /etc, `env`, `echo $VAR`. The shim matches the whole JSON: a project path containing "jupyter" sends 50/50 benign to Python (4/50 matching from `"tool_input"` on), and the description is matched too ("guarantee" hits `tee `) | C8 uses the D6 token list, plus: match from `"tool_input"` on, the no-space redirect forms, and `tee` only after a pipe. Python still decides |
+ | V12 latency | `sh nh-hook prompt-submit` end to end with a realistic payload, HEAD vs HEAD plus a pure-regex D0 a classifier, 50 runs: p95 < 150 ms | PASS, p50/p95: Python 3.13.8 HEAD 65.1/73.0 ms, with the classifier 65.6/74.0 ms; 3.9.6 76.3/81.3 and 76.4/83.0 ms. `classify()` 6.4 µs (3.13), 9.7 µs (3.9). Outcomes through the hook as expected ("run the next 3" → batch n=3, yes/no answers, `/nh:plan` → plan); prev_request carried into the next "yes" turn. One cold run with an empty pycache: 229.5 ms | C1 adds the classifier to prompt-submit: stdlib only, py3.9-compatible, writes only the fields (never the prompt text), fails open to None fields and logs `classify_failed` |
+ | V13 (hook) | `-p` without `--permission-prompt-tool`: the V4 and V6 asks are auto-denied and the model sees the reason | PASS: stream-json `permission_denied` with `decision_reason_type: "hook"`; the model's tool_result is `is_error` with exactly the hook's reason; pip didn't run and harness.toml wasn't created; `permission_denials` lists the call. With `--permission-prompts none`: `decision_reason_type: "asyncAgent"` and a canned message ending with the reason. The hooks doc says an ask reason is shown to the user, not Claude | nh's ask reasons are written for Claude too: they say what to ask the user |
+@@ -149,3 +150,17 @@ Reusable tools, kept for the later v0.2 spikes (V13 E122, V14, V2 (c)), are in `
+ | V13 (E122) | `-p`: the E122 flow with scripted yes turns | Runs later (in C5) | — |
+ | V14 (user) | Live batch of 3: exactly one question, one reply, stops at check-this | Runs later (after C6) | If it fails: fix before C7 |
+ | V2 (c) | The nh_inspect allow rule takes effect without restarting Claude Code | Runs later (in C11) | If it fails: a hook allow group (D12 fallback) |
++
++## v0.2 carry-overs: a7 and a8 (C12, 2026-09-29)
++
++Stack: JupyterLab 4.6.4, jupyter-collaboration 5.0.4 (jupyter-server-ydoc 3.0.4, jupyter_server 2.21.1), jupyter-ydoc 4.1.1, pycrdt 0.14.6, jupyter-nbmodel-client 1.5.1, jupyter-kernel-client 1.0.2, websocket-client 1.9.2, ipykernel 7.3.0, fastmcp 4.0.9, Python 3.11.15, Linux (4 CPUs, Intel Xeon 2.8 GHz, shared with other test runs). The regression tests are `tests/integration/test_large_outputs.py` (a7) and `tests/integration/test_lab_restart.py` (a8), with `-m integration`, and `tests/unit/test_rtc_save.py`, `tests/unit/test_kernel_utf8.py` and `tests/unit/test_shaping.py`. Design §6.13. Kernel time is the cell's own run time (IPython's `pre_run_cell` to `post_run_cell`); turn overhead is call − `exec.ms`: the gateway's work before and after the run and the MCP round trip, which V11 timed as `harness_ms` plus `shape_outputs` (`nhctl metrics` reports the events' `harness_ms`, the pre-run part only, and falls back to total − exec only for events without it); receive is `exec.ms` − kernel time.
++
++| Check | Result | Decision |
++|---|---|---|
++| a7, default JupyterLab: a cell prints 50 MB in 5 MB writes | Nothing large reaches nh: jupyter_server's iopub data limit (1 MB/s over 3 s) drops each stream message over 3 MB, and nh's result shows the server's "IOPub data rate exceeded" notice | a7 runs its own JupyterLab with `--ZMQChannelsWebsocketConnection.iopub_data_rate_limit=1e10`, as users do when they print this much |
++| a7, receive path, before the fix | 50 MB stream: kernel 0.41-0.54 s, `exec.ms` 10.6-12.3 s; 20 MB image bundle: kernel 0.39-0.46 s, `exec.ms` 4.4-5.1 s. websocket-client checks each text frame's UTF-8 in pure Python (0.87-0.95 s per 5 MB; no `wsaccel`, and jupyter-kernel-client runs it without `skip_utf8_validation`), on the gateway's receive thread, holding the GIL | Fixed: `backend/kernel.validate_utf8` does the same check with the C decoder, installed as the name websocket-client's frame reader calls. After: receive 0.23-0.49 s (stream), 0.06-0.11 s (images). a7 holds the receive path to 1.5 s p95 too |
++| a7, 50 MB stream through the RTC path (10 calls: add, 9 re-runs; V11's `.env`), after the fix, three runs at load 0.4-1.2 | Caps and cut PASS: the room and the `.ipynb` keep the notice line and ≤ 1 MB of the raw tail; the output section is ≤ 2000 chars and ends with `[full output: …]`; no planted secret in the result or the ~50 MB full copy (10 `.env` markers and the GitHub token's). Turn overhead per call 1.94-2.51 s, p95 (the max of 10) 2.376, 2.505, 2.326 s: over 1.5 s; `shape_outputs` 1.70-2.26 s of it. In the full integration suite (load 3.1-5.0): 2.02-2.68 s, p95 2.681 s; receive p95 0.586 s. Before the fix (3 calls a run): 2.12-2.99 s at load 1.8-5.4. V11's bench on this machine, 50 MB stream: `.env` 2010/2285 ms at load ~6, 2039/2462 ms at load ~1.6; off 880/1263 and 913/1216 ms (V11's machine: 946/976 and 356/361). One `shape_outputs` profiled: `terminal_text` 0.47 s, `redact` 0.94 s, the copy's write 0.25 s and sha256 0.13 s | Over on this machine at any load: V11's own case is over here too (the gateway's shaping runs 2.1-2.5 times slower than on V11's machine); the RTC path adds nothing. The budget and the test stay. The user chose V11's fallback: the trim (next rows) |
++| a7, 20 MB image bundle (10 calls), after the fix | Caps PASS: the 5.67 MB image becomes nh's "too large" note, the next is kept, the last two are one "2 more output(s) … over 8 MB" notice; two images sent at 768x768, image 4 "not sent (limit 2)"; all 4 originals on disk. Turn overhead 0.62-0.79 s, p95 0.718, 0.737, 0.786 s (`shape_outputs` 0.35-0.48 s); in the full suite (load 4.2-4.6) 0.68-0.82 s, p95 0.820 s | PASS |
++| a7, both in one cell (2 calls) | Before the fix: the full copy named 4 image originals that were gone: `prune_outputs_dir` (50 MiB) kept the newest file, the ~50 MB full copy, and deleted the call's originals as it wrote them. After: all caps and cuts as above, 11 `.env` markers in the full copy, 4 originals on disk. Turn overhead 2.81-3.19 s (`shape_outputs` 2.35-2.74 s) | Fixed: `prune_outputs_dir(keep=…)` never deletes what the current call wrote. Not budgeted then (V11 timed the two cases apart); budgeted since the trim (next row) |
++| a7 with the trim (`TRIM_CHARS` 8,000,000, design §6.8), 10 calls a case: three runs alone, each started at a 1-minute load under 1.5 (1.2-4.4 during the first, as other workflows came back; 1.4-2.2 and 1.5-2.1 during the others), one in the full integration suite (load 1.5-2.1) | All checks PASS in all four, including the trimmed copy's: at most 8,000,000 chars, the raw head and tail as printed but for the planted secrets (each its marker wherever kept, the GitHub token too, now in the last write), one `[… N chars cut …]` with N the raw length minus what is kept, and the result's marker counting the whole stream. Turn overhead per call, p95 in brackets: 50 MB stream 0.50-0.60 (0.604), 0.48-0.57 (0.568), 0.48-0.55 (0.553), suite 0.47-0.57 (0.567) s, `shape_outputs` 0.25-0.32 s; 20 MB image bundle 0.62-0.92 (0.923), 0.59-0.73 (0.731), 0.62-0.71 (0.712), suite 0.62-0.80 (0.797) s; both in one cell 0.97-1.27 (1.274), 0.98-1.09 (1.085), 0.94-1.10 (1.102), suite 0.97-1.22 (1.223) s. Receive p95 0.09-0.73 s. A first try at load 4.7-5.9: stream 0.788, images 0.802, both 1.919 s (over) | PASS: the stream case's overhead is about a quarter of what it was (1.94-2.68 s) and ~0.9 s under the budget. The combined case is now budgeted too; it has the least headroom and is the first to fail on a machine loaded past ~5 (design §6.13) |
++| a8, JupyterLab restarts (same root/runtime/port/token) while an nh cell prints every 0.1 s | SIGTERM: the server deletes its rooms, the kernel is gone in ~0.3 s, but the server doesn't exit (nh connected, a cell running); the test SIGKILLs it once the kernel's connection file is gone. Before the fix, 4 of 7 runs lost the cells of the two earlier messages: jupyter-collaboration's autosave waits for `document_save_delay` with no change, which nh's 200 ms output flushes never leave; shutdown cancels the pending save; the rebuilt room takes the file over its YStore ("out-of-sync … loaded from file"). The running cell is reported lost ("the kernel went away while it ran"), the gateway reconnects (new room, new kernel session), no duplicate ids | nh sends the room's RAW "save" request (what JupyterLab's File → Save sends) after each of its writes and at the end of each run. The save check (`.ipynb` holds both cells while the second prints) fails without it and passes with it. With the fix, both variants passed 4 of 4 runs (three alone at load 0.3-4.9, one in the full integration suite). a8 also restarts with a fresh YStore: only there does a stale-state merge into the new room show (review's mutation: 11 ids, 9 unique); with the same YStore it passed |
+diff --git a/tests/integration/conftest.py b/tests/integration/conftest.py
+index f34d0cf..f45d820 100644
+--- a/tests/integration/conftest.py
++++ b/tests/integration/conftest.py
+@@ -88,9 +88,11 @@ def start_lab(
+     runtime: Path | None = None,
+     port: int | None = None,
+     token: str | None = None,
++    args: tuple[str, ...] = (),
+ ) -> Lab:
+     """Start JupyterLab from this venv (cwd ``base``, where its YStore lives) and wait for its
+-    runtime file. Pass ``root``/``runtime``/``port`` of an earlier lab to restart "the same" one."""
++    runtime file. Pass ``root``/``runtime``/``port`` (and ``token``) of an earlier lab to restart
++    "the same" one; ``args`` are extra command-line options."""
+     root, runtime, config_dir = root or base / "root", runtime or base / "runtime", base / "config"
+     for folder in (root, runtime, config_dir):
+         folder.mkdir(parents=True, exist_ok=True)
+@@ -121,8 +123,9 @@ def start_lab(
+         "0.5",
+         "--YDocExtension.document_cleanup_delay",
+         "3",
++        *args,
+     ]
+-    with open(log, "wb") as handle:
++    with open(log, "ab") as handle:  # a restart of the same lab appends to its log
+         proc = subprocess.Popen(
+             command,
+             cwd=base,
+@@ -160,14 +163,25 @@ def lab(tmp_path_factory) -> Lab:
+         _stop(server.proc)
+ 
+ 
+-def _stop(proc: subprocess.Popen) -> None:
++def _stop(proc: subprocess.Popen, *, runtime: Path | None = None) -> None:
++    """SIGTERM the server's process group, give it 15 s to exit, then SIGKILL the group.
++
++    On SIGTERM the server deletes its rooms and shuts its kernels down; jupyter_client starts each
++    kernel in a session of its own, outside the group, and removes its connection file once the
++    kernel exited or was killed. A server can then hang instead of exiting (a8: nh connected and
++    a cell running); with ``runtime`` the wait ends as soon as no kernel connection file is left
++    there.
++    """
+     if proc.poll() is None:
+         with contextlib.suppress(ProcessLookupError):
+             os.killpg(proc.pid, signal.SIGTERM)
+-        with contextlib.suppress(subprocess.TimeoutExpired):
+-            proc.wait(15)
++        deadline = time.monotonic() + 15
++        while proc.poll() is None and time.monotonic() < deadline:
++            if runtime is not None and not list(runtime.glob("kernel-*.json")):
++                break
++            time.sleep(0.1)
+     with contextlib.suppress(ProcessLookupError, PermissionError):
+-        os.killpg(proc.pid, signal.SIGKILL)  # kernels the server started live in the same group
++        os.killpg(proc.pid, signal.SIGKILL)  # the server and anything else left in its group
+     with contextlib.suppress(subprocess.TimeoutExpired):
+         proc.wait(5)
+ 
+diff --git a/tests/integration/test_lab_restart.py b/tests/integration/test_lab_restart.py
+new file mode 100644
+index 0000000..7ae6b47
+--- /dev/null
++++ b/tests/integration/test_lab_restart.py
+@@ -0,0 +1,214 @@
++"""a8 (design §6.13): JupyterLab restarts while the gateway is connected and one of nh's cells runs.
++
++A JupyterLab of the test's own, an nh project in it, the gateway (MCP over ``RtcBackend``) and an
++observer peer standing in for the user's tab. Message 1 adds a cell. Message 2 adds one that
++prints for a minute; with a 5 s soft timeout its call comes back "still running". Then JupyterLab
++gets SIGTERM: it deletes its rooms and has its kernel shut down (the kernel is gone within a
++second), but with nh connected and the cell running it doesn't exit, so the test SIGKILLs it once
++the kernel's connection file is gone. It starts again as "the same" server: the same root,
++runtime dir, port and token, so the gateway's cached server still answers and only its room and
++kernel connections have to be rebuilt. Twice:
++
++- **same YStore** (JupyterLab restarted from the same directory): the rebuilt room loads the
++  YStore, then the file where they differ;
++- **fresh YStore** (``.jupyter_ystore.db`` deleted, as when JupyterLab starts from another
++  directory): the room loads the file alone. Only here would nh merging its stale copy of the
++  notebook into the new room show as duplicate cells; with the same YStore the room already holds
++  the old items and a second merge of them changes nothing.
++
++Checked after the restart:
++- ``nh_run(mode="wait")`` on the running cell reports it lost, in nh's words.
++- The gateway reconnects: message 3's cell runs, in a new kernel nh starts for the notebook.
++- No duplicate cell ids, in the tab (a new observer: the old one's connection died with the
++  server, as a browser tab reloads the document after a server restart) and in the saved .ipynb.
++- No cell is lost either. jupyter-collaboration saves a room only after ``document_save_delay``
++  with no change, never while nh's output flushes (every 200 ms) keep changing it, nor on
++  shutdown; and a room rebuilt after a restart takes the file over its YStore when they differ.
++  So nh asks the room to save after each of its writes and at the end of each run (design §6.13);
++  before that, the cells of messages 1 and 2 were gone after the restart in most runs.
++  ``test_cells_nh_wrote_are_saved_while_another_cell_streams`` checks the save itself.
++
++``test_backend_review.py`` covers a restart with a new token or port at the backend level, with
++no running cell; ``test_kernel_exec.py`` a kernel restart mid-run.
++"""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++import nbformat
++import pytest
++from fastmcp import Client
++
++from nh_gateway._shared.paths import Layout
++from nh_gateway.app import create_server
++from nh_gateway.backend.rtc_backend import RtcBackend
++from nh_gateway.config import ConfigCache
++from tests.fakes.turns import Turns, text
++
++pytestmark = pytest.mark.integration
++
++NB = "notebooks/01_eda.ipynb"
++
++
++def streaming(seconds: int) -> str:
++    """A cell that prints every 0.1 s, as a training loop's progress does."""
++    return (
++        f"import time\n\nfor step in range({seconds * 10}):\n"
++        "    print(f'step {step}', flush=True)\n    time.sleep(0.1)"
++    )
++
++
++def cell(code: str, title: str) -> dict:
++    return dict(
++        title=title,
++        notes=["Does the thing for the user.", "Shows the result so we can check it."],
++        intent="do the thing",
++        code=code,
++    )
++
++
++def uid_of(body: str) -> str:
++    return body.split("nh: cell=")[1].split()[0]
++
++
++def ids(cells: list[dict]) -> list[str]:
++    return [c["id"] for c in cells]
++
++
++def config(soft_timeout_s: int | None = None) -> str:
++    exec_table = f"[exec]\nsoft_timeout_s = {soft_timeout_s}\n" if soft_timeout_s else ""
++    return f'version = 1\n[project]\nnotebook = "{NB}"\n{exec_table}'
++
++
++@pytest.mark.parametrize("ystore", ["same", "fresh"], ids=["same-ystore", "fresh-ystore"])
++async def test_a_jupyterlab_restart_mid_run_reports_the_cell_lost_and_reconnects(
++    helpers, tmp_path: Path, monkeypatch, ystore: str
++) -> None:
++    base = Path(os.path.realpath(tmp_path / "lab"))
++    first = helpers.start_lab(base)
++    second = None
++    monkeypatch.setenv("JUPYTER_RUNTIME_DIR", str(first.runtime))
++    for var in ("NH_JUPYTER_URL", "NH_JUPYTER_TOKEN", "JUPYTER_TOKEN"):
++        monkeypatch.delenv(var, raising=False)
++    project = first.root / "proj"
++    (project / ".nh" / "state").mkdir(parents=True)
++    helpers.new_notebook(project / NB, [nbformat.v4.new_markdown_cell("# Sales EDA", id="title")])
++    # Message 1 has the default soft timeout: its call also starts the kernel and connects nh.
++    (project / "harness.toml").write_text(config())
++    api_path = (project / NB).relative_to(first.root).as_posix()
++    turns = Turns(project, tmp_path / "data")
++    backend = RtcBackend(Layout(project), ConfigCache(project))
++    try:
++        async with Client(create_server(project, backend)) as client:
++
++            async def call(tool: str, prompt_id: str, **args) -> str:
++                result = await turns.call(client, tool, args, prompt_id)
++                assert not result.is_error, text(result)
++                return text(result)
++
++            async with helpers.observe(first, api_path) as tab:
++                turns.prompt("t1")
++                body = await call("nh_add_cell", "t1", **cell("total = 10\ntotal", "Set a total"))
++                assert "ran ok" in body, body
++                (project / "harness.toml").write_text(config(soft_timeout_s=5))
++                turns.prompt("t2")
++                body = await call("nh_add_cell", "t2", **cell(streaming(60), "Train for a minute"))
++                assert "still running after" in body, body
++                running = uid_of(body)
++
++                def printing() -> bool:
++                    found = [c for c in helpers.cells_of(tab) if c["id"] == running]
++                    return bool(
++                        found and found[0]["execution_state"] == "running" and found[0]["outputs"]
++                    )
++
++                await helpers.eventually(printing, timeout=15)
++                before = ids(helpers.cells_of(tab))
++                assert len(before) == len(set(before)) == 5, before
++
++                # JupyterLab restarts as the same server; its kernel is shut down with it.
++                port = int(first.url.rsplit(":", 1)[1].strip("/"))
++                helpers.stop(first.proc, runtime=first.runtime)
++                if ystore == "fresh":
++                    stores = list(base.glob(".jupyter_ystore.db*"))
++                    assert stores, sorted(p.name for p in base.iterdir())
++                    for store in stores:
++                        store.unlink()
++                second = helpers.start_lab(
++                    base, root=first.root, runtime=first.runtime, port=port, token=first.token
++                )
++
++            # The running cell is reported lost, in nh's words.
++            body = await call("nh_run", "t2", cell_id=running, mode="wait")
++            lines = body.splitlines()
++            assert "the kernel went away while it ran" in body, body
++            assert any(line.startswith(f"nh: cell={running} ") for line in lines), body
++            assert "The kernel restarted, died or disconnected while" in body, body
++
++            # The gateway reconnected: the next message's cell runs in a new kernel.
++            turns.prompt("t3")
++            body = await call("nh_add_cell", "t3", **cell("count = 3\ncount", "Set a count"))
++            assert "ran ok" in body, body
++            added = uid_of(body)
++
++            # No duplicate cell ids: in the user's tab after the restart, and on disk.
++            async with helpers.observe(second, api_path) as tab:
++
++                def settled() -> list[dict] | None:
++                    cells = helpers.cells_of(tab)
++                    return cells if added in ids(cells) else None
++
++                cells = await helpers.eventually(settled, timeout=15)
++                after = ids(cells)
++                assert len(after) == len(set(after)) == 7, after
++                assert after[:5] == before, after
++                [lost] = [c for c in cells if c["id"] == running]
++                assert lost["execution_state"] == "idle", lost
++
++            def saved() -> dict | None:
++                disk = helpers.read_disk(project / NB)
++                return disk if disk and added in ids(disk["cells"]) else None
++
++            disk = await helpers.eventually(saved, timeout=20)
++            nbformat.validate(nbformat.from_dict(disk))
++            assert ids(disk["cells"]) == after, ids(disk["cells"])
++    finally:
++        await backend.aclose()
++        helpers.stop(first.proc)
++        if second is not None:
++            helpers.stop(second.proc)
++
++
++async def test_cells_nh_wrote_are_saved_while_another_cell_streams(
++    project: Path, backend, helpers, tmp_path: Path
++) -> None:
++    """The root cause a8 found: while a cell prints, the room's autosave never fires, so nh asks
++    for the save itself. Both messages' cells are in the .ipynb while the second one still runs."""
++    (project / "harness.toml").write_text(config(soft_timeout_s=5))
++    turns = Turns(project, tmp_path / "data")
++    async with Client(create_server(project, backend)) as client:
++
++        async def call(tool: str, prompt_id: str, **args) -> str:
++            result = await turns.call(client, tool, args, prompt_id)
++            assert not result.is_error, text(result)
++            return text(result)
++
++        turns.prompt("t1")
++        first = uid_of(await call("nh_add_cell", "t1", **cell("total = 10\ntotal", "Set a total")))
++        turns.prompt("t2")
++        body = await call("nh_add_cell", "t2", **cell(streaming(30), "Train for a while"))
++        assert "still running after" in body, body
++        running = uid_of(body)
++
++        def on_disk() -> list[str] | None:
++            disk = helpers.read_disk(project / NB)
++            found = ids(disk["cells"]) if disk else []
++            return found if {first, running} <= set(found) else None
++
++        try:
++            found = await helpers.eventually(on_disk, timeout=5)
++            assert found == ["title", f"{first}-n", first, f"{running}-n", running], found
++        finally:
++            await call("nh_run", "t2", cell_id=running, mode="interrupt")
+diff --git a/tests/integration/test_large_outputs.py b/tests/integration/test_large_outputs.py
+new file mode 100644
+index 0000000..4bf382b
+--- /dev/null
++++ b/tests/integration/test_large_outputs.py
+@@ -0,0 +1,521 @@
++"""a7 (design §6.13): very large outputs through the real RTC path, against a real JupyterLab.
++
++Spike V11's two cases, and both in one cell, each added in one message and re-run in the next
++nine (10 calls a case):
++
++- **50 MB stream:** ten 5 MB writes of a training log. The project's ``.env`` holds ~30 secret
++  values, as in V11; the stream carries one of them (in every write) and a GitHub token (in the
++  fifth and the last).
++- **20 MB image bundle:** a short stream, then four noise PNGs of ~5 MB of base64 each, the first
++  just over docsafe's 5 MB bundle cap.
++- **Both in one cell:** the stream, then the images, in one output list. Before the trim its
++  full copy (~50 MB) and image originals were over ``.nh/outputs``' 50 MiB cap together, which
++  exposed the prune that deleted a call's own originals; trimmed (~8 MB and ~15 MB), they are
++  under it, and ``test_shaping.py`` keeps that case (``test_a_call_s_own_copies_survive_its_prune``).
++
++A first message adds a small cell with the helpers (so the kernel is up and the gateway warm). It
++also has IPython record each later cell's own run time (``pre_run_cell`` to ``post_run_cell``).
++
++The test starts its own JupyterLab with jupyter_server's iopub data limit raised, as users do
++when they print this much: at its default (1 MB/s over a 3 s window) the server drops any stream
++message over 3 MB before it reaches a client, nh included, and sends its "IOPub data rate
++exceeded" notice instead, so nothing large would reach nh at all.
++
++Checked, for each case:
++- the room (the user's tab) and the saved ``.ipynb`` hold docsafe's capped outputs: the stream's
++  last 1 MB, no bundle over 5 MB (the first image becomes nh's note), and at most 8 MB per cell
++  (the images past it become one notice);
++- Claude's tool result: the output section fits ``[output] max_chars`` and ends with
++  ``[full output: …]``, at most ``max_images`` images go with it, and every image original the
++  full copy names is on disk;
++- the trim (design §6.8): the full copy under ``.nh/outputs`` holds the stream's raw head and
++  tail, at most ``TRIM_CHARS`` in all, and one ``[… N chars cut …]`` line whose N is the rest;
++  the result's own cut marker counts the whole stream too;
++- C3's redaction ran on all that is kept: no planted secret in the result or the full copy, and
++  the kept head and tail are the raw stream's with each planted secret as its marker;
++- time, per call, against the 1.5 s budget (design §6.8, spike V11), p95 by nearest rank over
++  10 calls a case (which is the max of the 10). §6.8 names V11's two cases; the combined one is
++  held to it too since the trim, with the least headroom (it does both cases' work in one call):
++  - turn overhead: the call's wall time minus the run's ``exec.ms`` (its ``cell_added``/
++    ``cell_rerun`` event: from nh seeing the kernel start the cell until nh holds every
++    output). That is the gateway's work before the run and after it (the after-probe,
++    ``shape_outputs``, render) and the MCP round trip: V11 timed the same work as
++    ``harness_ms`` plus ``shape_outputs``. It is not what ``nhctl metrics`` reports for these
++    calls: the event's ``harness_ms`` is the pre-run part only (``write.py`` takes it before
++    waiting for the run), and ``nhctl metrics`` reads that field first, falling back to
++    total − exec only for events without it. ``shape_outputs``' share, ``harness_ms`` and the
++    load average are printed with it;
++  - the receive path, which that measure leaves out: ``exec.ms`` minus the kernel's own run
++    time, the time the outputs take to reach nh (before nh checked the kernel websocket's
++    UTF-8 in C, ~10 s per 50 MB).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import math
++import os
++import random
++import re
++import string
++import sys
++import time
++from collections.abc import AsyncIterator, Callable
++from pathlib import Path
++from typing import Any
++
++import nbformat
++import pytest
++from fastmcp import Client
++
++from nh_gateway._shared.paths import Layout
++from nh_gateway.app import create_server
++from nh_gateway.backend.rtc_backend import RtcBackend
++from nh_gateway.config import ConfigCache
++from nh_gateway.exec import docsafe, shaping
++from tests.fakes.turns import Turns, text
++
++pytestmark = pytest.mark.integration
++
++NB = "notebooks/01_eda.ipynb"
++BUDGET_S = 1.5  # turn overhead p95 (design §6.8)
++MAX_CHARS = 2000  # [output] max_chars, the default
++MAX_IMAGES = 2  # [output] max_images, the default
++UNLIMITED = ("--ZMQChannelsWebsocketConnection.iopub_data_rate_limit=1e10",)
++FOOTER = re.compile(r"\[full output: \.nh/outputs/[0-9a-f]{16}\.txt\]")
++CUT = re.compile(r"\n\[… ([\d,]+) chars cut …\]\n")
++
++
++def env_values() -> list[tuple[str, str]]:
++    """~30 secret-named values of 16-45 chars, as V11's project .env holds them."""
++    rng = random.Random(7)
++    names = ["DB_PASSWORD", "API_TOKEN", "AWS_SECRET_ACCESS_KEY", "WAREHOUSE_PASSWORD"]
++    names += [f"SERVICE_{i}_API_KEY" for i in range(26)]
++    alphabet = string.ascii_letters + string.digits
++    return [(name, "".join(rng.choices(alphabet, k=16 + i))) for i, name in enumerate(names)]
++
++
++VALUES = env_values()
++PASSWORD = VALUES[0][1]
++GITHUB = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # fake
++TOKEN_PARTS = (4, 9)  # the writes that also print the token
++LINE = "epoch 12/100 - loss: 0.2345 - acc: 0.9123 - see https://example.com/x?a=1\n"  # V11's
++MARKERS = {"[redacted:DB_PASSWORD]": PASSWORD, "[redacted:github-token]": GITHUB}
++
++
++def helpers_code(times: Path) -> str:
++    """The first cell. Each secret is built from two halves: no line of code holds it whole.
++    IPython appends each later cell's own run time to ``times`` (nh's silent probes don't count)."""
++    half, gh = len(PASSWORD) // 2, len(GITHUB) // 2
++    return f"""import base64
++import json
++import os
++import struct
++import time
++import zlib
++
++from IPython.display import display
++
++LINE = {LINE!r}
++SECRET = {PASSWORD[:half]!r} + {PASSWORD[half:]!r}
++TOKEN = {GITHUB[:gh]!r} + {GITHUB[gh:]!r}
++TIMES = {str(times)!r}
++began = [0.0]
++
++
++def noise_png(side):
++    rows = b"".join(b"\\x00" + os.urandom(side * 3) for _ in range(side))
++
++    def chunk(kind, data):
++        body = kind + data
++        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
++
++    header = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
++    png = chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows, 0)) + chunk(b"IEND", b"")
++    return b"\\x89PNG\\r\\n\\x1a\\n" + png
++
++
++def cell_started(info):
++    began[0] = time.perf_counter()
++
++
++def cell_ran(result):
++    if began[0]:
++        record = {{"code": result.info.raw_cell[:40], "s": time.perf_counter() - began[0]}}
++        with open(TIMES, "a") as log:
++            log.write(json.dumps(record) + "\\n")
++
++
++get_ipython().events.register("pre_run_cell", cell_started)
++get_ipython().events.register("post_run_cell", cell_ran)
++print("helpers ready")"""
++
++
++# 10 x 5 MB of log lines; the .env value ends every write, the token the fifth and the last.
++STREAM = f"""block = LINE * (5_000_000 // len(LINE))
++for part in range(10):
++    extra = f" key {{TOKEN}}" if part in {TOKEN_PARTS} else ""
++    print(block + f"part {{part}} db {{SECRET}}{{extra}}", flush=True)
++del block"""
++
++# base64 of ~5.67 MB (over the 5 MB bundle cap), then three of ~4.80 MB: 20 MB in all.
++IMAGES = """print(f"four figures, db {SECRET}")
++for side in (1190, 1095, 1095, 1095):
++    data = base64.b64encode(noise_png(side)).decode()
++    display({"image/png": data, "text/plain": f"<Figure {side}x{side}>"}, raw=True)
++del data"""
++
++BOTH = "# both in one cell\n" + STREAM + "\n" + IMAGES
++IMAGES_LINE = f"four figures, db {PASSWORD}\n"  # what IMAGES prints before its figures
++
++
++def stream_text() -> str:
++    """The stream STREAM prints, as nh receives it."""
++    block = LINE * (5_000_000 // len(LINE))
++    return "".join(
++        f"{block}part {part} db {PASSWORD}"
++        + (f" key {GITHUB}" if part in TOKEN_PARTS else "")
++        + "\n"
++        for part in range(10)
++    )
++
++
++def cell(code: str, title: str) -> dict[str, Any]:
++    return dict(
++        title=title,
++        notes=["Makes very large outputs on purpose.", "Checks what nh keeps and shows."],
++        intent="stress nh with very large outputs",
++        code=code,
++    )
++
++
++def run_event(project: Path, uid: str) -> dict:
++    lines = (project / ".nh" / "log.jsonl").read_text().splitlines()
++    events = [json.loads(line) for line in lines if line.strip()]
++    return [
++        e for e in events if e["event"] in ("cell_added", "cell_rerun") and e.get("cell_uid") == uid
++    ][-1]
++
++
++def kernel_seconds(times: Path, code: str) -> float:
++    """The cell's own run time, as IPython saw it (``times`` holds this call's records only)."""
++    records = [json.loads(line) for line in times.read_text().splitlines() if line.strip()]
++    [record] = [r for r in records if r["code"] == code[:40]]
++    return float(record["s"])
++
++
++def nearest_rank(values: list[float], q: float) -> float:
++    ordered = sorted(values)
++    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
++
++
++def p95(values: list[float]) -> str:
++    value = nearest_rank(values, 0.95)
++    the_max = ": the max" if value == max(values) else ""
++    return f"p95 {value:.3f}s (nearest rank of {len(values)}{the_max})"
++
++
++def section(body: str, name: str) -> str:
++    match = re.search(rf"^--- {name} ---\n(.*?)(?=^--- [^\n]+ ---$|\Z)", body, re.M | re.S)
++    assert match, f"no {name} section in:\n{body[:3000]}"
++    return match.group(1).rstrip("\n")
++
++
++def joined(value: str | list[str]) -> str:
++    """The saved .ipynb splits multi-line strings into lists of lines; the room doesn't."""
++    return "".join(value) if isinstance(value, list) else value
++
++
++# --- what Claude sees ------------------------------------------------------------------------
++
++
++def cut_output(body: str) -> tuple[str, str]:
++    """The output section (within max_chars, ending with the full-copy line) and that path."""
++    output = section(body, "output")
++    assert len(output) <= MAX_CHARS, len(output)
++    footer = output.splitlines()[-1]
++    assert FOOTER.fullmatch(footer), footer
++    return output, footer[len("[full output: ") : -1]
++
++
++def attached(result: Any) -> int:
++    return len([part for part in result.content if getattr(part, "type", "") == "image"])
++
++
++def check_originals(project: Path, full: str, count: int) -> None:
++    """Every image original the full copy names is on disk (a call's own copies are never pruned
++    by that call)."""
++    originals = re.findall(r"; original: (\.nh/outputs/[0-9a-f]{16}\.png)\]", full)
++    assert len(originals) == count, originals
++    missing = [name for name in originals if not (project / name).is_file()]
++    assert not missing, f"the full copy names originals that are gone: {missing}"
++
++
++def check_image_lines(output: str) -> None:
++    assert "[image 1: 1190x1190 png, sent at 768x768]" in output, output
++    assert "[image 2: 1095x1095 png, sent at 768x768]" in output, output
++    assert "[image 4: 1095x1095 png, not sent (limit 2)]" in output, output
++
++
++def restore(text: str) -> str:
++    """Kept text with each planted secret back in place of its marker."""
++    for marker, secret in MARKERS.items():
++        text = text.replace(marker, secret)
++    return text
++
++
++def cut_count(match: re.Match[str]) -> int:
++    return int(match.group(1).replace(",", ""))
++
++
++def check_trimmed(kept: str, raw: str, output: str) -> None:
++    """The trim (design §6.8): the full copy keeps ``raw``'s head and tail, at most TRIM_CHARS,
++    exactly as printed but for each planted secret, which is its marker wherever it is kept, and
++    one trim marker counting the rest (the raw length minus what is kept). The result's own cut
++    marker counts the whole of ``raw`` too."""
++    last = "part 9 db [redacted:DB_PASSWORD] key [redacted:github-token]"
++    raw = raw.rstrip("\n")
++    assert len(kept) <= shaping.TRIM_CHARS and PASSWORD not in kept and GITHUB not in kept
++    [trim] = CUT.finditer(kept)
++    head, tail = kept[: trim.start()], kept[trim.end() :]
++    assert raw.startswith(restore(head)) and raw.endswith(restore(tail))
++    assert cut_count(trim) == len(raw) - len(head) - len(tail)
++    assert last in tail and tail.count("[redacted:DB_PASSWORD]") >= 2
++    output = output.rsplit("\n[full output: ", 1)[0]
++    [cut] = CUT.finditer(output)
++    shown_head, shown_tail = output[len("[stdout]\n") : cut.start()], output[cut.end() :]
++    shown_tail = shown_tail.split("\n[image 1: ")[0]
++    assert raw.startswith(restore(shown_head)) and last in shown_tail
++    assert cut_count(cut) == len(raw) - len(shown_head) - len(shown_tail)
++
++
++def check_stream_result(project: Path, body: str, result: Any) -> None:
++    output, copy = cut_output(body)
++    assert PASSWORD not in body and GITHUB not in body
++    assert attached(result) == 0
++    full = (project / copy).read_text()
++    assert full.startswith("[stdout]\n"), full[:200]
++    check_trimmed(full[len("[stdout]\n") :], stream_text(), output)
++
++
++def check_images_result(project: Path, body: str, result: Any) -> None:
++    output, copy = cut_output(body)
++    assert "four figures, db [redacted:DB_PASSWORD]" in output, output
++    check_image_lines(output)
++    assert PASSWORD not in body
++    assert attached(result) == MAX_IMAGES
++    full = (project / copy).read_text()
++    assert PASSWORD not in full and full.count("[redacted:DB_PASSWORD]") == 1
++    check_originals(project, full, 4)
++
++
++def check_both_result(project: Path, body: str, result: Any) -> None:
++    output, copy = cut_output(body)
++    assert "four figures, db [redacted:DB_PASSWORD]" in output, output
++    check_image_lines(output)
++    assert PASSWORD not in body and GITHUB not in body
++    assert attached(result) == MAX_IMAGES
++    full = (project / copy).read_text()
++    assert full.startswith("[stdout]\n"), full[:200]
++    stream = full[len("[stdout]\n") : full.index("\n[image 1: ")]
++    assert stream.endswith("\nfour figures, db [redacted:DB_PASSWORD]")
++    check_trimmed(stream, stream_text() + IMAGES_LINE, output)
++    check_originals(project, full, 4)
++
++
++# --- what the notebook keeps -----------------------------------------------------------------
++
++
++def check_capped_stream(stream: dict, where: str, ending: str) -> None:
++    """docsafe's stream cap: the notebook keeps the last 1 MB, raw, after nh's notice line."""
++    assert stream["output_type"] == "stream", where
++    notice, _, tail = joined(stream["text"]).partition("\n")
++    assert re.fullmatch(
++        r"\[nh: [\d,]+ earlier characters of this output were not saved in the notebook\]", notice
++    ), (where, notice)
++    assert 0 < len(tail) <= docsafe.STREAM_KEEP_CHARS, (where, len(tail))
++    assert tail.endswith(ending), where  # the notebook keeps the raw text
++
++
++def check_capped_images(outputs: list[dict], where: str) -> None:
++    """docsafe's bundle (5 MB) and cell (8 MB) caps on ``outputs[1:]``, after the stream."""
++    note, image, notice = outputs[1:]
++    plain = joined(note["data"]["text/plain"])
++    assert re.fullmatch(
++        r"\[nh: this output \(5\.\d MB\) is too large to save in the notebook\]", plain
++    ), (where, plain)
++    assert "image/png" not in note["data"], where
++    assert joined(image["data"]["text/plain"]) == "<Figure 1095x1095>", where
++    assert docsafe.approx_size(image) <= docsafe.BUNDLE_MAX_CHARS, where
++    assert notice["output_type"] == "stream" and notice["name"] == "stderr", where
++    assert joined(notice["text"]) == (
++        "[nh: 2 more output(s) were not saved; this cell's output is over 8 MB]\n"
++    ), where
++    assert sum(docsafe.approx_size(o) for o in outputs) <= docsafe.CELL_MAX_CHARS, where
++
++
++def check_stream_caps(outputs: list[dict], where: str) -> None:
++    [stream] = outputs
++    check_capped_stream(stream, where, f"part 9 db {PASSWORD} key {GITHUB}\n")
++
++
++def check_image_caps(outputs: list[dict], where: str) -> None:
++    assert len(outputs) == 4, (where, len(outputs))
++    assert joined(outputs[0]["text"]) == f"four figures, db {PASSWORD}\n", where
++    check_capped_images(outputs, where)
++
++
++def check_both_caps(outputs: list[dict], where: str) -> None:
++    assert len(outputs) == 4, (where, len(outputs))
++    check_capped_stream(outputs[0], where, f"part 9 db {PASSWORD} key {GITHUB}\n{IMAGES_LINE}")
++    check_capped_images(outputs, where)
++
++
++Check = Callable[..., None]
++CASES: dict[str, tuple[str, int, bool, Check, Check]] = {
++    # case: (code, calls: one add and the rest re-runs, budgeted, result check, notebook check)
++    "50 MB stream": (STREAM, 10, True, check_stream_result, check_stream_caps),
++    "20 MB image bundle": (IMAGES, 10, True, check_images_result, check_image_caps),
++    "both in one cell": (BOTH, 10, True, check_both_result, check_both_caps),
++}
++
++
++@contextlib.asynccontextmanager
++async def unlimited_lab(helpers, base: Path, monkeypatch) -> AsyncIterator[tuple[Any, Path]]:
++    """A JupyterLab of its own with the iopub data limit raised, and an nh project in it."""
++    lab = helpers.start_lab(base, args=UNLIMITED)
++    try:
++        monkeypatch.setenv("JUPYTER_RUNTIME_DIR", str(lab.runtime))
++        for var in ("NH_JUPYTER_URL", "NH_JUPYTER_TOKEN", "JUPYTER_TOKEN"):
++            monkeypatch.delenv(var, raising=False)
++        project = lab.root / "proj"
++        (project / ".nh" / "state").mkdir(parents=True)
++        helpers.new_notebook(
++            project / NB, [nbformat.v4.new_markdown_cell("# Big outputs", id="title")]
++        )
++        (project / "harness.toml").write_text(f'version = 1\n[project]\nnotebook = "{NB}"\n')
++        (project / ".env").write_text("".join(f"{name}={value}\n" for name, value in VALUES))
++        yield lab, project
++    finally:
++        helpers.stop(lab.proc)
++
++
++async def test_large_outputs_are_capped_in_the_room_and_cut_for_claude(
++    helpers, tmp_path: Path, monkeypatch
++) -> None:
++    shaped_s: list[float] = []
++    real_shape = shaping.shape_outputs
++
++    def timed_shape(*args: Any, **kwargs: Any) -> shaping.Shaped:
++        began = time.perf_counter()
++        try:
++            return real_shape(*args, **kwargs)
++        finally:
++            shaped_s.append(time.perf_counter() - began)
++
++    monkeypatch.setattr(shaping, "shape_outputs", timed_shape)
++    rows: list[str] = []
++    overhead: dict[str, list[float]] = {case: [] for case in CASES}
++    receive: dict[str, list[float]] = {case: [] for case in CASES}
++    uids: dict[str, str] = {}
++    times = tmp_path / "kernel-times.jsonl"
++    base = Path(os.path.realpath(tmp_path / "lab"))
++    async with unlimited_lab(helpers, base, monkeypatch) as (lab, project):
++        turns = Turns(project, tmp_path / "data")
++        api_path = (project / NB).relative_to(lab.root).as_posix()
++        backend = RtcBackend(Layout(project), ConfigCache(project))
++        try:
++            async with (
++                Client(create_server(project, backend)) as client,
++                helpers.observe(lab, api_path) as user,
++            ):
++                turns.prompt("a7-warm")
++                warm = await turns.call(
++                    client,
++                    "nh_add_cell",
++                    cell(helpers_code(times), "Define the helpers"),
++                    "a7-warm",
++                )
++                assert "ran ok" in text(warm), text(warm)
++                for case, (code, calls, _budgeted, check_result, _caps) in CASES.items():
++                    for run in range(calls):
++                        prompt = f"a7-{case[:5]}-{run}"
++                        turns.prompt(prompt)
++                        if case in uids:
++                            tool, args = "nh_run", {"cell_id": uids[case]}
++                        else:
++                            tool, args = "nh_add_cell", cell(code, f"Print a {case}")
++                        turns.stamp(tool, args, prompt)
++                        times.unlink(missing_ok=True)
++                        began = time.perf_counter()
++                        result = await client.call_tool(tool, args, raise_on_error=False)
++                        wall = time.perf_counter() - began
++                        body = text(result)
++                        assert not result.is_error and "ran ok" in body, body[:3000]
++                        uid = uids.setdefault(case, body.split("nh: cell=")[1].split()[0])
++                        event = run_event(project, uid)
++                        exec_s = event["exec"]["ms"] / 1000
++                        kernel_s = kernel_seconds(times, code)
++                        overhead[case].append(wall - exec_s)
++                        receive[case].append(exec_s - kernel_s)
++                        rows.append(
++                            f"{case} run {run}: call {wall:.3f}s, kernel {kernel_s:.3f}s, "
++                            f"exec {exec_s:.3f}s, receive {exec_s - kernel_s:.3f}s, "
++                            f"overhead {wall - exec_s:.3f}s, call - kernel {wall - kernel_s:.3f}s, "
++                            f"shape_outputs {shaped_s[-1]:.3f}s, "
++                            f"harness_ms {event.get('harness_ms')}, "
++                            f"load {os.getloadavg()[0]:.2f}"
++                        )
++                        print(f"a7 {rows[-1]}", flush=True)
++                        check_result(project, body, result)
++
++                # The room: the user's tab holds the capped outputs.
++                for case, uid in uids.items():
++
++                    def live(uid: str = uid) -> dict | None:
++                        found = [c for c in helpers.cells_of(user) if c["id"] == uid]
++                        idle = found and found[0].get("execution_state") == "idle"
++                        return found[0] if idle else None
++
++                    outputs = (await helpers.eventually(live, timeout=30))["outputs"]
++                    CASES[case][4](outputs, case)
++
++            # The .ipynb JupyterLab saves holds the same, once its last save caught up (a save
++            # made while a cell ran holds that moment's outputs).
++            def check_disk() -> dict:
++                disk = helpers.read_disk(project / NB)
++                assert disk is not None, "no saved notebook"
++                for case, uid in uids.items():
++                    [found] = [c for c in disk["cells"] if c["id"] == uid]
++                    CASES[case][4](found["outputs"], f"{case} on disk")
++                return disk
++
++            deadline = time.monotonic() + 30
++            while time.monotonic() < deadline:
++                with contextlib.suppress(AssertionError, KeyError, TypeError, ValueError):
++                    check_disk()
++                    break
++                await asyncio.sleep(0.2)
++            nbformat.validate(nbformat.from_dict(check_disk()))
++        finally:
++            await backend.aclose()
++
++    lines = [f"a7 ({sys.platform}, Python {sys.version.split()[0]}):", *rows]
++    over: list[str] = []
++    for case, (_code, _calls, budgeted, _result, _caps) in CASES.items():
++        limit = f"budget {BUDGET_S}s" if budgeted else "not budgeted"
++        lines.append(
++            f"{case}: turn overhead (call - exec.ms) {p95(overhead[case])}; "
++            f"receive (exec.ms - kernel) {p95(receive[case])}; {limit}"
++        )
++        if budgeted:
++            over += [
++                f"{case} {name}"
++                for name, values in (("turn overhead", overhead[case]), ("receive", receive[case]))
++                if nearest_rank(values, 0.95) > BUDGET_S
++            ]
++    report = "\n".join(lines)
++    print(f"\n{report}")
++    assert not over, f"over the {BUDGET_S}s budget: {over}\n{report}"
+diff --git a/tests/integration/test_rtc_document.py b/tests/integration/test_rtc_document.py
+index b881650..4ab5573 100644
+--- a/tests/integration/test_rtc_document.py
++++ b/tests/integration/test_rtc_document.py
+@@ -320,14 +320,21 @@ async def test_twenty_reconnects_leave_no_duplicate_ids(backend: RtcBackend, pro
+ 
+ async def test_source_patches_handle_non_ascii(backend: RtcBackend, helpers):
+     ref = await backend.resolve_notebook(helpers.NB)
+-    await backend.insert_cells(ref, -1, pair("nh-0000000009", "label = 'café 😀'\nprint(label)"))
++    old = "label = 'café 😀'\nprint(label)"
++    await backend.insert_cells(ref, -1, pair("nh-0000000009", old))
+     new = "label = 'crème brûlée 😀🎉'\nprint(label, 'ok')"
+-    await backend.update_cells(
+-        ref,
+-        [CellPatch(id="nh-0000000009", source=new, base_source="label = 'café 😀'\nprint(label)")],
+-    )
++    await backend.update_cells(ref, [CellPatch(id="nh-0000000009", source=new, base_source=old)])
+     async with helpers.observer(ref.api_path) as user:
++        # The room reads nh's patch only after the save nh asked for after the insert (design
++        # §6.13): wait until the patch arrived, then check what it made.
+         cell = await helpers.eventually(
+-            lambda: next((c for c in helpers.cells_of(user) if c["id"] == "nh-0000000009"), None)
++            lambda: next(
++                (
++                    c
++                    for c in helpers.cells_of(user)
++                    if c["id"] == "nh-0000000009" and c["source"] != old
++                ),
++                None,
++            )
+         )
+         assert cell["source"] == new
+diff --git a/tests/unit/test_kernel_utf8.py b/tests/unit/test_kernel_utf8.py
+new file mode 100644
+index 0000000..b2e56d0
+--- /dev/null
++++ b/tests/unit/test_kernel_utf8.py
+@@ -0,0 +1,84 @@
++"""a7's receive-path fix (design §6.13): the kernel websocket's text frames are checked as UTF-8
++by the C decoder, not websocket-client's pure-Python loop (~0.2 s per MB without ``wsaccel``).
++
++The check must refuse what websocket-client refused (its own check, or ``WebSocketApp``'s decode of
++a text frame, which catches a sequence cut at the end), and its frame reader must still call it by
++that name. Against websocket-client's latest release (the drift job), a7's receive budget
++(``tests/integration/test_large_outputs.py``) is what fails if it doesn't.
++"""
++
++from __future__ import annotations
++
++import pytest
++import websocket._abnf
++import websocket._utils
++from websocket._abnf import ABNF, continuous_frame
++from websocket._exceptions import WebSocketPayloadException
++
++from nh_gateway.backend import kernel
++
++VALID = [
++    b"",
++    b"plain ascii",
++    "café 😀 ✓ ∑".encode(),
++    b'{"msg_type": "stream", "text": "' + b"x" * 100_000 + b'"}',
++    b"\xf4\x8f\xbf\xbf",  # U+10FFFF, the last code point
++]
++INVALID = [
++    b"\xff",  # never valid
++    b"\xc0\xaf",  # overlong "/"
++    b"\xe0\x80\xaf",  # overlong, three bytes
++    b"\xed\xa0\x80",  # a UTF-16 surrogate
++    b"\xe2\x82",  # cut short
++    b"ok \x80 then",  # a stray continuation byte
++    b"\xf4\x90\x80\x80",  # past U+10FFFF
++]
++
++
++def refused_before(data: bytes) -> bool:
++    """websocket-client on its own: its check, then ``WebSocketApp``'s decode of the text."""
++    if not websocket._utils.validate_utf8(data):
++        return True
++    try:
++        data.decode("utf-8")
++    except UnicodeDecodeError:
++        return True
++    return False
++
++
++def text_frame(data: bytes) -> tuple[int, ABNF]:
++    """One whole text frame through websocket-client's own reader, as a kernel message arrives."""
++    frames = continuous_frame(fire_cont_frame=False, skip_utf8_validation=False)
++    frame = ABNF(fin=1, opcode=ABNF.OPCODE_TEXT, data=data)
++    frames.validate(frame)
++    frames.add(frame)
++    return frames.extract(frame)
++
++
++def test_the_frame_reader_calls_nh_s_check():
++    assert websocket._abnf.validate_utf8 is kernel.validate_utf8
++    assert "validate_utf8" in continuous_frame.extract.__code__.co_names
++
++
++@pytest.mark.parametrize("data", VALID)
++def test_valid_text_frames_pass(data: bytes):
++    assert kernel.validate_utf8(data) and not refused_before(data)
++    opcode, frame = text_frame(data)
++    assert opcode == ABNF.OPCODE_TEXT and frame.data == data
++
++
++@pytest.mark.parametrize("data", INVALID)
++def test_invalid_text_frames_are_refused_as_before(data: bytes):
++    assert refused_before(data)
++    assert not kernel.validate_utf8(data)
++    with pytest.raises(WebSocketPayloadException):
++        text_frame(data)
++
++
++def test_other_buffers_and_str_are_checked_like_websocket_client_does():
++    for data in (bytearray("é".encode()), memoryview("é".encode())):
++        assert kernel.validate_utf8(data)
++    assert not kernel.validate_utf8(bytearray(b"\xff"))
++    assert kernel.validate_utf8("é")
++    assert not kernel.validate_utf8("\ud800")  # a lone surrogate
++    assert not websocket._utils.validate_utf8("\ud800")
+diff --git a/tests/unit/test_rtc_save.py b/tests/unit/test_rtc_save.py
+new file mode 100644
+index 0000000..a89c512
+--- /dev/null
++++ b/tests/unit/test_rtc_save.py
+@@ -0,0 +1,174 @@
++"""a8's fix (design §6.13): nh asks the room to save after each of its writes and each run.
++
++jupyter-collaboration saves a room only after ``document_save_delay`` with no change, so while a
++cell prints nothing reaches the file; after a JupyterLab restart the room takes the file over its
++YStore and the unsaved cells are gone. The integration tests (``test_lab_restart.py``) show the
++loss and the fix against a real JupyterLab; these pin the pieces.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++from collections.abc import Iterator
++from pathlib import Path
++from typing import Any
++
++import pytest
++from pycrdt import Decoder
++from websockets.exceptions import ConnectionClosedError
++
++from nh_gateway._shared.paths import Layout
++from nh_gateway.backend.base import CellPatch, NewCell, NotebookRef
++from nh_gateway.backend.rtc import RAW_MESSAGE, NhNbModelClient, RtcDocument, save_message
++from nh_gateway.backend.rtc_backend import RtcBackend
++from nh_gateway.config import ConfigCache
++
++NB = "notebooks/01_eda.ipynb"
++
++
++class Socket:
++    """The room websocket: what nh sent on it."""
++
++    def __init__(self, fail: bool = False) -> None:
++        self.sent: list[bytes] = []
++        self.fail = fail
++
++    async def send(self, message: bytes) -> None:
++        if self.fail:
++            raise ConnectionClosedError(None, None)
++        self.sent.append(message)
++
++
++def decoded(message: bytes) -> tuple[int, str, int]:
++    """Read a save request the way jupyter-collaboration's YDocWebSocketHandler does."""
++    decoder = Decoder(message)
++    return decoder.read_var_uint(), decoder.read_var_string(), decoder.read_var_uint()
++
++
++def test_the_save_message_is_jupyter_collaborations_raw_save() -> None:
++    assert RAW_MESSAGE == 2
++    assert decoded(save_message(1)) == (2, "save", 1)
++    assert decoded(save_message(300)) == (2, "save", 300)
++
++
++async def test_the_client_saves_once_the_room_answered_and_ignores_the_reply() -> None:
++    client = NhNbModelClient("ws://127.0.0.1:9/room", username="nh-agent")
++    assert await client.request_save() is False  # no connection yet: nothing to send on
++    socket = Socket()
++    reply = bytes([RAW_MESSAGE]) + b'{"type": "save", "responseTo": 1, "status": "success"}'
++    await client._on_message(socket, reply)  # the room's answer to a save: ignored
++    assert await client.request_save() is True
++    assert await client.request_save() is True
++    assert [decoded(m) for m in socket.sent] == [(2, "save", 1), (2, "save", 2)]
++
++
++class Nb:
++    """A synced room client for RtcDocument."""
++
++    def __init__(self, fail: bool = False) -> None:
++        self.saves = 0
++        self.fail = fail
++        self.synced = True
++
++    async def request_save(self) -> bool:
++        if self.fail:
++            raise ConnectionClosedError(None, None)
++        self.saves += 1
++        return True
++
++
++async def room(nb: Nb | None) -> RtcDocument:
++    doc = RtcDocument(api=None, api_path=NB)  # type: ignore[arg-type]
++    doc.nb = nb  # type: ignore[assignment]
++    doc._task = asyncio.create_task(asyncio.sleep(3600))
++    return doc
++
++
++async def test_the_document_asks_only_while_synced_and_never_fails_a_write(caplog) -> None:
++    caplog.set_level(logging.INFO, logger="nh_gateway.rtc")
++    nb = Nb()
++    doc = await room(nb)
++    try:
++        await doc.save()
++        assert nb.saves == 1
++        nb.synced = False  # the room dropped: the next write reconnects first
++        await doc.save()
++        assert nb.saves == 1
++        nb.synced, nb.fail = True, True  # the connection dropped under the request
++        await doc.save()
++        assert "save request for notebooks/01_eda.ipynb not sent" in caplog.text
++    finally:
++        assert doc._task is not None
++        doc._task.cancel()
++    await (await room(None)).save()  # never connected: nothing to do
++
++
++class WriteDoc:
++    """The backend's room for one notebook: the order of nh's writes and save requests."""
++
++    upgraded_minor = False
++
++    def __init__(self) -> None:
++        self.calls: list[str] = []
++
++    def insert(self, index: int, cells: list[NewCell]) -> None:
++        self.calls.append("insert")
++
++    def update(self, patches: list[CellPatch]) -> None:
++        self.calls.append("update")
++
++    def delete(self, ids: list[str]) -> list:
++        self.calls.append("delete")
++        return []
++
++    def set_meta(self, key: str, value: Any) -> None:
++        self.calls.append("set_meta")
++
++    async def save(self) -> None:
++        self.calls.append("save")
++
++
++@pytest.fixture
++def backend(tmp_path: Path, monkeypatch) -> Iterator[tuple[RtcBackend, WriteDoc, NotebookRef]]:
++    project = tmp_path / "proj"
++    (project / ".nh" / "state" / "running").mkdir(parents=True)
++    rtc = RtcBackend(Layout(project), ConfigCache(project))
++    doc = WriteDoc()
++
++    async def the_doc(ref: NotebookRef) -> WriteDoc:
++        return doc
++
++    monkeypatch.setattr(rtc, "_doc", the_doc)
++    ref = NotebookRef(abs_path=project / NB, api_path=NB, rel_path=NB)
++    yield rtc, doc, ref
++    rtc._pool.shutdown(wait=False)
++
++
++async def test_every_backend_write_asks_the_room_to_save_after_it(backend) -> None:
++    rtc, doc, ref = backend
++    await rtc.insert_cells(ref, -1, [NewCell(id="c", cell_type="code", source="x", metadata={})])
++    await rtc.update_cells(ref, [CellPatch(id="c", source="y")])
++    await rtc.delete_cells(ref, ["c"])
++    await rtc.set_notebook_meta(ref, "nh", {"v": 1})
++    assert doc.calls == [
++        "insert",
++        "save",
++        "update",
++        "save",
++        "delete",
++        "save",
++        "set_meta",
++        "save",
++    ]
++
++
++async def test_a_finished_run_drops_its_record_and_asks_for_a_save(backend) -> None:
++    rtc, doc, _ref = backend
++    record = rtc._running_file("c")
++    record.write_text(json.dumps({"cell_id": "c"}))
++    rtc._run_done("c", doc)  # type: ignore[arg-type]
++    assert not record.exists()
++    await asyncio.gather(*rtc._saves)
++    assert doc.calls == ["save"] and not rtc._saves
+diff --git a/tests/unit/test_shaping.py b/tests/unit/test_shaping.py
+index 0d66c2b..9714f1e 100644
+--- a/tests/unit/test_shaping.py
++++ b/tests/unit/test_shaping.py
+@@ -7,6 +7,9 @@ import hashlib
+ import io
+ import os
+ import random
++import re
++import string
++import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -16,9 +19,12 @@ from PIL import Image
+ 
+ from nh_gateway._shared import secrets
+ from nh_gateway._shared.text import clip, strip_ansi
++from nh_gateway.exec import shaping
+ from nh_gateway.exec.shaping import (
+     MAX_HTML_CHARS,
+     PNG_LIMIT,
++    TRIM_CHARS,
++    _cut,
+     _html_to_text,
+     prune_outputs_dir,
+     redact,
+@@ -27,6 +33,7 @@ from nh_gateway.exec.shaping import (
+ )
+ 
+ MARKER = "chars cut …]"
++CUT = re.compile(r"\n\[… ([\d,]+) chars cut …\]\n")
+ 
+ 
+ def shape(outputs, *, max_chars=2000, max_images=2, image_max_px=768, save_dir=None):
+@@ -637,6 +644,333 @@ def test_prune_of_a_missing_dir_is_a_no_op(tmp_path):
+     prune_outputs_dir(tmp_path / "missing")
+ 
+ 
++def test_prune_never_deletes_the_files_it_is_told_to_keep(tmp_path):
++    for i in range(5):
++        path = tmp_path / f"f{i}.txt"
++        path.write_bytes(b"x" * 10)
++        os.utime(path, (1000 + i, 1000 + i))
++    (tmp_path / "big.txt").write_bytes(b"x" * 100)
++    os.utime(tmp_path / "big.txt", (999, 999))  # the oldest, and alone over the byte cap
++
++    prune_outputs_dir(tmp_path, max_files=3, keep={"f0.txt"})
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["f0.txt", "f3.txt", "f4.txt"]
++
++    (tmp_path / "big.txt").write_bytes(b"x" * 100)
++    os.utime(tmp_path / "big.txt", (999, 999))
++    prune_outputs_dir(tmp_path, max_bytes=25, keep={"big.txt", "f3.txt"})
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["big.txt", "f3.txt"]
++
++
++def test_a_call_s_own_copies_survive_its_prune(tmp_path, monkeypatch):
++    """a7 (design §6.13): one output list with a long stream and images over the byte cap. The
++    full copy and every original it names are still there afterwards (once, the originals, older
++    than the full copy by a few ms, were pruned the moment they were written)."""
++    import nh_gateway.exec.shaping as shaping
++
++    real_prune = shaping.prune_outputs_dir
++    monkeypatch.setattr(
++        shaping, "prune_outputs_dir", lambda path, **kw: real_prune(path, max_bytes=20_000, **kw)
++    )
++    save = outputs_dir(tmp_path)
++    save.mkdir(parents=True)
++    old = save / "0123456789abcdef.txt"
++    old.write_bytes(b"x" * 100)
++    os.utime(old, (1000, 1000))
++    images = [bundle({"image/png": image_b64(300, 300, noise=True, seed=s)}) for s in range(3)]
++    shaped = shape([stream("line\n" * 3000), *images], save_dir=save)
++    assert shaped.full_path
++    full = (tmp_path / "proj" / shaped.full_path).read_text()
++    originals = [part.split("]")[0] for part in full.split("; original: ")[1:]]
++    assert len(originals) == 3
++    for name in [shaped.full_path, *originals]:
++        assert (tmp_path / "proj" / name).is_file(), name
++    assert not old.exists()  # an older call's copy makes room
++
++
++# --- trim (design §6.8) ---------------------------------------------------------------------
++
++SMALL_TRIM = 200_000  # a TRIM_CHARS the tests fill fast; the margin stays the real one
++
++
++def trim_lengths() -> tuple[int, int, int]:
++    """The head and tail a text over SMALL_TRIM keeps, and the margin."""
++    margin = shaping._trim_margin()
++    keep = SMALL_TRIM - 2 * margin
++    return int(keep * shaping.HEAD_SHARE), keep - int(keep * shaping.HEAD_SHARE), margin
++
++
++def split_copy(full: str, label: str = "[stdout]\n") -> tuple[str, int, str]:
++    """A trimmed text's head, the count in its one trim marker, and its tail."""
++    assert full.startswith(label), full[:80]
++    [match] = CUT.finditer(full)
++    return (
++        full[len(label) : match.start()],
++        int(match.group(1).replace(",", "")),
++        full[match.end() :],
++    )
++
++
++def result_output(shaped) -> str:
++    return shaped.text.rsplit("\n[full output: ", 1)[0]
++
++
++def grams(text: str, size: int = 6) -> set[str]:
++    return {text[i : i + size] for i in range(len(text) - size + 1)}
++
++
++def test_a_50_mb_stream_is_cleaned_only_up_to_the_cap(tmp_path, monkeypatch):
++    install_secret(tmp_path)
++    redactor = secrets.current()
++    cleaned: list[int] = []
++    redacted: list[int] = []
++    real_terminal, real_redact = shaping.terminal_text, redactor.redact
++
++    def terminal(text):
++        cleaned.append(len(text))
++        return real_terminal(text)
++
++    def spy(text):
++        redacted.append(len(text))
++        return real_redact(text)
++
++    monkeypatch.setattr(shaping, "terminal_text", terminal)
++    monkeypatch.setattr(redactor, "redact", spy)
++    line = "epoch 12/100 - loss: 0.2345 - acc: 0.9123 - see https://example.com/x?a=1\n"
++    raw = line * (50_000_000 // len(line)) + f"done {PASSWORD}\n"
++    shaped = shape([stream(raw)], save_dir=outputs_dir(tmp_path))
++
++    first_line = shaping.FIRST_LINE_WINDOW + redactor.margin  # the summary's text_head window
++    assert sum(cleaned) <= TRIM_CHARS + first_line, sum(cleaned)
++    assert sum(redacted) <= TRIM_CHARS + first_line, sum(redacted)
++    assert shaped.truncated and shaped.full_path is not None
++    full = (tmp_path / "proj" / shaped.full_path).read_text()
++    assert len(full) <= TRIM_CHARS and PASSWORD not in full
++    head, count, tail = split_copy(full)
++    assert raw.startswith(head + "\n") and tail.endswith("\ndone [redacted:DB_PASSWORD]")
++    assert count == len(raw) - 1 - len(head) - len(tail)  # the raw length minus what is kept
++    # The result counts the real total: what its own cut and the trim left out.
++    output = result_output(shaped)
++    assert len(shaped.text) <= 2000
++    [match] = CUT.finditer(output)
++    shown_head, shown_tail = output[len("[stdout]\n") : match.start()], output[match.end() :]
++    shown = int(match.group(1).replace(",", ""))
++    assert shown == len(raw) - 1 - len(shown_head) - len(shown_tail)
++    assert shown_tail.endswith("done [redacted:DB_PASSWORD]")
++
++
++def test_the_trim_keeps_whole_lines_of_the_head_and_tail(tmp_path, monkeypatch):
++    monkeypatch.setattr(shaping, "TRIM_CHARS", SMALL_TRIM)
++    raw = "".join(f"line {i}\n" for i in range(300_000))
++    shaped = shape([stream(raw)], save_dir=outputs_dir(tmp_path))
++    head_len, tail_len, _ = trim_lengths()
++
++    full = (tmp_path / "proj" / shaped.full_path).read_text()
++    head, count, tail = split_copy(full)
++    assert raw.startswith(head + "\n") and raw.endswith("\n" + tail + "\n")
++    assert head_len - 20 <= len(head) <= head_len and tail_len - 20 <= len(tail) <= tail_len
++    assert count == len(raw) - 1 - len(head) - len(tail)
++    assert shaped.truncated
++
++
++def test_the_cap_is_where_the_trim_starts(tmp_path, monkeypatch):
++    monkeypatch.setattr(shaping, "TRIM_CHARS", SMALL_TRIM)
++    for size, cut in ((SMALL_TRIM, False), (SMALL_TRIM + 1, True)):
++        raw = ("row\n" * size)[:size]
++        shaped = shape([stream(raw)], save_dir=outputs_dir(tmp_path))
++        full = (tmp_path / "proj" / shaped.full_path).read_text()
++        assert (CUT.search(full) is not None) is cut
++        if not cut:
++            assert full == "[stdout]\n" + raw.rstrip("\n")
++
++
++def test_a_text_within_the_real_cap_is_kept_whole(tmp_path):
++    line = "row 12345 ok\n"
++    raw = line * (TRIM_CHARS // len(line))
++    shaped = shape([stream(raw)], save_dir=outputs_dir(tmp_path))
++    full = (tmp_path / "proj" / shaped.full_path).read_text()
++    assert full == "[stdout]\n" + raw.rstrip("\n")
++    assert Path(shaped.full_path).stem == hashlib.sha256(full.encode()).hexdigest()[:16]
++
++
++def pem_block(rng: random.Random, lines: int) -> tuple[str, list[str]]:
++    body = [fake(rng, 64, string.ascii_letters + string.digits + "+/") for _ in range(lines)]
++    key = "\n".join(["-----BEGIN RSA PRIVATE KEY-----", *body, "-----END RSA PRIVATE KEY-----"])
++    return key, body
++
++
++def fake(rng: random.Random, size: int, alphabet: str = string.ascii_letters + string.digits):
++    return "".join(rng.choice(alphabet) for _ in range(size))
++
++
++def edge_secret(kind: str) -> tuple[str, list[str]]:
++    """A secret to plant, and the parts of it no output may show any 6 chars of."""
++    rng = random.Random(kind)
++    if kind == ".env value":
++        return PASSWORD, [PASSWORD]
++    if kind == "github token":
++        token = "ghp_" + fake(rng, 36)
++        return token, [token]
++    if kind == "private key":
++        return pem_block(rng, 26)
++    if kind == "private key over 8 KB":  # its END line is past PEM_OPEN_MAX_CHARS
++        return pem_block(rng, 190)
++    password = fake(rng, 20)
++    return f"postgresql://app:{password}@db.example.com/prod", [password]
++
++
++EDGE_KINDS = [".env value", "github token", "private key", "private key over 8 KB", "userinfo"]
++EDGES = ["head cut", "head window end", "tail cut", "tail window start"]
++
++
++@pytest.mark.parametrize("edge", EDGES)
++@pytest.mark.parametrize("kind", EDGE_KINDS)
++def test_a_secret_across_a_trim_edge_is_redacted_whole(tmp_path, monkeypatch, kind, edge):
++    """One long line (nothing to snap to), the secret over each edge at several offsets."""
++    install_secret(tmp_path)
++    monkeypatch.setattr(shaping, "TRIM_CHARS", SMALL_TRIM)
++    secret, parts = edge_secret(kind)
++    head_len, tail_len, margin = trim_lengths()
++    size = 2 * SMALL_TRIM
++    at = {
++        "head cut": head_len,
++        "head window end": head_len + margin,
++        "tail cut": size - tail_len,
++        "tail window start": size - tail_len - margin,
++    }[edge]
++    fill = ". " * SMALL_TRIM
++    secret_grams = set().union(*(grams(part) for part in parts))
++    for before in (1, len(secret) // 2, len(secret) - 1):  # chars of it before the edge
++        start = at - before
++        raw = fill[:start] + secret + fill[start + len(secret) :]
++        save = outputs_dir(tmp_path) / f"{before}"
++        shaped = shape([stream(raw)], max_chars=SMALL_TRIM, save_dir=save)
++        full = (save / Path(shaped.full_path).name).read_text()
++        split_copy(full)  # trimmed, with one marker
++        assert "[full output: " in shaped.text and CUT.search(shaped.text)  # shown whole
++        for where, text in (("result", shaped.text), ("full copy", full)):
++            leaked = secret_grams & grams(text)
++            assert not leaked, (kind, edge, before, where, sorted(leaked)[:3])
++
++
++def test_texts_the_cap_can_t_share_are_left_out_from_the_middle(tmp_path, monkeypatch):
++    monkeypatch.setattr(shaping, "TRIM_CHARS", 1_000_000)
++    monkeypatch.setattr(shaping, "TRIM_MIN_SHARE", 150_000)
++    streams = [
++        stream((f"out {i:02d}\n" + "x\n" * 75_000)[:150_000], "stdout" if i % 2 else "stderr")
++        for i in range(30)
++    ]
++    outputs = [
++        *streams[:10],
++        error("ValueError", "boom", ["ValueError: boom"]),
++        *streams[10:15],
++        bundle({"image/png": image_b64(20, 20)}),
++        *streams[15:],
++    ]
++    shaped = shape(outputs, save_dir=outputs_dir(tmp_path))
++    full = (tmp_path / "proj" / shaped.full_path).read_text()
++
++    # The first three and the last three stay whole, and the error; each run between is a line.
++    for i in (0, 1, 2, 27, 28, 29):
++        assert f"out {i:02d}\n" in full
++    for i in range(3, 27):
++        assert f"out {i:02d}\n" not in full
++    runs = [int(n.replace(",", "")) for n in re.findall(r"(?m)^\[… ([\d,]+) chars cut …\]$", full)]
++    assert runs == [7 * 150_000, 5 * 150_000, 12 * 150_000]
++    assert "[error] ValueError: boom" in full and "[image 1: 20x20 png]" in full
++    assert full.index("[error]") < full.index("[image 1") < full.index("out 27")
++    assert len(shaped.text) <= 2000
++    # A result that leaves out a run counts every output the run stands for.
++    text = shape(outputs, max_chars=600).text
++    [more] = re.findall(r"\[… (\d+) more outputs not shown …\]", text)
++    shown = sum(f"out {i:02d}\n" in text for i in range(30)) + ("[image 1" in text)
++    shown += sum(count for chars, count in RUNS.items() if f"[… {chars} chars cut …]" in text)
++    assert int(more) == 31 - shown and int(more) > 10, text
++
++
++RUNS = {"1,050,000": 7, "750,000": 5, "1,800,000": 12}  # the runs above: their chars, outputs
++
++
++def test_a_long_error_is_trimmed_and_keeps_its_line(tmp_path, monkeypatch):
++    install_secret(tmp_path)
++    monkeypatch.setattr(shaping, "TRIM_CHARS", SMALL_TRIM)
++    evalue = "bad value: " + "v" * 1_000_000 + f" {PASSWORD}"
++    frames = ["Cell In[3], line 2\n----> 2 check(x)\n", f"ValueError: {evalue}"]
++    shaped = shape([error("ValueError", evalue, frames)], save_dir=outputs_dir(tmp_path))
++
++    assert shaped.error is not None and shaped.error.line == 2
++    assert CUT.search(shaped.error.evalue) and CUT.search(shaped.error.traceback)
++    full = (tmp_path / "proj" / shaped.full_path).read_text()
++    assert len(full) < SMALL_TRIM + 1000
++    for text in (full, shaped.text, shaped.error.evalue, shaped.summary.error or ""):
++        assert PASSWORD[:8] not in text
++    assert shaped.summary.error.startswith("ValueError: bad value: vvv")
++    assert len(shaped.text) <= 2000
++    counts = [int(n.replace(",", "")) for n in CUT.findall(shaped.text)]
++    assert counts and max(counts) > 1_000_000  # the result counts what the trims left out
++
++
++def test_the_error_summary_cleans_a_long_value_within_its_share(tmp_path, monkeypatch):
++    install_secret(tmp_path)
++    redactor = secrets.current()
++    scanned: list[int] = []
++    real = redactor.redact
++
++    def spy(text):
++        scanned.append(len(text))
++        return real(text)
++
++    monkeypatch.setattr(redactor, "redact", spy)
++    summary = summarize_outputs([error("ValueError", "bad " + "v" * 5_000_000, [])])
++    assert sum(scanned) <= shaping.TRIM_MIN_SHARE + 4096  # and error_summary's own head window
++    assert summary.error is not None and summary.error.startswith("ValueError: bad vvv")
++
++
++def test_a_cut_never_shows_part_of_a_trim_marker():
++    marker = "[… 5,000,000 chars cut …]"
++    text = "a\n" + marker + "\n" + "b" * 300
++    out = _cut(text, 80, [(marker, 5_000_000)])  # the head would end inside the marker
++    [match] = CUT.finditer(out)
++    head, tail = out[: match.start()], out[match.end() :]
++    assert head == "a\n" and text.endswith(tail) and "chars cut" not in head + tail
++    left_out = len(text) - len(head) - len(tail) - len(marker)  # the marker stands for its count
++    assert int(match.group(1).replace(",", "")) == left_out + 5_000_000
++
++
++@pytest.mark.parametrize("inside", [1, 5, 12, 21])  # in "[redacted:", in the name, before "]"
++def test_a_trim_cut_never_splits_a_redaction_marker(inside):
++    text = "x" * 100 + "[redacted:DB_PASSWORD]" + "y" * 100  # one line: no break to snap to
++    at = 100 + inside
++    assert shaping._head_end(text, at) == 100  # the head leaves the marker out
++    assert shaping._tail_start(text, at) == 122  # the tail starts after it
++    assert shaping._head_end(text, 100) == 100 and shaping._tail_start(text, 122) == 122
++
++
++def test_html_is_cut_at_its_share_after_redaction(tmp_path):
++    install_secret(tmp_path)
++    markup = "<p>" + "x" * 990 + PASSWORD + "</p>" + "<p>more</p>" * 100
++    text = _html_to_text(markup, 1000)
++    assert text.endswith("[… HTML cut …]") and PASSWORD[:4] not in text
++
++
++def test_the_trim_s_cost_does_not_grow_with_the_output(tmp_path, monkeypatch):
++    """Relative, not a wall clock: 8 times the output costs about the same once trimmed."""
++    install_secret(tmp_path)
++    monkeypatch.setattr(shaping, "TRIM_CHARS", 1_000_000)
++    line = f"epoch 1 - loss 0.25 - token=abc123def456 - db {PASSWORD}\n"
++
++    def best(size: int) -> float:
++        outputs = [stream(line * (size // len(line)))]
++        times = []
++        for _ in range(3):
++            began = time.perf_counter()
++            shape(outputs)
++            times.append(time.perf_counter() - began)
++        return min(times)
++
++    small, large = best(2_000_000), best(16_000_000)
++    assert large < 3 * small, (small, large)
++
++
+ # --- the budget always holds ----------------------------------------------------------------
+ 
+ _texts = st.text(alphabet=st.characters(codec="utf-8"), max_size=3000)
