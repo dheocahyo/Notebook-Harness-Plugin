@@ -291,7 +291,7 @@ class EventLog:
 - **`NO_PROXY` is set before import.**
 
 **RTC**
-- `NhNbModelClient(NbModelClient)`: awareness messages are applied.
+- `NhNbModelClient(NbModelClient)`: awareness messages are applied; save requests go on run()'s own send queue; a normal close of the room connection ends run() (§6.13).
 - `RtcDocument.ensure()`: a `run()` task plus `wait_until_synced()` with an 8 s cap, else E135. A reconnect bumps `generation`.
 - **Inside `with nb._lock:` touch only `nb._doc.ycells`, `ycell[...]`, `nb._doc._ymeta` and `len(nb)`. Never a public `NotebookModel` method.**
 - Insert = `create_ycell(nbformat.v4.new_*_cell(..., id=, metadata=))` + ONE `nb._doc._ydoc.transaction(origin=nb._changes_origin)`.
@@ -300,6 +300,7 @@ class EventLog:
 **Kernel**
 - Attach per call: sessions lookup (UUID race wait, most connections), POST if missing (501 fallback).
 - Clients: `JupyterKernelClient(server_url=, token=, kernel_id=, username="nh-agent")`. If `has_kernel` is false, raise E134. Assert `channels_running`. Stop with `stop(shutdown_kernel=False)`. **Two clients per kernel: exec and probe.**
+- websocket-client's UTF-8 check of text frames is `kernel.validate_utf8`, installed only where its private name is as expected (§6.13).
 - Do NOT use `execute_interactive`. Use our own request loop on the client's channels:
   1. flush with `client.iopub_channel.get_msgs()`;
   2. `msg_id = client.execute(code, silent=, store_history=, allow_stdin=False, stop_on_error=False)`;
@@ -1519,3 +1520,189 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
 - Raw vs redacted: with the fake backend, the notebook, the history and a cell view's `base_sha` hold the raw value while the tool result and the `.nh/outputs` copy hold the marker, and the ledger holds no raw text. An integration test (`tests/integration/test_redaction.py`, marked `integration`) shows the same against a real JupyterLab: the `.ipynb` and the RTC document are raw, the tool result is redacted, and a cell that prints the discovered Jupyter token (built from two halves) shows `[redacted:JUPYTER_TOKEN]`.
 
 **Perf** (hooks, 3 warm-ups and 50 interleaved runs, C2 vs C3, p50/p95 in ms): through the shim, on a project with a 30-value `.env`, a goal and a last cell: system 3.9 prompt-submit 112.1/119.9 → 114.0/121.1, session-start 133.0/140.6 → 134.3/144.8; server venv 3.13 prompt-submit 79.9/84.4 → 81.0/87.0, session-start 99.0/108.8 → 101.5/110.2. A second run: p50 up 1.8 to 3.3 ms, every C3 p95 at most 141.0 ms. All under the 150 ms budget. Before the keyed regexes were compiled lazily, system 3.9 session-start reached 150.9 ms at p95.
+
+### 6.13 a7, a8 and drift issue filing
+
+Chunk C12 (plan D13), built early as C12-early: a7, a8, the drift.yml issue job and the ci.yml artifact glob. The rest of C12 (README, troubleshooting pass, acceptance) comes later. a7 and a8 each exposed gateway bugs, fixed minimally here: a8 the unsaved room (`backend/rtc.py`, `backend/rtc_backend.py`; while testing it, C12's review found that a normal close of the room connection froze the gateway, from v0.1, fixed in `backend/rtc.py` too), a7 the kernel websocket's pure-Python UTF-8 check (`backend/kernel.py`) and the prune that deleted a call's own image originals (`exec/shaping.py`). a7 also measured V11's 50 MB stream over the 1.5 s budget on this machine, so V11's fallback, the trim, is built here too (`exec/shaping.py`; designed in design.md §6.8 Trim, directly). Tests: `tests/integration/test_large_outputs.py` (new, a7), `tests/integration/test_lab_restart.py` (new, a8), `tests/integration/conftest.py`, `tests/integration/test_rtc_document.py`, `tests/unit/test_rtc_save.py` (new), `tests/unit/test_kernel_utf8.py` (new), `tests/unit/test_shaping.py`. Also `.github/workflows/drift.yml`, `.github/workflows/ci.yml` and `spikes/RESULTS.md`. No new code in §6.0 d, no model-facing text: the trim reuses nh's `[… N chars cut …]` marker.
+
+**a7: very large outputs** (`tests/integration/test_large_outputs.py`)
+- **Its own JupyterLab**, started with `--ZMQChannelsWebsocketConnection.iopub_data_rate_limit=1e10`. At jupyter_server's default (1 MB/s over a 3 s window) the server drops any stream message over 3 MB before it reaches a client, nh or the user's tab, and sends "IOPub data rate exceeded" on stderr instead: with a default server nothing that large reaches nh. So a7 measures the case where the user raised the limit, as users do when they print this much.
+- **Project:** V11's ~30-value `.env` (secret names, 16-45 chars), the gateway (MCP over `RtcBackend`), an observer peer for the user's tab. A first message adds a helpers cell, so the kernel is up and the gateway warm. That cell also registers IPython `pre_run_cell`/`post_run_cell` hooks that append each later cell's own run time to a file (nh's probes run silent and don't count).
+- **Cases**, each a cell added in one message and re-run in the next ones:
+
+| Case | Cell | Calls | Budgeted |
+|---|---|---|---|
+| 50 MB stream | ten 5 MB prints of V11's log line; the `.env` value `DB_PASSWORD` ends each, and a GitHub token follows it in the fifth and the last (so the trimmed copy keeps one) | 10 (add, 9 re-runs) | yes |
+| 20 MB image bundle | a short stream holding `DB_PASSWORD`, then four noise PNGs: base64 of ~5.67 MB (over the bundle cap), then three of ~4.80 MB | 10 | yes |
+| Both in one cell | the stream, then the images. Before the trim its full copy (~50 MB) and image originals (~15 MB) were over `.nh/outputs`' 50 MiB cap together (see pruned originals below); trimmed (~8 MB and ~15 MB) they are under it, so `test_shaping.py` keeps that case | 10 | no, reported since C12's review: it does both cases' work in one call (a trimmed stream, four image decodes and resizes, 15 MB of originals) and the room's saves of a 12 MB notebook; 6.8's budget names V11's two cases apart. Its turn overhead in the review's three runs: 1.24-1.58 s, p95 1.577, 1.563 and 1.490 s; after its second round of fixes 1.22-1.50 s, p95 1.503 s at load ~4 (Known gaps) |
+
+- **Checks**, in the room (the observer) and in the saved `.ipynb`:
+
+| Cap (`exec/docsafe.py`) | Holds |
+|---|---|
+| Stream tail, `STREAM_KEEP_CHARS` (1 MB) | "[nh: N earlier characters of this output were not saved in the notebook]", then at most 1 MB of the raw tail, ending with the last line (the notebook keeps the secret: 6.8) |
+| Bundle, `BUNDLE_MAX_CHARS` (5 MB) | the 5.67 MB image is "[nh: this output (5.4 MB) is too large to save in the notebook]", with no image data |
+| Cell, `CELL_MAX_CHARS` (8 MB) | the second image is kept (≤ 5 MB); the third and fourth are one stderr notice, "[nh: 2 more output(s) were not saved; this cell's output is over 8 MB]"; the outputs' `approx_size` sum ≤ 8 MB |
+
+  The combined cell holds the capped stream (its tail ends with the images' first line), then the same three. The disk check waits for JupyterLab's last save: a save made while the cell ran holds that moment's outputs.
+- **Checks on what Claude sees:**
+
+| What | Holds |
+|---|---|
+| The output section | ≤ `[output] max_chars` (2000), last line `[full output: .nh/outputs/<sha16>.txt]` |
+| Images | "[image 1: 1190x1190 png, sent at 768x768]", "[image 2: …, sent at 768x768]", "[image 4: …, not sent (limit 2)]"; two images attached (`max_images`) |
+| Originals | every "original: .nh/outputs/<sha16>.png" the full copy names is on disk (4 per call) |
+| The trim (6.8) | the full copy holds at most `TRIM_CHARS` of the stream and one `[… N chars cut …]` line: the kept head and tail are the raw stream's (rebuilt in the test) as printed, but for each planted secret; N is the raw chars neither window holds plus what each window cleaned but didn't keep, which here (no secret near a cut) is the stream's raw length minus what is kept, secrets restored; the result's own marker counts what the copy holds, its trim marker as its N, less what the result shows |
+| Redaction (C3) | no planted value or token in the result or the full copy; every one the trim keeps is its marker; the shown text ends "part 9 db [redacted:DB_PASSWORD] key [redacted:github-token]", and "four figures, db [redacted:DB_PASSWORD]" for the images |
+
+- **Time, per call:**
+
+| Measure | Is | Budget |
+|---|---|---|
+| Turn overhead | call wall time − the run's `exec.ms` (its `cell_added`/`cell_rerun` event: from nh seeing the kernel start the cell until nh holds every output, the final flush included): the pre-run work (kernel status and attach probe, snapshot, lint, insert, the before-probe), the post-run work (the after-probe, `shape_outputs` with its redaction and full copy, render) and the MCP round trip. V11 timed the same work as `harness_ms` plus `shape_outputs`. It is not what `nhctl metrics` reports for these calls: the event's `harness_ms` is the pre-run part only (`tools/write.py` computes it before `_wait`), and `nhctl metrics` reads that field first, falling back to total − exec only for events without it. Here `harness_ms` is 75-127 ms, a tenth or less of the overhead | p95 ≤ 1.5 s (6.8) |
+| Receive path | `exec.ms` − the kernel's own run time: the outputs travelling kernel → JupyterLab → nh's kernel websocket → nh's output hook. Outside V11's measure, so held to the same 1.5 s on its own | p95 ≤ 1.5 s |
+| Call − kernel | the two together, printed | — |
+
+  p95 is by nearest rank, over 10 calls: the max of the 10 (V11's p95 over 10 runs was its max too). The test also prints `shape_outputs`' own time (what V11 timed), `harness_ms` and the load average. 31 calls (a warm-up, then 10 per case); C12's review timed the file at 79-132 s on this machine, its JupyterLab's start included, varying with the load other builds put on it (81-84 s in its four runs of the fixed trim). The two V11 cases are budgeted; the combined one is printed as "not budgeted".
+- **Logs:** the test has the gateway log at INFO into the project's `.nh/logs/gateway.log` (WARNING and up otherwise; CI keeps it as an artifact), with each REST call that takes `SLOW_REST_S` (1 s) or more: its method, path, time and outcome. The report lists those calls, or says "no REST call took 1.0s or more". A ~5 s pre-run stall (`harness_ms` ~5050, `rest.TIMEOUT`) was seen in 2 of 9 runs during C12's review, cause not found; one such call fails the budget. A stall outside REST (the room's sync, the kernel websocket's connect) is not logged.
+- **Measured with the trim** (design §6.8 Trim, `TRIM_CHARS` 8,000,000), per call: three runs alone, each started once the 1-minute load was under 1.5 (other workflows share this machine; in the first they came back and the load rose to 4.4), one in the full integration suite, and a first try at load 4.7-5.9; then C12's review's three runs after its first round of fixes (the fixed trim, and the save request on run()'s queue) (review 1-3: the first two with the combined case still budgeted, so they failed on it alone; the third with it reported); then one after the review's second round of fixes (fix 2), with other builds keeping the load near 4. Load is what the test printed during the case:
+
+| Case | Run (load) | Turn overhead (s) | p95 (s) | `shape_outputs` (s) | Receive p95 (s) |
+|---|---|---|---|---|---|
+| 50 MB stream | alone 1 (1.2-2.3) | 0.50-0.60 | 0.604 | 0.25-0.32 | 0.727 |
+| 50 MB stream | alone 2 (1.4-1.5) | 0.48-0.57 | 0.568 | 0.26-0.32 | 0.434 |
+| 50 MB stream | alone 3 (1.5-1.7) | 0.48-0.55 | 0.553 | 0.25-0.31 | 0.437 |
+| 50 MB stream | full suite (1.5-1.7) | 0.47-0.57 | 0.567 | 0.25-0.31 | 0.436 |
+| 50 MB stream | first try (4.7-5.3) | 0.58-0.79 | 0.788 | 0.30-0.44 | 0.870 |
+| 50 MB stream | review 1 (1.8-2.3) | 0.60-0.75 | 0.749 | 0.31-0.43 | 0.606 |
+| 50 MB stream | review 2 (2.0-2.5) | 0.63-0.85 | 0.854 | 0.33-0.51 | 0.592 |
+| 50 MB stream | review 3 (1.7-2.5) | 0.59-0.77 | 0.771 | 0.32-0.42 | 0.611 |
+| 50 MB stream | fix 2 (3.9-4.2) | 0.63-0.81 | 0.812 | 0.32-0.47 | 1.041 |
+| 20 MB image bundle | alone 1 (2.3-3.1) | 0.62-0.92 | 0.923 | 0.35-0.51 | 0.121 |
+| 20 MB image bundle | alone 2 (1.5-1.9) | 0.59-0.73 | 0.731 | 0.35-0.43 | 0.094 |
+| 20 MB image bundle | alone 3 (1.6) | 0.62-0.71 | 0.712 | 0.34-0.43 | 0.103 |
+| 20 MB image bundle | full suite (1.6) | 0.62-0.80 | 0.797 | 0.36-0.46 | 0.118 |
+| 20 MB image bundle | first try (5.3) | 0.64-0.80 | 0.802 | 0.37-0.47 | 0.230 |
+| 20 MB image bundle | review 1 (2.4-2.6) | 0.72-1.12 | 1.120 | 0.42-0.72 | 0.126 |
+| 20 MB image bundle | review 2 (2.3-2.5) | 0.72-1.00 | 1.001 | 0.41-0.60 | 0.117 |
+| 20 MB image bundle | review 3 (2.3-2.5) | 0.76-0.92 | 0.924 | 0.42-0.57 | 0.154 |
+| 20 MB image bundle | fix 2 (4.0-4.1) | 0.73-0.88 | 0.879 | 0.40-0.59 | 0.208 |
+| Both in one cell | alone 1 (3.1-4.4) | 0.97-1.27 | 1.274 | 0.60-0.81 | 0.305 |
+| Both in one cell | alone 2 (2.0-2.2) | 0.98-1.09 | 1.085 | 0.59-0.74 | 0.131 |
+| Both in one cell | alone 3 (1.6-2.1) | 0.94-1.10 | 1.102 | 0.59-0.69 | 0.210 |
+| Both in one cell | full suite (1.7-2.1) | 0.97-1.22 | 1.223 | 0.62-0.77 | 0.221 |
+| Both in one cell | first try (5.5-5.9) | 1.16-1.92 | 1.919: over | 0.72-1.30 | 0.517 |
+| Both in one cell | review 1 (2.2-2.4) | 1.26-1.58 | 1.577 (then over) | 0.79-1.03 | 0.328 |
+| Both in one cell | review 2 (2.4-2.5) | 1.24-1.56 | 1.563 (then over) | 0.77-1.00 | 0.243 |
+| Both in one cell | review 3 (2.3-3.0) | 1.29-1.49 | 1.490 (reported) | 0.77-0.94 | 0.159 |
+| Both in one cell | fix 2 (3.9-4.2) | 1.22-1.50 | 1.503 (reported) | 0.75-0.93 | 0.528 |
+
+  The first four runs passed, with every check; the review's three held every check, the first two failing only the combined case's budget then; fix 2's passed (84 s, no REST call of 1 s or more). `harness_ms` 81-168 ms (84-161 in the review's runs); kernel time 0.39-0.58 s (stream), 0.35-0.46 s (images), 0.76-0.98 s (both) in the first four. A trimmed stream's turn overhead besides `shape_outputs` was ~0.25-0.3 s in the first four runs and 0.26-0.39 s in the review's four (0.40-0.60 s for the combined case): design §6.8 counts on the stream's when it chooses the cap.
+- **Measured before the trim**, after the two fixes below (same machine), per call; three runs alone (load 0.4-1.6), then one in the full integration suite (load 3.1-5.0):
+
+| Case | Run | Kernel (s) | Receive (s) | Turn overhead (s) | `shape_outputs` (s) | p95 (s): turn overhead; receive |
+|---|---|---|---|---|---|---|
+| 50 MB stream | alone | 0.38-0.56 | 0.23-0.49 | 1.94-2.51 | 1.70-2.26 | 2.376, 2.505, 2.326: over; 0.413, 0.490, 0.420 |
+| 50 MB stream | full suite | 0.38-0.55 | 0.32-0.59 | 2.02-2.68 | 1.75-2.35 | 2.681: over; 0.586 |
+| 20 MB image bundle | alone | 0.36-0.47 | 0.06-0.11 | 0.62-0.79 | 0.35-0.48 | 0.718, 0.737, 0.786; 0.092, 0.111, 0.093 |
+| 20 MB image bundle | full suite | 0.38-0.51 | 0.03-0.13 | 0.68-0.82 | 0.37-0.45 | 0.820; 0.125 |
+| Both in one cell | alone | 0.75-0.95 | 0.08-0.14 | 2.81-3.19 | 2.35-2.74 | (not budgeted) |
+| Both in one cell | full suite | 0.92-1.08 | 0.23-0.30 | 3.61-3.62 | 3.04-3.14 | (not budgeted) |
+
+  `harness_ms` 82-110 ms. V11's own bench (`spikes/v0.2/v11_redaction.py`, its 50 MB stream case) on this machine: `shape_outputs` with the `.env` 2010/2285 ms p50/p95 at load ~6 and 2039/2462 ms at load ~1.6; redaction off 880/1263 and 913/1216 ms; against 946/976 and 356/361 ms on V11's machine (macOS arm64, Python 3.13.8). A profile of one 50 MB `shape_outputs` here: `terminal_text` 0.47 s, `redact` 0.94 s, writing the copy 0.25 s, its sha256 0.13 s; no step runs twice. So V11's own case is over 1.5 s on this machine, under load or not: it runs the gateway's shaping about 2.1-2.5 times slower. The RTC path adds nothing to it: `shape_outputs` is ~85-90% of a7's turn overhead.
+- **Found: the receive path.** Before the fix the 50 MB stream's `exec.ms` was 10.6-12.3 s for a cell the kernel ran in ~0.45 s, and the image bundle's 4.4-5.1 s for ~0.4 s: websocket-client checks every text frame's UTF-8 in a pure-Python loop (~0.19 s per MB) unless `wsaccel` is installed, and jupyter-kernel-client runs it without `skip_utf8_validation`. It ran on the gateway's receive thread and held the GIL. V11's measure left all of it out.
+- **Fix:**
+
+| Where | Change |
+|---|---|
+| `backend/kernel.validate_utf8(data)` | websocket-client's check by the C decoder: `codecs.utf_8_decode(data, "strict", False)`, then the cut tail's second byte against RFC 3629's narrower ranges (E0, ED, F0, F4), since CPython's incremental decoder lets a cut surrogate (`ED A0`-`ED BF`) through; a `str` is encoded with `surrogatepass` first, as websocket-client does. Its answers are websocket-client's own, input for input: False from the first byte that can't continue UTF-8 (overlong forms, surrogates, past U+10FFFF, stray continuation bytes), True for valid text and for a sequence cut at the end, which `WebSocketApp`'s decode of a text frame then refuses and its decode of a close reason replaces with U+FFFD, as before. A call it doesn't know (other arguments, or data that isn't bytes, bytearray, str or a contiguous byte memoryview) goes to websocket-client's own check, logged once |
+| `kernel.install_utf8_check()`, at import | puts it in `websocket._abnf.validate_utf8`, the name websocket-client's frame reader (`continuous_frame.extract`, and `ABNF.validate` for close frames) calls, only when both modules import (any exception there is caught) and that name is still `websocket._utils.validate_utf8`. Otherwise it returns the reason, the gateway keeps websocket-client's own check (only slower), and `open_client` logs it once at warning (`kernel.note_utf8_check`; gateway.log is open by then). Only jupyter-kernel-client uses websocket-client in the gateway (the room client uses `websockets`) |
+
+  After: receive 0.23-0.49 s for the 50 MB stream, 0.06-0.11 s for the image bundle; a7's runtime went from ~77 s (3 + 5 calls) to ~60 s (22 calls, as a7 was then). Proof of the answers (C12's review fixes): over 5,477,952 inputs (every 1- and 2-byte string, every 3-byte one with a lead byte C0-FF, 4-byte ones with leads F0-F7 and continuation or edge bytes after, 200,000 random, cut, flipped and spliced ones; `str`, bytearray and memoryview), `validate_utf8` and websocket-client 1.9.2's check differ on none; close frames through `ABNF.validate` agree too (a reason cut mid-sequence is accepted by both). 10.1 MB took 38-45 ms, websocket-client's loop 230-255 ms per MB. `test_kernel_utf8.py` pins it: the frame reader calls whatever `websocket._abnf.validate_utf8` holds (a recording stand-in sees a text frame and a close reason), the answers equal websocket-client's on every 1- and 2-byte input and on 3- and 4-byte ones with the narrowing leads, and a renamed or missing module leaves websocket-client's check in place and is logged once. The drift job runs it (and `test_rtc_save.py`) against the latest releases, so a rename fails a named test, not only a7's receive budget.
+- **Found: pruned originals.** With both in one output list, `prune_outputs_dir` (50 MiB) kept the newest file, the ~50 MB full copy, and deleted the call's four image originals the moment they were written: the full copy named four files that were gone.
+- **Fix:** `prune_outputs_dir(..., *, keep=())`: the files named in `keep` sort first, count toward the caps, and are never deleted. `shape_outputs` passes what it just wrote (the originals and the full copy), so older calls' files make room. A call's own copies over 50 MiB together now stay until a later call's prune.
+- **Found: V11's own case is over the budget here** (Measured before the trim, above). **Fix:** V11's fallback, the trim (design §6.8 Trim): one call cleans, redacts and keeps at most 8,000,000 raw chars of text, each long text's head (30%) and tail (70%) from windows that reach a margin past each cut, with `[… N chars cut …]` between. V11's bench on this machine, 50 MB stream with the `.env`: 2044/2140 → 261/284 ms p50/p95. a7's checks follow the trimmed copy: its head and tail are the raw stream's as printed but for the planted secrets, which are their markers wherever they are kept, and its marker's N is the rest.
+
+**a8: JupyterLab restarts mid-run** (`tests/integration/test_lab_restart.py`)
+- **Scenario:** its own JupyterLab, a project, the gateway, an observer. Message 1 adds a cell (ok) with the default soft timeout (100 s): its call also starts the kernel and connects nh. Message 2 adds a cell that prints every 0.1 s for a minute; with `soft_timeout_s = 5` (written to `harness.toml` before it) the call returns "still running". JupyterLab gets SIGTERM: it deletes its rooms and has its kernel shut down (the kernel is gone ~0.3 s later, its connection file ~0.5 s later), but with nh connected and a cell running it doesn't exit. `_stop(proc, runtime=…)` SIGKILLs its process group once no kernel connection file is left (it used to wait 15 s). jupyter_client starts kernels in a session of their own, outside that group. JupyterLab then starts again as the same server: root, runtime dir, port and token.
+- **Two variants** (`ystore` parameter):
+
+| Variant | Restart | What it catches |
+|---|---|---|
+| `same-ystore` | same directory: the rebuilt room loads the YStore, then the file where they differ ("out-of-sync … loaded from file") | the unsaved cells (below) |
+| `fresh-ystore` | `.jupyter_ystore.db*` deleted first, as when JupyterLab starts from another directory: the room loads the file alone | nh merging a stale copy of the notebook into the new room: with the same YStore the room already holds those items and the merge changes nothing (review's mutation: `same-ystore` passed, `fresh-ystore` found 11 ids, 9 unique) |
+
+  `test_backend_review.py` already covers a new token or port at the backend level with no running cell, and `test_kernel_exec.py` a kernel restart mid-run.
+- **Found:** in 4 of 7 runs, the restarted room held the title and message 3's cells only; the cells of messages 1 and 2, which nh had reported written, were gone. jupyter-collaboration 5.0.4:
+
+| Behaviour | Effect |
+|---|---|
+| Autosave: each change cancels the pending save and waits `document_save_delay` (1 s by default, 0.5 s in the tests) again | while a cell's outputs flow in (nh flushes every 200 ms, `flusher.PERIOD_S`), nothing is saved: not the outputs, and not the cells nh or anyone else added since the last quiet moment |
+| Shutdown stops the rooms and cancels the pending save | no last save |
+| A room rebuilt after a restart loads the YStore, then takes the file when the two differ | whatever was never saved is gone |
+
+  The lab log of a failing run shows no "Saving the content" between the room's start and the SIGTERM. The same holds for a user's own cell that prints for a long time; nh made it likely because nh's writes were followed at once by its own flushes.
+- **Fix: nh asks the room to save after its writes and after each run:**
+
+| Where | Change |
+|---|---|
+| `rtc.save_message(request_id)` | jupyter-collaboration's RAW save request: message type 2, the string "save", a request id; what JupyterLab sends for File → Save in a collaborative session. The server saves at once (`save_now`, no delay) and answers with a RAW JSON `{"type": "save", "responseTo", "status"}` |
+| `NhNbModelClient.request_save() -> bool` | puts it on `NbModelClient.run()`'s own send queue, behind the updates already queued, so the room reads every write nh made before it, even while the connection is congested (websockets writes a message, then waits in `drain()`, and the next ones wait in the queue); it never waits on the network. run() keeps the queue local; `rtc.send_queue(awareness)` finds it as the argument of the awareness callback run() registers (pycrdt's `Awareness._subscriptions`), once per connection at the room's first message. False before that, or when it isn't found (upstream changed: logged once at warning, and JupyterLab's autosave is all that saves) |
+| `NhNbModelClient._on_message` | reads the room's RAW answers (`rtc.save_reply`) and logs one whose status isn't "success" at warning, with the path: "skipped" (the room was loading the file, `_update_lock` held) or "failed" (the save raised); drops the rest. A save that a change to the document cancelled before it wrote is answered "success" too, so it is not logged (Known gaps) |
+| `RtcDocument.save()` | when synced: queues the request, then `settle()` (the sender picks up the write's update and the request). Nothing to fail or wait for: the queue is unbounded. A connection that drops before they are sent loses both, as it loses any update not yet sent, and the next write reconnects |
+| `RtcBackend.insert_cells`, `update_cells`, `delete_cells`, `set_notebook_meta`, `_reset_stuck` | `await doc.save()` after the write, in place of `settle()` |
+| `RtcBackend._run_done(cell_id, doc)`, the run's `on_done` | also schedules `doc.save()` (kept in `_saves`), so a finished run's outputs, count and idle state are saved even when the next run starts printing within the save delay |
+
+- **Cost:** jupyter-collaboration answers a save inside its message handler, and tornado reads nh's next message only after it: nh's writes that follow a save reach the room once the file is written (tens of ms on the test notebooks). A peer that connects right after `update_cells` returns can see the source from before the update for that long, so `test_rtc_document.py`'s non-ASCII test now waits for the patch to arrive, then checks it as before.
+- **Found while testing the save (C12's review), from v0.1: a normal close froze the gateway.** jupyter-nbmodel-client's listener is `while True: async for message in websocket`. websockets ends that iteration quietly when the room closes the connection normally (codes 1000, 1001, 1005, e.g. a proxy's "going away"), and every later one ends at once without yielding, so the listener spun at ~90% CPU and the gateway's event loop never ran again. a8 never showed it: a SIGKILLed server gives 1006, which ends `run()`. **Fix:** at the room's first message `NhNbModelClient` wraps that connection's `recv` (`rtc.end_run_on_clean_close`; websockets documents that iteration calls `recv()`) so a normal close raises `rtc.RoomClosed` (a `ConnectionError`): `run()` ends as on a dropped connection, `RtcDocument.synced` turns False and the next write reconnects. nbmodel's listener logs it at error ("Websocket client stopped."), as it does a dropped connection.
+- **Not saved by nh:** `begin_run` (cleared outputs) and the flusher's periodic writes. After a restart mid-run the running cell is there with its source (saved at insert) but without the output it printed.
+- **A change for users who turned saving off.** nh's awareness sets no `autosave`, which the room reads as on: the room already autosaved while nh was connected even when the user's own tab had autosave off, and nh's save requests change only when it saves. JupyterLab's `--YDocExtension.document_save_delay=None` ("the document will never be saved") is different: it stops the room's autosave, not a save request (`_maybe_save_document(save_now=True)` saves regardless). nh can't read that setting (the server exposes it neither in its REST API nor in its page config), so with it nh's writes and run ends now write the `.ipynb`, the user's unsaved edits in the room included, where before nothing did (C12's review: a Lab started with only that option held nh's inserted cell on disk 4 s later, two "Saving the content from room" lines in its log; without the save requests it did not). A known gap below.
+- **After the restart** (with the fix; both variants passed in each of 4 runs: three of the file alone at load 0.3-4.9, one in the full integration suite; `same-ystore` also in the glob proof below. After C12's review fixes, the request on run()'s queue: both variants and the save check passed in 3 runs of the file at load 2.4-3.8, the first and last with `test_rtc_document.py`, whose 12 tests passed too; with the queue lookup made to fail, the save check failed and gateway.log held the one warning):
+
+| Step | Result |
+|---|---|
+| `nh_run(mode="wait")` on the running cell | status lost: "Waited for …; the kernel went away while it ran (<reason>)." and the lost next block ("The kernel restarted, died or disconnected while …"). The reason is what the runner saw first: "the connection to the kernel was lost", or "the kernel was restarted" when the server's shutdown sent the kernel's shutdown reply first |
+| Message 3's `nh_add_cell` | ran ok: the gateway kept its server (same URL and token) and made a new room and a new kernel session ("nh started a kernel for this notebook") |
+| Cell ids | 7, unique, in a new observer (a tab reloads the document after a server restart; the old observer's connection closed with the server) and in the saved `.ipynb`; the first 5 as before the restart; the lost cell idle |
+
+- The lost run's own notice ("[nh] … output after this point was not saved.") isn't in the notebook: the runner's one reconnect try (10 s) meets a server that is down. The tool result says the cell was lost.
+- `test_cells_nh_wrote_are_saved_while_another_cell_streams` checks the root cause on the session's JupyterLab, with no restart: while message 2's cell prints, the `.ipynb` holds both messages' cells. It failed before the fix.
+- **Message 1's soft timeout.** The review saw message 1 come back "queued" once in 21 runs (load ~2.4) under the old 5 s timeout. Its lab log shows the attach probe's kernel client connect, its close when the run started (`retire("probe")`), and the exec client's connect; the third connect of a passing run is the after-probe's, which comes only after the run ends. So the kernel clients connected; the kernel, started 0.5 s before, sent nothing nh read as "busy" for 5 s. Why is not established. Message 1 now has the default 100 s.
+
+**drift.yml `file-issue` job**
+
+| Key | Value |
+|---|---|
+| `needs` | `[upstream-latest, claude-code-latest]` |
+| `if` | `failure()`: true when a needed job (any leg of the matrix) failed, false when they passed or were cancelled |
+| `permissions` | `issues: write` (the job's only permission; the workflow keeps `contents: read`) |
+| `concurrency` | `group: drift-file-issue`, `cancel-in-progress: false`: one filer at a time, so two failed runs close together (a `workflow_dispatch` and the night's) can't both open an issue. GitHub keeps one pending job per group: of three queued filers the middle one is cancelled |
+| `env` | `GH_TOKEN: github.token`, `GH_REPO` (no checkout), the run URL, `github.event_name`, and each needed job's `needs.<job>.result` |
+
+- The step (POSIX sh, `gh`): lists the failed jobs; finds the label `drift` in whatever case the repo spells it, or creates it (`--force`, so a label made meanwhile is no error); lists the open issues with that label through REST (`gh api repos/$GH_REPO/issues?labels=…&state=open`: newest first, pull requests left out; `gh issue list --label` is a search, which can lag a new issue); comments on the newest, or opens "Nightly drift check failed" with the label. The body: the event, the run URL, the failed jobs, and both jobs' results. The nightly cron stays.
+- Checked with actionlint 1.7.12 (shellcheck on): 0 errors in both workflows; the step's script also passes `shellcheck -s sh` and `-s bash`, and runs with a stand-in `gh` (with `jq` for `--jq`) under `dash -e` and `bash -e -o pipefail` through its paths: no label and no issue (label created, issue opened), label "Drift" with an open pull request #50 and issues #42 and #7 (comment on #42), label "Drift" and no issue (issue opened with "Drift"), `gh` failing (exit 1, nothing filed).
+
+**ci.yml artifact glob**
+- v0.1's `/tmp/pytest-of-*/**/jupyterlab.log` uploaded nothing: `start_lab`'s logs are `jupyterlab-<port>-<token prefix>.log`; the one kind named `jupyterlab.log` (labs `nhctl lab start` runs in `tests/nhctl/test_lab_real.py`) sits under the project's hidden `.nh/logs`, which upload-artifact skips by default; `test_lab_real.py::test_adopts_the_users_own_jupyterlab` starts the user's own lab, which nhctl adopts, with its output in `<tmp_path>/user-lab.log` (that test's only lab log); and on macOS pytest's base is under `$TMPDIR`, not `/tmp`.
+- The integration step passes `--basetemp "$RUNNER_TEMP/pytest-integration"` (`$RUNNER_TEMP` is `runner.temp` on both OSes).
+- Upload: `${{ runner.temp }}/pytest-integration/**/jupyterlab-*.log`, `…/**/.nh/logs/*.log` (nhctl's labs, and gateway logs) and `…/**/user-lab.log`, minus `…/*current/**` (pytest's `<name>current` symlinks would upload each log twice), with `include-hidden-files: true`.
+- `start_lab` appends to its log, so a restart of the same lab (same port and token, so the same file name) keeps the first server's output; it also takes extra `args`.
+- Proof, locally: the step's command with `RUNNER_TEMP` set, on one session-lab test, a8's `same-ystore` case and `test_lab_real.py::test_token_never_reaches_the_log`; then the path input through `@actions/glob` 0.5.1 with upload-artifact v6's options (`followSymbolicLinks`, `implicitDescendants`, `omitBrokenSymbolicLinks`, `excludeHiddenFiles: !include-hidden-files`): the 4 logs (`jupyterlab0/jupyterlab-<port>-<tok>.log`, `test_a_jupyterlab_restart_mid_0/lab/jupyterlab-<port>-<tok>.log` with both servers' output, that test's `.nh/logs/gateway.log`, `test_token_never_reaches_the_l0/work/sales_study/.nh/logs/jupyterlab.log`). Without `include-hidden-files`: 2; without the exclude: 8. The `user-lab.log` path (added in C12's review fixes) the same way, on `test_lab_real.py::test_adopts_the_users_own_jupyterlab` run with that basetemp: 1 file, `test_adopts_the_users_own_jupy0/user-lab.log`; without the exclude 2 (its `…current` twin).
+
+**Tests:**
+- `tests/integration/test_large_outputs.py` (a7; its `gateway_info_log` fixture logs the gateway at INFO into the project's `.nh/logs/gateway.log`, with each REST call of `SLOW_REST_S` or more, and the report lists those calls: Logs, above) and `tests/integration/test_lab_restart.py` (a8 in two variants, and the save check), marked `integration`.
+- `tests/integration/conftest.py`: `start_lab(args=…)` and its appended log; `_stop(proc, runtime=None)` (above).
+- `tests/integration/test_rtc_document.py`: `test_source_patches_handle_non_ascii` waits until the observer sees the patched source, then asserts it equals the new source (see Cost above).
+- `tests/unit/test_rtc_save.py`: the save message as jupyter-collaboration's handler decodes it, and its answers as it writes them; upstream's real `NbModelClient.run()` against an in-memory room (its `connect` replaced): with the connection congested (an update written, the sender waiting for the drain, the next update queued) the room reads both updates before the save, and `save()` returns at once; the requests are numbered; a normal close ends `run()` with `RoomClosed`, the document unsynced and `recv` called once after the close; the same against a real websockets server closing with 1000 and 1001, in a subprocess (a spinning listener would freeze the test's own loop); the client queues nothing before the room answered, logs "skipped" and "failed" answers at warning, and says once that it can't save when run()'s queue isn't there; `RtcDocument.save()` asks only while synced; each backend write is followed by a save; `_reset_stuck` saves after marking the stuck cells stopped; a finished run drops its record and schedules a save. Mutants, each failing them: the request sent straight on the websocket as before (`save()` waits on the congested connection), the same sent without waiting (the room reads the save before the queued update), no clean-close guard (the in-memory room counts the listener's spin, the subprocess times out).
+- `tests/unit/test_kernel_utf8.py`: the frame reader calls whatever `websocket._abnf.validate_utf8` holds, for a text frame and a close reason, and holds nh's; valid text frames pass; invalid ones (overlong, surrogate, stray continuation, past U+10FFFF, and the cut surrogate, overlong and past-U+10FFFF prefixes) are refused by both checks and raise in the reader; a cut sequence passes both checks and fails the text decode, and a close reason cut that way is accepted, as before; the answers equal websocket-client's on every 1- and 2-byte input and on 3- and 4-byte ones with the leads that narrow the second byte; bytearray, memoryview and `str` as websocket-client takes them; a call it doesn't know goes to websocket-client's check, logged once; a renamed name or a missing module leaves websocket-client's check in place and `note_utf8_check` logs the reason once. With `extract` changed to call `websocket._utils.validate_utf8` by attribute, the first test fails.
+- `tests/unit/test_shaping.py`: `prune_outputs_dir` never deletes the files it is told to keep (under the file and byte caps); `shape_outputs` over a small byte cap keeps its full copy and every original it names, and prunes an older copy. The trim's tests are listed in design §6.8 (Tests).
+
+**Known gaps**
+- Before the trim a7's 50 MB stream case was over its 1.5 s budget on this machine, about 2.1-2.5 times slower than V11's, at any load (turn overhead 1.94-2.68 s per call; V11's own case 2.46 s p95 here). With the trim (V11's fallback) it is 0.47-0.60 s at load 1.2-2.3, 0.59-0.85 s at load 1.7-4.2 after C12's review's fixes, and 0.79 s p95 at load ~5; the budget, its p95 method and V11 are unchanged. The trim's own gaps are in design §6.8.
+- The combined case is reported, not budgeted (since C12's review): it does both cases' work in one call (a trimmed stream, four image decodes and resizes, 15 MB of originals) and the room's saves of a 12 MB notebook. Its turn overhead was 0.94-1.27 s (p95 1.09-1.27 s) at load 1.6-4.4 in the first four runs and 1.22-1.58 s (p95 1.490-1.577 s, over 1.5 s in three of four runs) at load 2.2-4.2 in the review's four, after its fixes; a first try at load 5.5-5.9 measured 1.92 s. Sending the run end's save after the tool result is built, or skipping it when autosave will run, might bring it under 1.5 s on a quiet machine; then it can be budgeted again.
+- A save the room starts for nh is lost when the document changes before it writes, and the room still answers "success": jupyter-collaboration (jupyter-server-ydoc 3.0.4) cancels a save in flight at any change while autosave is on (`_maybe_save_document`), and its handler replies "success" once the cancelled task returns. So nh neither logs it nor asks again. C12's review probe (an observer peer appending a char to a cell, nh inserting a cell six times): quiet, 6 of 6 cells on disk; a keystroke every 150 ms, 1 of 6 cells missing at 30 cells, 4 of 6 at 300, 6 of 6 at 3,000 (where a quiet save took 0.6-0.8 s). nh's own output flushes (every 200 ms while a cell prints) change the document too, so on a large notebook, whose save takes longer than that, the save after a write that starts a run can be cancelled the same way (not measured). The write then reaches the `.ipynb` at the next save that runs to its end: the run end's, or autosave once the document is quiet; a JupyterLab restart before that loses it, as in a8. Checking the room's `hash` after a "success" and asking again (bounded) would close it.
+- With JupyterLab's `document_save_delay=None` (its autosave off) nh's writes and run ends still save the `.ipynb`, the user's unsaved edits in the room included: nh can't read the setting (A change for users who turned saving off, above).
+- nh's save requests and the clean-close guard rest on private upstream names: the send queue as the argument of the awareness callback `NbModelClient.run()` registers (jupyter-nbmodel-client 1.5.1, pycrdt 0.14.6's `Awareness._subscriptions`), and websockets' iteration calling the connection's `recv` (17.1). `test_rtc_save.py` pins both, in the drift job too; without the queue nh logs it once and falls back to JupyterLab's autosave.
+- A room that closes the connection normally before its first message (between the websocket upgrade and the sync reply) still makes nbmodel's listener spin: the guard is installed at the first message, and upstream's `run()` gives nh no earlier hold on the connection. jupyter-collaboration closes with 1003 or 4xxx there, which end `run()`; a proxy closing in that window is the case left.
+- A running cell's output is lost when JupyterLab restarts mid-run (never saved while it prints); its cell and source stay.
+- A call's own copies (its full copy, now at most about 8,000,000 chars, and its image originals) over 50 MiB together stay on disk until a later call's prune.
