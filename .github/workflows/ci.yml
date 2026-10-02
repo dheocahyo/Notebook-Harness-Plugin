@@ -70,12 +70,22 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --project plugins/nh/server --locked --all-groups
-      - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300
+      # An explicit basetemp: pytest's default is under /tmp on Linux but $TMPDIR on macOS.
+      - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300 --basetemp "$RUNNER_TEMP/pytest-integration"
       - if: failure()
         uses: actions/upload-artifact@v6
         with:
           name: integration-logs-${{ matrix.os }}
-          path: /tmp/pytest-of-*/**/jupyterlab.log
+          # tests/integration/conftest.py start_lab writes jupyterlab-<port>-<token prefix>.log;
+          # labs started by `nhctl lab start` (tests/nhctl) log under the project's hidden .nh/logs;
+          # tests/nhctl/test_lab_real.py's own lab (the one nhctl adopts) writes user-lab.log.
+          # pytest's <name>current symlinks would upload each log twice.
+          path: |
+            ${{ runner.temp }}/pytest-integration/**/jupyterlab-*.log
+            ${{ runner.temp }}/pytest-integration/**/.nh/logs/*.log
+            ${{ runner.temp }}/pytest-integration/**/user-lab.log
+            !${{ runner.temp }}/pytest-integration/*current/**
+          include-hidden-files: true
           if-no-files-found: ignore
 
   plugin:

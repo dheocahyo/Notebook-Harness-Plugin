@@ -28,7 +28,11 @@ jobs:
           uv sync --all-groups
           uv tree --depth 1 | head -40
           cd ../../..
-      - run: uv run --project plugins/nh/server pytest -q tests/contract tests/gateway tests/unit/test_fake_backend.py
+      # test_kernel_utf8.py and test_rtc_save.py pin the private upstream names nh relies on
+      # (websocket-client's UTF-8 check, jupyter-nbmodel-client's send queue, websockets' recv).
+      - run: >-
+          uv run --project plugins/nh/server pytest -q tests/contract tests/gateway
+          tests/unit/test_fake_backend.py tests/unit/test_kernel_utf8.py tests/unit/test_rtc_save.py
       - run: uv run --project plugins/nh/server pytest -q -m integration --timeout 300
 
   claude-code-latest:
@@ -40,3 +44,52 @@ jobs:
           node-version: 24
       - run: npm install -g @anthropic-ai/claude-code@latest && claude --version
       - run: claude plugin validate --strict plugins/nh && claude plugin validate --strict .
+
+  # A failed night comments on the open issue labelled drift, or opens one: one issue at a time.
+  # failure() is true when a job this one needs failed; not when they passed or were cancelled.
+  file-issue:
+    needs: [upstream-latest, claude-code-latest]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    # One filer at a time, so two failed runs close together can't both open an issue.
+    concurrency:
+      group: drift-file-issue
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      EVENT: ${{ github.event_name }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      UPSTREAM: ${{ needs.upstream-latest.result }}
+      CLAUDE_CODE: ${{ needs.claude-code-latest.result }}
+    steps:
+      - name: comment on the open drift issue, or open one
+        run: |
+          failed=""
+          if [ "$UPSTREAM" = failure ]; then failed="upstream-latest"; fi
+          if [ "$CLAUDE_CODE" = failure ]; then failed="${failed:+$failed, }claude-code-latest"; fi
+          body="The drift check failed ($EVENT run): $RUN_URL
+
+          Failed: $failed
+
+          - upstream-latest: $UPSTREAM
+          - claude-code-latest: $CLAUDE_CODE"
+          # The label as the repo spells it; created when missing (--force: no error if it
+          # appeared since).
+          label=$(gh label list --search drift --limit 100 --json name \
+            --jq '.[] | select((.name | ascii_downcase) == "drift") | .name')
+          if [ -z "$label" ]; then
+            label=drift
+            gh label create "$label" --force --color B60205 --description "The nightly drift check failed"
+          fi
+          # REST, not `gh issue list --label` (a search, which lags new issues): newest first,
+          # pull requests left out.
+          issue=$(gh api "repos/$GH_REPO/issues?labels=$label&state=open&per_page=30" \
+            --jq '[.[] | select(.pull_request | not)][0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "Nightly drift check failed" --label "$label" --body "$body"
+          fi
