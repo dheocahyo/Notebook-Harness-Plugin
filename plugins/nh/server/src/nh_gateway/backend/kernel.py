@@ -11,7 +11,10 @@ from . import rest  # first: it sets NO_PROXY before websocket-client is importe
 
 # isort: split
 
+import codecs
 import contextlib
+import importlib
+import logging
 import queue
 import re
 import threading
@@ -24,6 +27,98 @@ from jupyter_kernel_client import JupyterKernelClient
 
 from ..policy.errors import NhError, scrub
 from .base import ServerInfo
+
+log = logging.getLogger("nh_gateway.kernel")
+
+
+def _no_check(*args: Any, **kwargs: Any) -> bool:
+    raise TypeError("websocket-client's own UTF-8 check was not found")
+
+
+_upstream_utf8: Callable[..., bool] = _no_check  # websocket-client's own check, once replaced
+_unknown_call_logged = False
+# A lead byte's second byte where it is narrower than 80-BF (RFC 3629): no overlong form, no
+# surrogate, nothing past U+10FFFF.
+_SECOND_BYTE = {0xE0: (0xA0, 0xBF), 0xED: (0x80, 0x9F), 0xF0: (0x90, 0xBF), 0xF4: (0x80, 0x8F)}
+
+
+def _plain_text(data: Any) -> bool:
+    """bytes, bytearray, str, or a plain byte memoryview: what websocket-client passes."""
+    if isinstance(data, memoryview):
+        return data.format == "B" and data.c_contiguous
+    return isinstance(data, (bytes, bytearray, str))
+
+
+def validate_utf8(data: Any, *args: Any, **kwargs: Any) -> bool:
+    """websocket-client's UTF-8 check of each text frame and close reason nh's kernel clients
+    receive, by the C decoder.
+
+    Its own is a pure-Python loop over every byte unless ``wsaccel`` is installed: ~0.2 s per MB
+    on the gateway's receive thread, holding the GIL (a 50 MB stream took ~10 s more than the
+    kernel did; design §6.13). This answers as it does: False from the first byte that can't
+    continue UTF-8 (an overlong form, a surrogate, past U+10FFFF, a stray continuation byte),
+    True for valid text and for a sequence cut at the end (which ``WebSocketApp``'s decode of a
+    text frame then refuses, and its close-reason decode replaces, as before). A call this
+    doesn't know (other arguments or types) goes to websocket-client's own check.
+    """
+    global _unknown_call_logged
+    if args or kwargs or not _plain_text(data):
+        if not _unknown_call_logged:
+            _unknown_call_logged = True
+            log.warning("websocket-client called nh's UTF-8 check in a new way; its own is used")
+        return _upstream_utf8(data, *args, **kwargs)
+    if isinstance(data, str):  # as websocket-client's own: lone surrogates fail
+        data = data.encode("utf-8", "surrogatepass")
+    try:
+        _, done = codecs.utf_8_decode(data, "strict", False)  # final=False: a cut end is no error
+    except UnicodeDecodeError:
+        return False
+    tail = bytes(data[done:])  # a sequence cut at the end, at most 3 bytes: can it still be one?
+    if len(tail) > 1:  # (CPython's decoder lets a cut surrogate, ED A0-BF, through)
+        low, high = _SECOND_BYTE.get(tail[0], (0x80, 0xBF))
+        return low <= tail[1] <= high and all(0x80 <= byte <= 0xBF for byte in tail[2:])
+    return True
+
+
+def install_utf8_check() -> str | None:
+    """Put :func:`validate_utf8` where websocket-client's frame reader calls it: the name
+    ``websocket._abnf`` imports from ``websocket._utils`` (``continuous_frame.extract`` for text
+    frames, ``ABNF.validate`` for close frames). Both are private, so only when they are as
+    expected; else the reason, and the gateway keeps websocket-client's own check (only slower,
+    noted once by :func:`note_utf8_check`). ``tests/unit/test_kernel_utf8.py`` pins the reader.
+    """
+    global _upstream_utf8
+    try:
+        abnf = importlib.import_module("websocket._abnf")
+        utils = importlib.import_module("websocket._utils")
+    except Exception as exc:  # gone, renamed, or failing to import: never the gateway's import
+        return f"websocket-client's modules changed ({type(exc).__name__}: {exc})"
+    current = getattr(abnf, "validate_utf8", None)
+    if current is validate_utf8:
+        return None
+    if current is None or current is not getattr(utils, "validate_utf8", None):
+        return "websocket-client's frame reader no longer calls websocket._utils.validate_utf8"
+    _upstream_utf8 = current
+    abnf.validate_utf8 = validate_utf8  # type: ignore[attr-defined]
+    return None
+
+
+UTF8_CHECK_NOTE = install_utf8_check()
+_utf8_noted = False
+
+
+def note_utf8_check() -> None:
+    """Log once, at the first kernel connection (gateway.log is open by then), when
+    :func:`install_utf8_check` left websocket-client's own check in place."""
+    global _utf8_noted
+    if UTF8_CHECK_NOTE and not _utf8_noted:
+        _utf8_noted = True
+        log.warning(
+            "nh's fast UTF-8 check for kernel messages is not installed (%s): kernel output of "
+            "many MB is received more slowly",
+            UTF8_CHECK_NOTE,
+        )
+
 
 PumpState = Literal["idle", "timeout", "abort", "lost"]
 UUID_NAME = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -337,6 +432,7 @@ def attach_session(
 
 def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> JupyterKernelClient:
     """Connect a websocket client to an existing kernel. Never starts or owns a kernel."""
+    note_utf8_check()
     try:
         kc = JupyterKernelClient(
             server_url=server.url.rstrip("/"),
