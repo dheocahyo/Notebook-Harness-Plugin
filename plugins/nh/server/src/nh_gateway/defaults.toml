@@ -61,6 +61,7 @@ max_chain = 4
 
 [lint.rules]                    # per rule: off | hint | error | ask
 package_install = "ask"
+network = "ask"
 notebook_write = "error"
 markdown_output = "error"
 secret_print = "error"

@@ -22,8 +22,9 @@ works in the same notebook you are looking at.
   Claude replies. It is still one cell per message, and one undo removes it.
 - **Guardrails.** No raw edits to `.ipynb` files, no cells that print an env
   var's value, no writes from subagents except nh's own cell writer inside
-  `/nh:qa-cell`, and a cell that installs packages waits for your yes. nh's
-  server enforces every rule and refuses what it can't verify.
+  `/nh:qa-cell`, and a cell that installs packages, or reaches a host your
+  project hasn't approved, waits for your yes. nh's server enforces every
+  rule and refuses what it can't verify.
 
 ## Requirements
 

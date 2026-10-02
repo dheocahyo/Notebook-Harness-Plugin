@@ -256,11 +256,15 @@ async def inspect_notebook(
         except NhError as exc:
             lines = await _status_lines(svc, None)
             lines.append(str(exc).splitlines()[0])
-            return text_result(_clip("\n".join(["nh status"] + lines + config_lines(cfg)), limit))
+            return text_result(
+                _clip("\n".join(["nh status"] + lines + config_lines(cfg, svc.layout)), limit)
+            )
         lines = await _status_lines(svc, ref)
         return text_result(
             _clip(
-                "\n".join([f"nh status — notebook {ref.rel_path}"] + lines + config_lines(cfg)),
+                "\n".join(
+                    [f"nh status — notebook {ref.rel_path}"] + lines + config_lines(cfg, svc.layout)
+                ),
                 limit,
             )
         )
@@ -352,9 +356,16 @@ async def inspect_notebook(
     outline = _outline(cells, stale, int(cfg["inspect"]["outline_limit"]), cell_id)
     head = [f"notebook {ref.rel_path}: {len(cells)} cells"]
     if view == "outline":
-        return text_result(_clip("\n".join(header + head + outline + config_lines(cfg)), limit))
+        return text_result(
+            _clip("\n".join(header + head + outline + config_lines(cfg, svc.layout)), limit)
+        )
 
     body = (
-        header + head + outline + ["--- variables ---"] + _vars_block(payload) + config_lines(cfg)
+        header
+        + head
+        + outline
+        + ["--- variables ---"]
+        + _vars_block(payload)
+        + config_lines(cfg, svc.layout)
     )
     return text_result(_clip("\n".join(body), limit))

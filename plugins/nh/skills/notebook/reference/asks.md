@@ -1,22 +1,41 @@
 # When nh asks first (E122)
 
-Some cells need the user's yes before nh writes them. Today that is a cell
-that installs packages (`!pip install`, `%pip install`, `%conda install`,
-`!uv add`: rule L009) or removes them with `%pip uninstall` or
-`%conda remove`, unless `harness.toml` sets that rule to another level. nh
-refuses such a call with `E122`, writes nothing, and puts the question in its
-`Next:` line.
+Some cells need the user's yes before nh writes them:
+- a cell that installs packages (`!pip install`, `%pip install`,
+  `%conda install`, `!uv add`: rule L009) or removes them with
+  `%pip uninstall` or `%conda remove`;
+- a cell that reaches a host the project hasn't approved (rule L012): a URL
+  given to a reader or any other call (`pd.read_csv("https://…")`, a name
+  holding one), `requests`, `httpx`, `urllib`, `socket`, `!curl`, `!wget`,
+  `!git clone`, `!scp`. The question names the hosts, never the URL.
+
+Unless `harness.toml` sets the rule to another level, nh refuses such a call
+with `E122`, writes nothing, and puts the question in its `Next:` line.
+
+Don't ask before the call: write the cell and send it, and let nh ask. nh
+grants only a yes to its own question, so asking first means asking twice.
 
 The better way to install stays `uv add <pkg>` with Bash (in a conda project:
 add it to environment.yml, then `nhctl env sync`), after the user's yes,
 then the cell without the install. A cell that installs is the fallback, for
 when the user wants the cell itself; nh asks them about it.
 
+## Approved hosts
+
+A cell whose every host is in `.nh/state/approved_hosts.json` is written with
+no question. `/nh:init` puts the host of the data URL it set up there, so the
+first cell reads the data straight away. A yes to `E122` approves that one
+cell, once, never the host: the next cell that reads from it asks again. To
+approve a host for good, the user adds it to that file themselves (a JSON
+list of host names: `["data.example.org"]`); a subdomain needs its own entry.
+You can't write the file, and nh has no command for it.
+
 ## In the message that gets E122
 
 1. Ask the user that question in chat, as nh gives it. One question, then
    stop. Write nothing else in this message: no other cell, and no way around
-   it (don't drop the install into Bash on your own, don't split the cell).
+   it (don't drop the install or the download into Bash on your own, don't
+   split the cell).
 2. Keep the call exactly as it was. Never rephrase its code between the
    question and the retry: changed code is a new question.
 3. One question per message. A second cell nh asks about in the same message
@@ -36,7 +55,10 @@ when the user wants the cell itself; nh asks them about it.
   "yes, but …"): the cell is not approved. Drop the call and do what the
   message asks. For a package that is usually `uv add <pkg>` with Bash (in a
   conda project: environment.yml, then `nhctl env sync`), after the user
-  agreed, then the cell without the install.
+  agreed, then the cell without the install. For the network: the user
+  downloads the file into the project (for example `data/raw/`), then a cell
+  reads it there. Never fetch it yourself: no `curl` or `wget` with Bash, no
+  WebFetch, no other cell.
 - The yes only counts in the very next message. Later, nh asks again.
 
 ## Other cases
@@ -46,7 +68,8 @@ when the user wants the cell itself; nh asks them about it.
 - A retry that keeps the install (`nh_edit_cell` after the approved cell
   failed) asks again: a yes covers one call.
 - Re-running a cell that installs (`nh_run`) runs the install again without a
-  question from nh: ask the user first, as for any re-run.
+  question from nh, as does re-running one that downloads: ask the user
+  first, as for any re-run.
 - Headless runs (`NH_HEADLESS=1`, set for runs like `claude -p` where nobody
   answers): the refusal stands. Tell the user the cell needs their yes in an
   interactive session, and write nothing.

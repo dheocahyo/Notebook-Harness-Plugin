@@ -12,7 +12,7 @@ from fastmcp import Context
 from fastmcp.tools import ToolResult
 
 from .. import dataflow, meta, render
-from .._shared import secrets
+from .._shared import hosts, secrets
 from .._shared.text import clip, count_words, render_note, split_notes, unescape_markdown
 from .._shared.turn_record import WRITER_AGENT
 from ..backend.base import (
@@ -161,6 +161,12 @@ def _lint_failure(
             "Don't call again yet: ask the user whether to install the package. After a yes, run "
             "`uv add <package>` with Bash (in a conda project, add it to environment.yml and run "
             "`nhctl env sync`), then write the cell without the install."
+        )
+    elif "L012" in rules:
+        next_step = (
+            "Don't call again yet: this project refuses cells that reach the network. Ask the user "
+            "to download what the cell needs into the project (for example data/raw/), then write "
+            "the cell to read it from there."
         )
     elif "L002" in rules:
         next_step = (
@@ -526,7 +532,7 @@ async def report_run(
     if result is not None and result.note and status not in ("lost", "deleted"):
         notices.append(result.note)
     out.section("notices", notices)
-    out.section("config", config_lines(cfg))
+    out.section("config", config_lines(cfg, svc.layout))
     out.section(
         "next",
         render.next_block(
@@ -702,7 +708,8 @@ async def add_cell(
             raise NhError("E121")
 
         index, anchor = _insert_index(cells, after_cell_id)
-        names_above = dataflow.defined_names(code_sources_before(cells, index))
+        code_above = code_sources_before(cells, index)
+        names_above = dataflow.defined_names(code_above)
         report = lint_cell(
             code,
             title=title,
@@ -713,6 +720,8 @@ async def add_cell(
             require_intent=True,
             kernel_python=kernel.python_version,
             names_above=names_above,
+            approved_hosts=hosts.read_approved(svc.layout.approved_hosts),
+            code_above=code_above,
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)
@@ -941,7 +950,8 @@ async def edit_cell(
                 note_bullets = list(nh.get("rationale") or []) or [
                     line[2:] for line in note.source.splitlines() if line.startswith("- ")
                 ]
-        names_above = dataflow.defined_names(code_sources_before(cells, target.index))
+        code_above = code_sources_before(cells, target.index)
+        names_above = dataflow.defined_names(code_above)
         report = lint_cell(
             code,
             title=note_title if wants_note else None,
@@ -952,6 +962,8 @@ async def edit_cell(
             require_intent=not nh.get("intent"),
             kernel_python=kernel.python_version,
             names_above=names_above,
+            approved_hosts=hosts.read_approved(svc.layout.approved_hosts),
+            code_above=code_above,
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)

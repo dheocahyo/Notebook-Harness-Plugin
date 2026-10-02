@@ -17,7 +17,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent
 
 from .. import dataflow, meta, render
-from .._shared import secrets
+from .._shared import hosts, secrets
 from .._shared.paths import Layout, atomic_write_json, read_json
 from .._shared.text import normalize_title
 from ..backend.base import (
@@ -363,8 +363,10 @@ def machine_line(
     return line
 
 
-def config_lines(cfg: Config) -> list[str]:
-    return [f"harness.toml: {problem}" for problem in cfg.problems]
+def config_lines(cfg: Config, layout: Layout | None = None) -> list[str]:
+    """``harness.toml``'s problems, then the approved hosts list's (design §6.4)."""
+    found = [f"harness.toml: {problem}" for problem in cfg.problems]
+    return found + (hosts.problems(layout.approved_hosts) if layout is not None else [])
 
 
 def windows_guard() -> None:

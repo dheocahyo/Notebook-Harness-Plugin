@@ -1,12 +1,14 @@
-"""FR-12 cell approvals (design §6.4): a cell the lint asks about (L009 by default) waits for the
-user's yes (E122), and the yes in the next message lets exactly that call through once. Through
-the real hooks and the gateway (FakeBackend)."""
+"""FR-12 cell approvals (design §6.4): a cell the lint asks about (L009 and L012 by default)
+waits for the user's yes (E122), and the yes in the next message lets exactly that call through
+once; a host in the project's approved list needs none. Through the real hooks and the gateway
+(FakeBackend)."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ from nh_gateway.lint.lint import Issue
 from nh_gateway.policy.errors import CATALOGUE, RETURN_TO_WORKFLOW, WRITER_LINE, NhError
 from nh_gateway.policy.turn import TurnState
 from nh_gateway.tools import approvals
+from tests.fakes.net import serving
 from tests.fakes.turns import Turns, text
 from tests.gateway.conftest import NOTEBOOK, Harness, make_project
 
@@ -774,3 +777,222 @@ async def test_the_edit_grant_is_checked_and_used_inside_the_lock(
     assert "nh: E133" in refused or "nh: E112" in refused, refused  # its run, going or ok
     assert [c["source"] for c in nh_code_cells(nh)] == [code]
     assert pending(nh) is None
+
+
+# --- L012: a cell that reaches the network (C5b) ---------------------------------------------
+#
+# A real reader: FakeBackend runs it with pandas, and the module's urlopen serves the file (and
+# refuses every other URL), so no test reaches the network.
+TRIPS_URL = "https://data.example.org/trips-2023.csv"
+TRIPS_CSV = "trip_id,minutes\n1,12\n2,7\n3,31\n"
+NETWORK = dict(
+    title="Read the 2023 trips file",
+    notes=["Reads the 2023 trips file from its URL.", "Shows how many rows and columns it has."],
+    intent="load the 2023 trips data",
+    code=f'import pandas as pd\n\nTRIPS_URL = "{TRIPS_URL}"\ntrips = pd.read_csv(TRIPS_URL)\ntrips.shape',
+)
+NETWORK_QUESTION = "This cell connects to `data.example.org` over the network. Run it as it is?"
+NETWORK_FINDING = (
+    "- L012: The cell connects to `data.example.org` over the network (`pd.read_csv`)."
+)
+NETWORK_ASKED = [
+    FIRST,
+    "nh: E122",
+    NETWORK_FINDING,
+    f"Next: Ask the user, then stop: '{NETWORK_QUESTION}'. After a yes, send the same call again.",
+]
+
+
+@pytest.fixture(autouse=True)
+def _trips_served() -> Iterator[None]:
+    with serving({TRIPS_URL: TRIPS_CSV}):
+        yield
+
+
+def approve_hosts(h: Harness, content: Any) -> None:
+    path = Layout(h.project).approved_hosts
+    if isinstance(content, str):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    else:
+        atomic_write_json(path, content)
+
+
+@pytest.mark.parametrize("who", ["main", "writer"])
+async def test_a_network_cell_asks_and_the_yes_grants_that_call_once(nh: Harness, who: str) -> None:
+    nh.turns.prompt("p1", text="load the 2023 trips CSV from data.example.org")
+    asked = await add(nh, who, "p1", "wf_run-1", **NETWORK)
+    if who == "main":
+        assert asked.is_error and lines(asked) == NETWORK_ASKED, text(asked)
+    else:
+        assert asked.is_error and lines(asked)[-2:] == [
+            f"- The main conversation asks the user: '{NETWORK_QUESTION}'",
+            f"Next: {RETURN_TO_WORKFLOW}",
+        ]
+    key = approvals.cell_key(NOTEBOOK, "add", NETWORK["code"])
+    assert pending(nh)["key"] == key
+    assert [e["rules"] for e in events(nh, "cell_asked")] == [["L012"]]
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **NETWORK))
+    assert [c["source"] for c in nh_code_cells(nh)] == [NETWORK["code"]]
+    assert "(3, 2)" in str(nh_code_cells(nh)[0]["outputs"])  # it read the served file
+    assert pending(nh) is None and [e["rules"] for e in events(nh, "cell_granted")] == [["L012"]]
+    again = await nh.call("nh_add_cell", "p2", **dict(NETWORK, title="Read the trips again"))
+    assert again.is_error and "nh: E110" in text(again)
+    assert Layout(nh.project).approved_hosts.exists() is False  # a yes approves the cell only
+
+
+async def test_an_approved_host_is_written_with_no_question(nh: Harness) -> None:
+    approve_hosts(nh, ["data.example.org"])
+    nh.turns.prompt("p1", text="load the 2023 trips CSV from data.example.org")
+    written = await nh.call("nh_add_cell", "p1", **NETWORK)
+    assert_written(written)
+    assert "data.example.org" not in text(written).split("--- next ---")[0].split("--- output")[0]
+    assert pending(nh) is None and events(nh, "cell_asked") == []
+    [added] = events(nh, "cell_added")
+    assert "L012" not in added["hints"]
+
+
+async def test_the_approved_hosts_are_read_on_every_call(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the trips")
+    assert lines(await nh.call("nh_add_cell", "p1", **NETWORK)) == NETWORK_ASKED
+    approve_hosts(nh, ["DATA.example.org."])  # the user adds it by hand; any form of the host
+    nh.turns.prompt("p2", text="I added the host, load the trips")
+    assert_written(await nh.call("nh_add_cell", "p2", **NETWORK))
+    Layout(nh.project).approved_hosts.unlink()
+    nh.turns.prompt("p3", text="now the 2024 file")
+    code = NETWORK["code"].replace("2023", "2024")
+    asked = await nh.call("nh_add_cell", "p3", **dict(NETWORK, code=code))
+    assert asked.is_error and "- L012: The cell connects to `data.example.org`" in text(asked)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{", '{"hosts": ["data.example.org"]}', '"data.example.org"', ["api.data.example.org"]],
+)
+async def test_a_corrupt_list_or_another_host_still_asks(nh: Harness, content: Any) -> None:
+    approve_hosts(nh, content)
+    nh.turns.prompt("p1", text="load the trips")
+    assert lines(await nh.call("nh_add_cell", "p1", **NETWORK)) == NETWORK_ASKED
+
+
+async def test_the_network_question_names_the_host_never_the_url(nh: Harness) -> None:
+    url = "https://analyst:s3cretPassw0rdXYZ@data.example.org:8443/private/t.csv?token=tok_9f8e7d"
+    nh.turns.prompt("p1", text="load the trips")
+    code = f'import pandas as pd\n\ntrips = pd.read_csv("{url}")'
+    asked = await nh.call("nh_add_cell", "p1", **dict(NETWORK, code=code))
+    body = text(asked)
+    assert asked.is_error and NETWORK_QUESTION in body, body
+    for part in ("analyst", "s3cretPassw0rdXYZ", "8443", "private", "tok_9f8e7d"):
+        assert part not in body, (part, body)
+
+
+async def test_an_install_and_a_download_ask_one_question(nh: Harness) -> None:
+    code = "%pip install seaborn\n" + NETWORK["code"]
+    nh.turns.prompt("p1", text="install seaborn and load the trips")
+    asked = await nh.call("nh_add_cell", "p1", **dict(NETWORK, code=code))
+    assert asked.is_error and lines(asked)[1:4] == [
+        "nh: E122",
+        FINDING,
+        NETWORK_FINDING,
+    ]
+    assert lines(asked)[-1] == (
+        "Next: Ask the user, then stop: 'This cell installs `seaborn` into the kernel only, and "
+        "the next env sync removes it (`uv add seaborn` keeps it); it also connects to "
+        "`data.example.org` over the network. Run it as it is?'. After a yes, send the same call "
+        "again."
+    )
+    assert [e["rules"] for e in events(nh, "cell_asked")] == [["L009", "L012"]]
+
+
+async def test_an_edit_reads_the_approved_hosts_too(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the data")
+    uid = (await nh.call("nh_add_cell", "p1", **LOAD)).meta["nh/cell_id"]
+    nh.turns.prompt("p2", text="read the 2023 trips from data.example.org in that cell instead")
+    asked = await nh.call("nh_edit_cell", "p2", cell_id=uid, code=NETWORK["code"])
+    assert asked.is_error and lines(asked)[:3] == NETWORK_ASKED[:3], text(asked)
+    assert pending(nh)["key"] == approvals.cell_key(NOTEBOOK, f"edit:{uid}", NETWORK["code"])
+    approve_hosts(nh, ["data.example.org"])
+    nh.turns.prompt("p3", text="I approved data.example.org, try again")
+    edited = await nh.call("nh_edit_cell", "p3", cell_id=uid, code=NETWORK["code"])
+    assert not edited.is_error and "Updated" in text(edited), text(edited)
+    assert [c["source"] for c in nh_code_cells(nh)] == [NETWORK["code"]]
+    assert [e["rules"] for e in events(nh, "cell_asked")] == [["L012"]]
+
+
+async def test_a_url_named_in_an_earlier_cell_still_asks(nh: Harness) -> None:
+    """The gateway passes the cells above: a URL bound in one (the user approved it, or it
+    reached nothing) counts in the next cell that reads it."""
+    named = dict(
+        title="Name the trips file",
+        notes=["Keeps the 2023 trips URL in one place.", "Shows the file name it ends in."],
+        intent="name the trips data",
+        code=f'TRIPS_URL = "{TRIPS_URL}"\nTRIPS_URL.rsplit("/", 1)[-1]',
+    )
+    reads = dict(NETWORK, code="import pandas as pd\n\ntrips = pd.read_csv(TRIPS_URL)\ntrips.shape")
+    nh.turns.prompt("p1", text="name the trips file")
+    assert_written(await nh.call("nh_add_cell", "p1", **named))
+    nh.turns.prompt("p2", text="now load it")
+    assert lines(await nh.call("nh_add_cell", "p2", **reads)) == NETWORK_ASKED
+    nh.turns.prompt("p3", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p3", **reads))
+    assert "(3, 2)" in str(nh_code_cells(nh)[-1]["outputs"])
+
+
+async def test_a_list_nh_cant_use_shows_a_config_line(nh: Harness) -> None:
+    entry = (
+        "`.nh/state/approved_hosts.json` entry 2 is not a host name (write the host only, such "
+        "as `data.example.org`): it approves nothing."
+    )
+    approve_hosts(nh, ["data.example.org", "https://api.example.org/x?token=tok_1"])
+    nh.turns.prompt("p1", text="load the trips")
+    written = await nh.call("nh_add_cell", "p1", **NETWORK)
+    assert_written(written)
+    assert f"--- config ---\n{entry}" in text(written), text(written)
+    assert "tok_1" not in text(written)
+    status = text(await nh.call("nh_inspect", "p1", view="status"))
+    assert entry in status, status
+    approve_hosts(nh, "{")
+    broken = (
+        "`.nh/state/approved_hosts.json` is not a JSON list of host names: nh approves no host "
+        "from it."
+    )
+    assert broken in text(await nh.call("nh_inspect", "p1", view="overview"))
+    Layout(nh.project).approved_hosts.unlink()
+    assert ".nh/state/approved_hosts.json" not in text(
+        await nh.call("nh_inspect", "p1", view="status")
+    )
+
+
+@pytest.mark.parametrize(
+    ("toml", "outcome"),
+    [
+        ('[lint]\nmode = "strict"\n', "E122"),
+        ('[lint.rules]\nnetwork = "error"\n', "E120"),
+        ('[lint.rules]\nnetwork = "hint"\n', "written"),
+        ('[lint.rules]\nnetwork = "off"\n', "written"),
+    ],
+)
+async def test_the_rule_level_decides_what_a_network_cell_gets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, outcome: str
+) -> None:
+    project = make_project(tmp_path, toml)
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    async with Client(create_server(project, backend)) as client:
+        h = Harness(project, backend, client, Turns(project, tmp_path / "data"))
+        h.turns.prompt("p1", text="load the trips")
+        result = await h.call("nh_add_cell", "p1", **NETWORK)
+    body = text(result)
+    if outcome == "written":
+        assert_written(result)
+        hinted = "The cell connects to `data.example.org` over the network" in body
+        assert hinted == ("hint" in toml), body
+    else:
+        assert result.is_error and f"nh: {outcome}" in body, body
+    if outcome == "E120":
+        assert lines(result)[-1] == (
+            "Next: Don't call again yet: this project refuses cells that reach the network. Ask "
+            "the user to download what the cell needs into the project (for example data/raw/), "
+            "then write the cell to read it from there."
+        )

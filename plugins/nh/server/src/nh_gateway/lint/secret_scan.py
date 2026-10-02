@@ -1639,6 +1639,51 @@ def _shell_script(args: list[str]) -> str | None:
     return None
 
 
+def shell_commands(text: str, _depth: int = 0) -> list[tuple[list[str], list[str]]]:
+    """Each command a shell line runs, as (raw words, unquoted words) with ``sudo``,
+    ``NAME=value`` and keywords taken off the front: its lists' and pipelines' commands, then
+    those of its ``$(…)`` and backtick substitutions and of a ``bash -c '…'`` script. A line
+    whose quotes don't close is read as raw text. L012 reads shell this way (design §6.4)."""
+    lexed = _lex(text)
+    found: list[tuple[list[str], list[str]]] = []
+    for stages in lexed if lexed is not None else _lex_raw(text):
+        for stage in stages:
+            raws, words = _command_words(stage)
+            if words:
+                found.append((raws, words))
+            if _depth >= 4:
+                continue
+            if words and words[0].rsplit("/", 1)[-1] in _SHELLS:
+                script = _shell_script(words[1:])
+                if script is not None:
+                    found += shell_commands(script, _depth + 1)
+            for raw in stage.words:
+                for kind, inner, _, _ in _expansions(raw):
+                    if kind == "(":
+                        found += shell_commands(inner, _depth + 1)
+    return found
+
+
+def shell_lines(body: list[str]) -> list[str]:
+    """A shell cell's lines as the shell reads them: a line that ends in a backslash, or with a
+    quote still open, goes on to the next."""
+    found: list[str] = []
+    text = ""
+    for number, line in enumerate(body):
+        if not text:
+            text = line
+        elif text.endswith("\\"):
+            text = text[:-1] + " " + line
+        else:  # a quote still open
+            text = f"{text}\n{line}"
+        more = number + 1 < len(body)
+        if more and (text.endswith("\\") or _lex(text) is None):
+            continue
+        found.append(text)
+        text = ""
+    return found
+
+
 def _secret_file(word: str) -> Taint | None:
     """What reading this file shows: every value of `.env`, or of the environment."""
     if _env_file(word):

@@ -251,7 +251,7 @@ async def undo(
         ["Kept the note above it: the user had edited it."] if note_kept and code_changed else []
     )
     out.section("notices", notices)
-    out.section("config", config_lines(cfg))
+    out.section("config", config_lines(cfg, svc.layout))
     kernel_part = "which variables still hold the old results, " if leftover else ""
     out.section(
         "next",

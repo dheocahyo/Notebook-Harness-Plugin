@@ -262,6 +262,185 @@ def test_userinfo_url_is_secret(tmp_path):
     assert "sqlalchemy>=2.0" in (tmp_path / "pyproject.toml").read_text()
 
 
+# ----------------------------------------------------------------------- approved hosts
+# Design §6.4: a data URL's host goes into .nh/state/approved_hosts.json, so the first cell reads
+# it with no question (L012). Only the host, merged with what is there.
+HOSTS = ".nh/state/approved_hosts.json"
+TRIPS_URL = "https://data.example.org/trips-2023.csv"
+
+
+def approved(root: Path) -> list[str]:
+    return json.loads((root / HOSTS).read_text(encoding="utf-8"))
+
+
+def test_url_data_approves_its_host(env, project):
+    env.script("uv", "exit 0")
+    url = "https://Data.Example.ORG.:8443/exports/trips-2023.csv"
+    report = env.json("scaffold", "--data", url, cwd=project)
+    assert {"path": HOSTS, "action": "created"} in report["paths"]
+    assert report["data"]["approved_host"] == "data.example.org"
+    assert approved(project) == ["data.example.org"]
+    # the state folder, approved_hosts.json with it, is not committed
+    assert (project / ".nh/.gitignore").read_text() == "*\n!.gitignore\n!README.md\n"
+    again = env.json("scaffold", "--data", url, cwd=project)
+    assert {"path": HOSTS, "action": "kept"} in again["paths"]
+    assert approved(project) == ["data.example.org"]
+    human = env.run("scaffold", "--data", url, cwd=project)
+    shown = [line.split() for line in human.stdout.splitlines()]
+    assert human.returncode == 0 and [HOSTS, "kept"] in shown, human.stdout
+
+
+@pytest.mark.parametrize(
+    ("url", "secrets", "key"),
+    [
+        (
+            "https://analyst:s3cr3tPw@data.example.org:8443/private/trips.csv?token=tok_abc#frag",
+            ("analyst", "s3cr3tPw", "tok_abc", "frag"),
+            "data.example.org",
+        ),
+        ("https://analyst:p%40ssw0rd@data.example.org/t.csv", ("p%40ssw0rd",), "data.example.org"),
+        ("https://analyst:pa$$w0rd@data.example.org/t.csv", ("pa$$w0rd",), "data.example.org"),
+        (
+            "https://data.example.org/exports/trips.csv?X-Amz-Signature=sig123",
+            ("sig123",),
+            "data.example.org",
+        ),
+        (
+            "s3://trips-bucket/k/AKIAIOSFODNN7EXAMPLE/trips.parquet",
+            ("AKIAIOSFODNN7EXAMPLE",),
+            "s3://trips-bucket",
+        ),
+    ],
+)
+def test_a_credentialed_url_approves_only_its_host(env, project, url, secrets, key):
+    env.script("uv", "exit 0")
+    proc = env.run("scaffold", "--data", url, "--json", cwd=project)
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["data"]["approved_host"] == key
+    text = (project / HOSTS).read_text(encoding="utf-8")
+    assert json.loads(text) == [key]  # no port, path, query or userinfo either
+    human = env.run("scaffold", "--data", url, cwd=project).stdout
+    for secret in secrets:
+        assert secret not in text and secret not in proc.stdout and secret not in human, secret
+
+
+def test_approving_merges_with_the_hosts_there(tmp_path):
+    (tmp_path / ".nh/state").mkdir(parents=True)
+    (tmp_path / HOSTS).write_text('["api.example.org", "DATA.EXAMPLE.ORG"]', encoding="utf-8")
+    kept = core.scaffold(tmp_path, data=TRIPS_URL, tools=tools(uv=True))
+    assert {"path": HOSTS, "action": "kept"} in kept.paths
+    assert kept.data["approved_host"] == "data.example.org"
+    (tmp_path / HOSTS).write_text('["api.example.org"]', encoding="utf-8")
+    updated = core.scaffold(tmp_path, data=TRIPS_URL, tools=tools(uv=True))
+    assert {"path": HOSTS, "action": "updated"} in updated.paths
+    assert approved(tmp_path) == ["api.example.org", "data.example.org"]
+
+
+def test_approving_keeps_entries_it_cant_read(tmp_path):
+    (tmp_path / ".nh/state").mkdir(parents=True)
+    (tmp_path / HOSTS).write_text('["ok.example", 3, "https://x.example/"]', encoding="utf-8")
+    report = core.scaffold(tmp_path, data=TRIPS_URL, tools=tools(uv=True))
+    assert {"path": HOSTS, "action": "updated"} in report.paths
+    assert approved(tmp_path) == ["ok.example", 3, "https://x.example/", "data.example.org"]
+
+
+@pytest.mark.parametrize(
+    ("url", "key"),
+    [
+        ("s3://trips-bucket/2023/trips.parquet", "s3://trips-bucket"),
+        ("gcs://trips-bucket/trips.parquet", "gs://trips-bucket"),
+        ("hf://datasets/org/trips/data/train.parquet", "huggingface.co"),
+    ],
+)
+def test_a_bucket_or_service_url_approves_its_key(tmp_path, url, key):
+    report = core.scaffold(tmp_path, data=url, tools=tools(uv=True))
+    assert report.data["approved_host"] == key
+    assert approved(tmp_path) == [key]
+
+
+@pytest.mark.parametrize("content", ["{", '{"hosts": []}', "null", '"data.example.org"'])
+def test_a_list_that_isnt_one_is_left_alone(tmp_path, content):
+    (tmp_path / ".nh/state").mkdir(parents=True)
+    (tmp_path / HOSTS).write_text(content, encoding="utf-8")
+    report = core.scaffold(tmp_path, data=TRIPS_URL, tools=tools(uv=True))
+    assert {"path": HOSTS, "action": "skipped"} in report.paths
+    assert report.data["approved_host"] == ""
+    assert (tmp_path / HOSTS).read_text(encoding="utf-8") == content
+    [warning] = [w for w in report.warnings if HOSTS in w]
+    assert "data.example.org" in warning and "the first cell will ask" in warning
+
+
+@pytest.mark.parametrize(
+    ("data", "mode"),
+    [
+        ("trips.csv", "copy"),
+        ("trips.csv", "in-place"),
+        ("postgresql://me:pw@db.example.org:5432/trips", "auto"),
+        ("sqlite:///trips.db", "auto"),
+        ("file:///tmp/trips.csv", "auto"),
+        ("http://localhost:8000/trips.csv", "auto"),
+        ("https://127.0.0.1/trips.csv", "auto"),
+        ("", "auto"),
+    ],
+)
+def test_data_that_isnt_on_the_network_approves_nothing(tmp_path, data, mode):
+    project = tmp_path / "p"
+    project.mkdir()
+    if data == "trips.csv":
+        data = str(tmp_path / data)
+        Path(data).write_text("a\n1\n")
+    report = core.scaffold(project, data=data, data_mode=mode, tools=tools(uv=True))
+    assert not (project / HOSTS).exists()
+    assert report.data["approved_host"] == ""
+    assert HOSTS not in {p["path"] for p in report.paths}
+
+
+def test_adopt_mode_approves_the_data_host_too(env, project):
+    env.script("uv", "exit 0")
+    nb = {"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
+    (project / "old.ipynb").write_text(json.dumps(nb))
+    report = env.json("scaffold", "--adopt", "old.ipynb", "--data", TRIPS_URL, cwd=project)
+    assert {"path": HOSTS, "action": "created"} in report["paths"]
+    assert approved(project) == ["data.example.org"]
+
+
+def test_the_first_cell_reads_an_approved_url_with_no_question(tmp_path):
+    """first-cell.md's canonical cell with the data URL lints with no L012 once scaffold has
+    approved the host, as the gateway reads the list (design §6.4)."""
+    import re
+
+    from nh_gateway._shared import hosts
+    from nh_gateway._shared.paths import Layout
+    from nh_gateway.config import load
+    from nh_gateway.lint.lint import lint_cell
+
+    first_cell = (
+        Path(__file__).resolve().parents[2] / "plugins/nh/skills/init/reference/first-cell.md"
+    )
+    block = re.findall(r"```python\n(.*?)```", first_cell.read_text("utf-8"), flags=re.S)[0]
+    cell = block.replace('DATA_PATH = "../data/raw/sales.csv"', f'DATA_URL = "{TRIPS_URL}"')
+    cell = cell.replace("pd.read_csv(DATA_PATH)", "pd.read_csv(DATA_URL)")
+    assert TRIPS_URL in cell and "DATA_PATH" not in cell
+
+    def l012(project: Path) -> list[str]:
+        report = lint_cell(
+            cell, title=None, notes=None, intent=None, cfg=load(project), require_note=False,
+            require_intent=False, kernel_python=(3, 11), names_above=None,
+            approved_hosts=hosts.read_approved(Layout(project).approved_hosts),
+        )  # fmt: skip
+        return [i.rule for i in report.asks + report.errors + report.hints if i.rule == "L012"]
+
+    other = tmp_path / "other"
+    other.mkdir()
+    core.scaffold(other, data="https://api.example.org/other.csv", tools=tools(uv=True))
+    assert l012(other) == ["L012"]
+    project = tmp_path / "trips"
+    project.mkdir()
+    core.scaffold(project, data=TRIPS_URL, tools=tools(uv=True))
+    assert l012(project) == []
+
+
 def test_notebook_new(env, project):
     env.script("uv", "exit 0")
     env.json("scaffold", "--goal", "Forecast demand", cwd=project)

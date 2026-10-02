@@ -1,8 +1,9 @@
 """Scaffold an nh project: folders, harness.toml, .nh/, NOTEBOOK.md, env file, first notebook.
 
-Every write is create-only; an existing file is reported as kept and left alone. Two
+Every write is create-only; an existing file is reported as kept and left alone. Three
 edits are deliberate exceptions: the nh block appended to ``.gitignore`` (and a
-``DATA_URL`` line appended to ``.env``), and, only when the caller passes
+``DATA_URL`` line appended to ``.env``); the data URL's host merged into
+``.nh/state/approved_hosts.json`` (design §6.4); and, only when the caller passes
 ``add_dev_deps=True`` after the user agreed to the shown diff, the Jupyter packages
 added to an existing env file.
 """
@@ -23,7 +24,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .. import secrets
+from .. import hosts, secrets
+from ..paths import Layout
 
 HERE = Path(__file__).resolve().parent
 TEMPLATES = HERE / "templates"
@@ -749,6 +751,35 @@ def _copy_data(plan: DataPlan, project: Path, report: Report) -> None:
     report.add(rel, "copied")
 
 
+def data_host(plan: DataPlan) -> str | None:
+    """The host key a URL plan's data comes from (``data.example.org``, ``s3://trips-bucket``),
+    when it is on the network: a network scheme and a host nh can read that isn't this machine
+    (never a database URL, ``file://`` or localhost)."""
+    if plan.kind != "url":
+        return None
+    is_url, host = hosts.network_url(plan.given)
+    return host if is_url and host and not hosts.is_loopback(host) else None
+
+
+def _approve_data_host(project: Path, plan: DataPlan, report: Report, warnings: list[str]) -> str:
+    """Merge the data URL's host into ``.nh/state/approved_hosts.json``, so the first cell
+    reads it with no question (L012, design §6.4). Only the host: never the URL or its
+    credentials. A file that isn't a JSON list is left alone, with a warning."""
+    host = data_host(plan)
+    if host is None:
+        return ""
+    path = Layout(project).approved_hosts
+    action = hosts.approve(path, [host])
+    report.add(display_path(project, path), action)
+    if action == "skipped":
+        warnings.append(
+            f"{display_path(project, path)} is not a JSON list of hosts, so nh left it alone and "
+            f"did not approve {host}: the first cell will ask before reading the data."
+        )
+        return ""
+    return host
+
+
 def scaffold(
     project: Path,
     *,
@@ -843,6 +874,7 @@ def scaffold(
     (project / ".nh").mkdir(exist_ok=True)
     _write(project, ".nh/README.md", (TEMPLATES / "nh_README.md.tmpl").read_text("utf-8"), report)
     _write(project, ".nh/.gitignore", NH_GITIGNORE, report)
+    approved_host = _approve_data_host(project, plan, report, warnings)
     _write(project, "harness.toml", render_harness_toml(values), report)
     notebook_md = render_notebook_md(
         display_name, goal, plan.source, problem_type, notebook, bool(plan.secret_url)
@@ -909,6 +941,7 @@ def scaffold(
         "reader": plan.reader,
         "bytes": plan.size,
         "secret_in_env": secret_stored,
+        "approved_host": approved_host,
     }
     report.harness = values
     report.notebook = notebook

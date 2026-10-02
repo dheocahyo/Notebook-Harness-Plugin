@@ -14,7 +14,7 @@ data path as the kernel sees it from the notebook it set up (the new
 | Scaffold reported `data.mode` | In the cell |
 |---|---|
 | `copy`, `in-place` | `DATA_PATH = "<data.path_from_notebook>"`: for example `"../data/raw/sales.csv"` from `notebooks/`, `"sales.csv"` for a notebook at the project root, an absolute path for data outside the project |
-| `url` without credentials | the URL, as `DATA_URL` |
+| `url` without credentials | the URL, as `DATA_URL` (scaffold approved its host, `data.approved_host`, so nh writes the cell without asking) |
 | `url` with credentials (`data.secret_in_env`) | read `DATA_URL` from the project's `.env` (below); never print it |
 
 Other project files follow the same rule: count the folders in the scaffold's

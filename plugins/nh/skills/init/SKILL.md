@@ -65,6 +65,10 @@ adding `--adopt <notebook>` when the user adopts one. It never overwrites a
 file. Report what it created and what it kept, one line each.
 - A URL with credentials is stored in `.env` as `DATA_URL`. Never repeat its
   query string, credentials or the path parts the report shows as `…` in chat.
+- When the report's `data.approved_host` is set (an http(s), s3 or similar
+  data URL; never a database URL, `file://` or localhost), scaffold approved
+  that host in `.nh/state/approved_hosts.json`, so nh writes the loader cell
+  without asking. Say so in the report.
 - If `env.dev_diff` is not empty (an existing pyproject.toml or
   environment.yml lacks JupyterLab, jupyter-collaboration or ipykernel), show
   the diff and ask yes/no with AskUserQuestion. On yes, re-run the same

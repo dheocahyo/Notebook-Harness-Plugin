@@ -13,15 +13,16 @@ import re
 import sys
 import textwrap
 import tokenize
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from nh_gateway._shared import hosts
 from nh_gateway._shared.patterns import CELL_NOTEBOOK_WRITES, CELL_PACKAGE_INSTALL, CELL_SEPARATORS
 from nh_gateway._shared.text import count_words, normalize_bullet, normalize_title, split_notes
 from nh_gateway.config import ASK_RULES, Config
 from nh_gateway.dataflow import EVERYTHING, Flow, base_name, flow_of
-from nh_gateway.lint import secret_scan
+from nh_gateway.lint import network, secret_scan
 from nh_gateway.lint.magics import Masked, lines_of, mask
 
 Severity = Literal["error", "hint", "ask"]
@@ -197,6 +198,8 @@ class _Cell:
     intent: str | None
     bullets: list[str]
     names_above: set[str] | None
+    approved_hosts: frozenset[str]  # host keys; L012 skips a site whose hosts are all here
+    code_above: tuple[str, ...]  # the code cells above, in order: L012 reads their names
 
     @classmethod
     def build(
@@ -208,6 +211,8 @@ class _Cell:
         intent: str | None,
         bullets: list[str],
         names_above: set[str] | None,
+        approved_hosts: Collection[str] = (),
+        code_above: Sequence[str] = (),
     ) -> _Cell:
         source = "\n".join(lines_of(code or ""))
         masked = mask(source)
@@ -242,6 +247,8 @@ class _Cell:
             intent=intent,
             bullets=bullets,
             names_above=names_above,
+            approved_hosts=frozenset(filter(None, map(hosts.normalize_entry, approved_hosts))),
+            code_above=tuple(code_above),
         )
 
     @property
@@ -252,6 +259,11 @@ class _Cell:
     def secrets(self) -> secret_scan.Scan:
         """What would show a secret; L011 and L014 share one scan."""
         return secret_scan.scan(self.masked, self.lines, self.tree, self.names_above)
+
+    @functools.cached_property
+    def network(self) -> list[network.Site]:
+        """Where the cell reaches the network (L012)."""
+        return network.scan(self.masked, self.lines, self.tree, network.bindings(self.code_above))
 
     @property
     def empty(self) -> bool:
@@ -275,11 +287,23 @@ def lint_cell(
     require_intent: bool,
     kernel_python: tuple[int, int] | None,
     names_above: set[str] | None,
+    approved_hosts: Collection[str] = frozenset(),
+    code_above: Sequence[str] = (),
 ) -> LintReport:
+    """Lint one cell. ``approved_hosts``: the project's approved host keys (the gateway reads
+    ``.nh/state/approved_hosts.json`` per call), which L012 lets through; ``code_above``: the
+    code cells above it, whose names L012 reads (design §6.4)."""
     clean_title = normalize_title(title) if title and title.strip() else None
     bullets = [re.sub(r"\s*\n\s*", " ", bullet) for bullet in split_notes(notes)]
     cell = _Cell.build(
-        code, cfg, title=clean_title, intent=intent, bullets=bullets, names_above=names_above
+        code,
+        cfg,
+        title=clean_title,
+        intent=intent,
+        bullets=bullets,
+        names_above=names_above,
+        approved_hosts=approved_hosts,
+        code_above=code_above,
     )
     issues: list[Issue] = []
     if cell.empty:
@@ -816,6 +840,35 @@ def _shell_word(word: str) -> str:
 def _and(parts: list[str]) -> str:
     """`a`, `b` and `c`."""
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _network(cell: _Cell) -> Finding | None:
+    """L012, an ask by default (design §6.4): the hosts the cell reaches that the project hasn't
+    approved, never a URL, so no userinfo, path or token reaches the text."""
+    approved = cell.approved_hosts
+    left = [
+        site
+        for site in cell.network
+        if site.unknown or not site.hosts or not set(site.hosts) <= approved
+    ]
+    if not left:
+        return None
+    named = list(dict.fromkeys(h for site in left for h in site.hosts if h not in approved))
+    parts = [f"`{host}`" for host in named[:3]]
+    if len(named) > 3:
+        parts.append(f"{len(named) - 3} more")
+    if not parts:
+        clause = "connects to the network"
+    else:
+        if any(site.unknown for site in left):
+            parts.append("other hosts")
+        clause = f"connects to {_and(parts)} over the network"
+    return (
+        f"The cell {clause} (`{left[0].where}`{_more(len(left))}).",
+        "Don't reach the network from this cell: ask the user to download what it needs into "
+        "the project (for example `data/raw/`), then read it from there.",
+        clause,
+    )
 
 
 def _markdown_output(cell: _Cell) -> Finding | None:
@@ -1457,6 +1510,7 @@ def _long_bullet(cell: _Cell) -> Finding | None:
 _CHECKS: list[tuple[str, str, Callable[[_Cell], Finding | None]]] = [
     ("L008", "notebook_write", _notebook_write),
     ("L009", "package_install", _package_install),
+    ("L012", "network", _network),
     ("L010", "markdown_output", _markdown_output),
     ("L011", "secret_print", _secret_print),
     ("L014", "secret_name", _secret_name),

@@ -68,6 +68,7 @@ class Layout:
         self.lab_json = self.state / "lab.json"
         self.stale_json = self.state / "stale.json"
         self.drift_json = self.state / "kernel_drift.json"
+        self.approved_hosts = self.state / "approved_hosts.json"  # nhctl scaffold writes it
 
     def turn_file(self, session_id: str) -> Path:
         return self.turns / f"{safe_name(session_id)}.json"

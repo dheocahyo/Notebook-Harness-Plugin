@@ -151,9 +151,10 @@ Each rule is `"off"`, `"hint"`, `"error"` or `"ask"`. `"error"` rejects the
 cell before it is written; `"hint"` reports it after the run; `"off"` skips it.
 `"ask"` makes nh ask you in chat before it writes the cell (E122): your yes, on
 its own in your next message, lets that exact cell through once; anything else
-drops it. Strict mode leaves an ask an ask. Only `package_install` can be
-`"ask"`: nh has a question for it, and none for the other rules. Any other
-value falls back to the rule's default and shows under `--- config ---`. With
+drops it. Strict mode leaves an ask an ask. Only `package_install` and
+`network` can be `"ask"`: nh has a question for them, and none for the other
+rules. Any other value falls back to the rule's default and shows under
+`--- config ---`. With
 `secret_print` at `"hint"` or `"off"`, a cell can print an env var's value into
 the notebook; nh still hides the values it knows as secrets from Claude
 (`[redacted:NAME]`).
@@ -161,6 +162,7 @@ the notebook; nh still hides the values it knows as secrets from Claude
 | Key | Rule | Default | Fires on |
 |---|---|---|---|
 | `package_install` | L009 | `"ask"` | a package install (or removal) in a cell: `!pip install`, `%pip install`, `%conda install`, `!uv add` and the like (`%pip list` is fine). nh asks you first, naming the packages, since the next env sync removes a kernel-only install (`uv add <pkg>` keeps it). `"error"` refuses such cells, and the agent asks you and installs with a command you approve instead. |
+| `network` | L012 | `"ask"` | a cell that reaches a host the project hasn't approved: a URL given to a reader or any other call (`pd.read_csv("https://…")`, `s3://`, `gs://`, a name holding one, also from an earlier cell, an f-string or `+` with its host in the code), `requests`, `httpx`, `urllib`, `aiohttp`, `socket`, and `!curl`, `!wget`, `!kaggle`, `!pip download`, `!git clone`, `!scp`, `!rsync host:`, `!ssh` (also in `%%bash`, `os.system` and `subprocess`). nh asks you first, naming the hosts (never the URL). Not network: database URLs (`postgresql://…`), `file://`, `localhost` and `127.0.0.1`, and a URL nh can't see in the code (from the env or `.env` given to a reader, built at run time). The approved hosts are `.nh/state/approved_hosts.json`, a JSON list of host names (`["data.example.org"]`), and of buckets as `s3://<bucket>` (`gs://<bucket>`, `az://<container>`): `/nh:init` adds its data URL's host there, and you can add more by hand. The list lives in `.nh/`, which is git-ignored, so it is local to your clone. A host matches exactly, whatever the URL's case, port or userinfo; a subdomain needs its own entry. When the file isn't a JSON list, or holds entries that aren't host names (a URL, a path), they approve nothing and `nh_inspect`'s status and each write's `--- config ---` lines say so. Your yes to the question approves that one cell, not the host. `"error"` refuses such cells, and the agent asks you to download the data into the project instead. |
 | `notebook_write` | L008 | `"error"` | a cell that writes an `.ipynb` file |
 | `markdown_output` | L010 | `"error"` | `%%markdown`, `%%html`, or `Markdown()`/`HTML()`/`Latex()` showing prose |
 | `secret_print` | L011 | `"error"` | code that would show an env var's value, secret or not (nh can't tell which values are secrets): `print(os.environ["API_KEY"])`, `os.getenv("API_KEY")` as the last line, a variable holding one, `os.environ.keys()` shown (its repr holds every value), `%env`, `!env`, `!printenv`, `!echo $API_KEY`, `!cat .env`, a `.env` file read in Python and shown. Checking is fine: `print("API_KEY" in os.environ)`, `print(bool(os.getenv("API_KEY")))`, `sorted(os.environ)`, `len(key)`, passing it on (`create_engine(url)`), or an env var the cell set to a literal (`os.environ["MODE"] = "dev"`) |

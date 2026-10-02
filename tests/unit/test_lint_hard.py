@@ -1,4 +1,5 @@
-"""Hard lint rules (L001–L011): what rejects a cell before anything is written."""
+"""Hard lint rules (L001–L012): what rejects a cell, or holds it for the user's yes, before anything
+is written."""
 
 from __future__ import annotations
 
@@ -668,8 +669,11 @@ def test_l009_text_scan_is_linear() -> None:
     assert issue.rule == "L009" and "`x`" in issue.question
 
 
-# One cell per rule that can ask (config.ASK_RULES): C5b and C5c add theirs here.
-ASK_SAMPLES = {"package_install": ("L009", "!pip install seaborn")}
+# One cell per rule that can ask (config.ASK_RULES): C5c adds its own here.
+ASK_SAMPLES = {
+    "package_install": ("L009", "!pip install seaborn"),
+    "network": ("L012", 'trips = pd.read_csv("https://data.example.org/trips-2023.csv")'),
+}
 
 
 @pytest.mark.parametrize("level", ["ask", "hint", "error"])
@@ -699,6 +703,1226 @@ def test_only_an_ask_rule_has_a_question() -> None:
     report = lint("# %%\n!pip install x", title="a b c d e f g h i")
     assert all(issue.question == "" for issue in report.errors + report.hints)
     assert [issue.question != "" for issue in report.asks] == [True]
+
+
+# L012 -------------------------------------------------------------------------------------------
+# Design §6.4: the scan's Source table, its "Not network" table, the quiet calls and the
+# approved hosts. Every entry of network.py's hand-written tables has a row here that fails when
+# the entry is taken out (L012_EACH_ENTRY, L012_PASSES_ON, L012_QUIET_EACH, L012_FILLS and
+# L012_VALUE_OPTIONS hold the forms the generic rules would catch anyway); `_STR_METHODS`, built
+# from `str`'s own methods, is sampled.
+L012_FIX = (
+    "Don't reach the network from this cell: ask the user to download what it needs into the "
+    "project (for example `data/raw/`), then read it from there."
+)
+TRIPS_URL = "https://data.example.org/trips-2023.csv"
+
+
+def network_issues(code: str, approved: Any = (), **overrides: Any) -> list[Issue]:
+    report = lint(code, approved_hosts=approved, **overrides)
+    return [i for i in report.errors + report.hints + report.asks if i.rule == "L012"]
+
+
+def network_message(code: str, approved: Any = ()) -> str | None:
+    found = network_issues(code, approved)
+    return found[0].message if found else None
+
+
+def reaches(hosts: str, where: str, more: int = 0) -> str:
+    """The message for a site list: ``hosts`` as the clause names them ("" for none nh can
+    read)."""
+    clause = f"connects to {hosts} over the network" if hosts else "connects to the network"
+    return f"The cell {clause} (`{where}`{f' (+{more} more)' if more else ''})."
+
+
+DATA = "`data.example.org`"
+API = "`api.example.org`"
+BUCKET = "`s3://trips-bucket`"
+HF = "`huggingface.co`"
+GITHUB = "`github.com`"
+L012_FIRES = [
+    # a network URL literal passed to a call: positional, keyword, starred, in a display
+    (f'trips = pd.read_csv("{TRIPS_URL}")', reaches(DATA, "pd.read_csv")),
+    (
+        'trips = pl.scan_parquet("s3://trips-bucket/2023/*.parquet")',
+        reaches(BUCKET, "pl.scan_parquet"),
+    ),
+    (
+        'trips.to_parquet("gs://trips-bucket/out.parquet")',
+        reaches("`gs://trips-bucket`", "trips.to_parquet"),
+    ),
+    ('trips = pd.read_parquet("az://trips/t.parquet")', reaches("`az://trips`", "pd.read_parquet")),
+    (
+        'trips = pd.read_parquet("hf://datasets/org/trips/t.parquet")',
+        reaches(HF, "pd.read_parquet"),
+    ),
+    # the userinfo may hold anything; an unknown port or userinfo leaves the host literal
+    (
+        'trips = pd.read_csv("https://user:p%40ss@data.example.org/x.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_csv("https://user:pa$$w0rd@data.example.org/x.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_csv("https://{}:{}@data.example.org/x.csv".format(user, pw))',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_csv(f"https://{user}:{pw}@data.example.org/x.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_csv(f"https://data.example.org:{port}/x.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_csv("https://%s@data.example.org/x.csv" % creds)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_parquet("abfss://trips-bucket@acct.dfs.core.windows.net/t")',
+        reaches("`acct.dfs.core.windows.net`", "pd.read_parquet"),
+    ),
+    (
+        'trips = load(url="ftp://ftp.example.org/pub/trips.csv")',
+        reaches("`ftp.example.org`", "load"),
+    ),
+    (f'trips = load(*["{TRIPS_URL}"])', reaches(DATA, "load")),
+    (f'trips = read_all({{"2023": "{TRIPS_URL}"}})', reaches(DATA, "read_all")),
+    (
+        f'trips = read_all(("{TRIPS_URL}", "https://api.example.org/t"))',
+        reaches(f"{DATA} and {API}", "read_all"),
+    ),
+    (f'subprocess.run(["curl", "-O", "{TRIPS_URL}"])', reaches(DATA, "subprocess.run")),
+    (f'loaders["csv"]("{TRIPS_URL}")', reaches(DATA, "loaders[…]")),
+    (f'trips = pd.concat(map(pd.read_csv, ["{TRIPS_URL}"]))', reaches(DATA, "map")),
+    # through a name, in statement order
+    (f'TRIPS_URL = "{TRIPS_URL}"\ntrips = pd.read_csv(TRIPS_URL)', reaches(DATA, "pd.read_csv")),
+    (
+        f'SOURCES = {{"trips": "{TRIPS_URL}"}}\ntrips = pd.read_csv(SOURCES["trips"])',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'SOURCES = {{"trips": "{TRIPS_URL}"}}\nfor name, url in SOURCES.items():\n    frames[name] = pd.read_csv(url)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'SOURCES = {{"trips": "{TRIPS_URL}"}}\ntrips = pd.read_csv(SOURCES.get("trips"))',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'URLS = ["{TRIPS_URL}"]\nframes = [pd.read_csv(u) for u in URLS]',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (f'frames = {{u: pd.read_csv(u) for u in ["{TRIPS_URL}"]}}', reaches(DATA, "pd.read_csv")),
+    (f'if (url := "{TRIPS_URL}"):\n    trips = pd.read_csv(url)', reaches(DATA, "pd.read_csv")),
+    (f'def load(url="{TRIPS_URL}"):\n    return pd.read_csv(url)', reaches(DATA, "pd.read_csv")),
+    (f'def load(*, url="{TRIPS_URL}"):\n    return pd.read_csv(url)', reaches(DATA, "pd.read_csv")),
+    (
+        f'URL = "{TRIPS_URL}"\nCLEAN = URL.strip()\ntrips = pd.read_csv(CLEAN)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'URLS = []\nURLS.append("{TRIPS_URL}")\ntrips = pd.read_csv(URLS[0])',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'SRC, OUT = "{TRIPS_URL}", "out.csv"\ntrips = pd.read_csv(SRC)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'if fresh:\n    URL = "{TRIPS_URL}"\nelse:\n    URL = "trips.csv"\ntrips = pd.read_csv(URL)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\ntrips = pd.read_csv(URL if fresh else "trips.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (f'URL = "{TRIPS_URL}"\ntrips = pd.read_csv(str(URL)[:200])', reaches(DATA, "pd.read_csv")),
+    (
+        f'cfg = {{}}\ncfg["url"] = "{TRIPS_URL}"\ntrips = pd.read_csv(cfg["url"])',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'URL = os.environ.get("DATA_URL") or "{TRIPS_URL}"\ntrips = pd.read_csv(URL)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'URLS = ["{TRIPS_URL}"]\nfor u in tqdm(URLS, desc="files"):\n    frames.append(pd.read_csv(u))',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'TRIPS_URL = "{TRIPS_URL}"\nstations = pd.read_csv(TRIPS_URL.rsplit("/", 1)[0] + "/stations.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\nclean = pd.read_csv(URL.split("?")[0])',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    # a literal host from a name, by itself or as one of several
+    (
+        'HOST = "data.example.org"\ntrips = pd.read_csv(f"https://{HOST}/trips.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'HOST = "data.example.org"\ntrips = pd.read_csv("https://" + HOST + "/trips.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'HOST = "data.example.org"\ntrips = pd.read_csv("https://%s/trips.csv" % HOST)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'HOST = "data.example.org"\ntrips = pd.read_csv("https://{}/trips.csv".format(HOST))',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'HOST = "data.example.org"\nPORT = 8443\ntrips = pd.read_csv(f"https://{HOST}:{PORT}/t.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'if prod:\n    HOST = "data.example.org"\nelse:\n    HOST = "api.example.org"\ntrips = pd.read_csv(f"https://{HOST}/t.csv")',
+        reaches(f"{DATA} and {API}", "pd.read_csv"),
+    ),
+    # a string that starts with a URL, or with a name that holds one
+    (
+        'trips = pd.read_csv(f"https://data.example.org/trips/{year}.csv")',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    ('trips = pd.read_csv(f"https://data.example.org?year={year}")', reaches(DATA, "pd.read_csv")),
+    ('trips = pd.read_csv("https://data.example.org/trips/" + name)', reaches(DATA, "pd.read_csv")),
+    (
+        'trips = pd.read_csv("https://data.example.org/trips/%s.csv" % year)',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    (
+        'trips = pd.read_csv("https://data.example.org/trips/{}.csv".format(year))',
+        reaches(DATA, "pd.read_csv"),
+    ),
+    ('BASE = "https://api.example.org"\nitems = fetch(f"{BASE}/items")', reaches(API, "fetch")),
+    ('BASE = "https://api.example.org"\nitems = fetch(BASE + "/items")', reaches(API, "fetch")),
+    (
+        'BASE = "https://api.example.org"\nitems = fetch("{}/items".format(BASE))',
+        reaches(API, "fetch"),
+    ),
+    (
+        'BASE = "https://api.example.org/"\nitems = fetch(urljoin(BASE, "items"))',
+        reaches(API, "fetch"),
+    ),
+    (
+        'BASE = "https://api.example.org"\nitems = fetch(os.path.join(BASE, "items"))',
+        reaches(API, "fetch"),
+    ),
+    (
+        'BASE = "https://api.example.org"\nitems = fetch("/".join([BASE, "items"]))',
+        reaches(API, "fetch"),
+    ),
+    # network library calls: always, whatever the URL's source
+    (
+        'r = requests.get("https://api.example.org/v1/trips", timeout=10)',
+        reaches(API, "requests.get"),
+    ),
+    ("r = requests.post(ENDPOINT, json=payload)", reaches("", "requests.post")),
+    ('r = requests.get(os.environ["API_URL"])', reaches("", "requests.get")),
+    ("import requests as rq\nr = rq.put(url)", reaches("", "rq.put")),
+    ("from requests import get\nr = get(url)", reaches("", "get")),
+    (
+        'with httpx.stream("GET", "https://api.example.org/t") as r:\n    pass',
+        reaches(API, "httpx.stream"),
+    ),
+    (
+        'import urllib.request\nurllib.request.urlretrieve("https://data.example.org/t.csv", "t.csv")',
+        reaches(DATA, "urllib.request.urlretrieve"),
+    ),
+    (
+        "from urllib.request import urlopen\nwith urlopen(url) as f:\n    body = f.read()",
+        reaches("", "urlopen"),
+    ),
+    ('body = urlopen(Request("https://api.example.org/t")).read()', reaches(API, "urlopen")),
+    (
+        'import urllib3\nr = urllib3.request("GET", "https://api.example.org/t")',
+        reaches(API, "urllib3.request"),
+    ),
+    ('import aiohttp\nr = aiohttp.request("GET", url)', reaches("", "aiohttp.request")),
+    (
+        'import socket\nsock = socket.create_connection(("api.example.org", 443))',
+        reaches(API, "socket.create_connection"),
+    ),
+    (
+        'import socket\nHOST = "api.example.org"\nsock = socket.create_connection((HOST, 443))',
+        reaches(API, "socket.create_connection"),
+    ),
+    (
+        'import socket\naddress = socket.gethostbyname("api.example.org")',
+        reaches(API, "socket.gethostbyname"),
+    ),
+    (
+        'import ftplib\nftp = ftplib.FTP("ftp.example.org")',
+        reaches("`ftp.example.org`", "ftplib.FTP"),
+    ),
+    (
+        'import smtplib\nserver = smtplib.SMTP("mail.example.org", 587)',
+        reaches("`mail.example.org`", "smtplib.SMTP"),
+    ),
+    (
+        'from ftplib import FTP\nftp = FTP(host="ftp.example.org")',
+        reaches("`ftp.example.org`", "FTP"),
+    ),
+    (
+        'sock = socket.create_connection(address=("api.example.org", 443))',
+        reaches(API, "socket.create_connection"),
+    ),
+    ('r = requests.get(os.getenv("API_URL"))', reaches("", "requests.get")),
+    # a network method of a session the cell made
+    ('s = requests.Session()\nr = s.get("https://api.example.org/t")', reaches(API, "s.get")),
+    ("s = requests.Session()\nr = s.get(url)", reaches("", "s.get")),
+    (
+        'r = requests.Session().get("https://api.example.org/t")',
+        reaches(API, "requests.Session().get"),
+    ),
+    (
+        'with httpx.Client(base_url="https://api.example.org") as client:\n    r = client.get("/trips")',
+        reaches(API, "client.get"),
+    ),
+    (
+        "async def main():\n    async with aiohttp.ClientSession() as session:\n        async with session.get(url) as r:\n            return await r.text()",
+        reaches("", "session.get"),
+    ),
+    (
+        'async with httpx.AsyncClient() as client:\n    r = await client.get("https://api.example.org/t")',
+        reaches(API, "client.get"),
+    ),
+    (
+        'import http.client\nconn = http.client.HTTPSConnection("api.example.org")\nconn.request("GET", "/v1")',
+        reaches(API, "conn.request"),
+    ),
+    (
+        'from http import client\nconn = client.HTTPConnection("api.example.org", 8080)\nconn.request("GET", "/")',
+        reaches(API, "conn.request"),
+    ),
+    (
+        'pool = urllib3.PoolManager()\nr = pool.request("GET", "https://api.example.org/t")',
+        reaches(API, "pool.request"),
+    ),
+    (
+        'opener = urllib.request.build_opener()\nbody = opener.open("https://api.example.org/t").read()',
+        reaches(API, "opener.open"),
+    ),
+    ('sock = socket.socket()\nsock.connect(("api.example.org", 80))', reaches(API, "sock.connect")),
+    # shell: `!`, `!!`, `x = !`, %sx, %system, shell cells, bash -c, Python shell calls
+    (f"!curl -sSL {TRIPS_URL} -o ../data/raw/trips.csv", reaches(DATA, "!curl")),
+    (f"!!wget {TRIPS_URL}", reaches(DATA, "!wget")),
+    (f"listing = !curl -s {TRIPS_URL}", reaches(DATA, "!curl")),
+    (f"%sx curl -s {TRIPS_URL}", reaches(DATA, "%sx curl")),
+    (f"%system wget -q {TRIPS_URL}", reaches(DATA, "%system wget")),
+    (f"%%bash\nset -e\ncurl -O {TRIPS_URL}", reaches(DATA, "curl")),
+    (f"%%sh\nwget -q \\\n  {TRIPS_URL}", reaches(DATA, "wget")),
+    (f"%%script bash\ncd /tmp && wget {TRIPS_URL}", reaches(DATA, "wget")),
+    (f"%%script --bg bash\ncurl -O {TRIPS_URL}", reaches(DATA, "curl")),
+    (f"%%script --out log --bg bash\nwget {TRIPS_URL}", reaches(DATA, "wget")),
+    (f"%%system\ncurl {TRIPS_URL}", reaches(DATA, "curl")),
+    (f"%%!\ncurl {TRIPS_URL}", reaches(DATA, "curl")),
+    (f"for year in years:\n    !curl -O {TRIPS_URL}", reaches(DATA, "!curl")),
+    (f"!bash -c 'curl -O {TRIPS_URL}'", reaches(DATA, "!curl")),
+    (f"!sudo curl -O {TRIPS_URL}", reaches(DATA, "!curl")),
+    (f"!env HTTPS_PROXY=http://proxy:3128 curl -O {TRIPS_URL}", reaches(DATA, "!curl")),
+    (f"!mkdir -p raw && curl -s {TRIPS_URL} | head -5 > raw/head.csv", reaches(DATA, "!curl")),
+    ("!echo $(curl -s https://api.example.org/ip)", reaches(API, "!curl")),
+    ("!wget $DATA_URL", reaches("", "!wget")),
+    (f'URL = "{TRIPS_URL}"\n!curl -O {{URL}}', reaches(DATA, "!curl")),
+    (f'URL = "{TRIPS_URL}"\n!wget $URL', reaches(DATA, "!wget")),
+    ("!git clone https://github.com/org/repo", reaches(GITHUB, "!git clone")),
+    ("!git clone --depth 1 git@github.com:org/repo.git", reaches(GITHUB, "!git clone")),
+    ("!git clone $REPO_URL", reaches("", "!git clone")),
+    (
+        'REPO = "https://github.com/org/repo"\n!git clone {REPO} vendor/repo',
+        reaches(GITHUB, "!git clone"),
+    ),
+    ("!git -C repo pull", reaches("", "!git pull")),
+    ("!git pull", reaches("", "!git pull")),
+    ("!git push origin main", reaches("", "!git push")),
+    ("!git fetch https://github.com/org/repo main", reaches(GITHUB, "!git fetch")),
+    ("!git ls-remote git@github.com:org/repo.git", reaches(GITHUB, "!git ls-remote")),
+    ("!git submodule update --init", reaches("", "!git submodule")),
+    (
+        "!git submodule add https://github.com/org/lib vendor/lib",
+        reaches(GITHUB, "!git submodule"),
+    ),
+    (
+        "!scp trips.csv analyst@backup.example.org:/srv/data/",
+        reaches("`backup.example.org`", "!scp"),
+    ),
+    ("!scp trips.csv backup:/srv/data/", reaches("", "!scp")),
+    (
+        "!rsync -av data/ rsync://mirror.example.org/data/",
+        reaches("`mirror.example.org`", "!rsync"),
+    ),
+    ("!rsync -av data/ mirror.example.org::data", reaches("`mirror.example.org`", "!rsync")),
+    ("!ssh -p 2222 deploy@box.example.org 'ls /srv'", reaches("`box.example.org`", "!ssh")),
+    ("!sftp box", reaches("", "!sftp")),
+    ("!aws s3 cp s3://trips-bucket/t.csv ../data/raw/", reaches(BUCKET, "!aws")),
+    # commands that download by name, reach a host by itself, or install system packages
+    ("!kaggle datasets download -d org/trips -p ../data/raw", reaches("", "!kaggle")),
+    ("!gdown 1AbCdEf -O ../data/raw/trips.csv", reaches("", "!gdown")),
+    ("!huggingface-cli download org/trips --repo-type dataset", reaches("", "!huggingface-cli")),
+    ("!hf download org/trips", reaches("", "!hf")),
+    ("!gh release download v1 -R org/repo", reaches("", "!gh")),
+    ("!ping -c 1 api.example.org", reaches(API, "!ping")),
+    ("!nc -z api.example.org 443", reaches(API, "!nc")),
+    ("!dig @8.8.8.8 api.example.org", reaches(f"`8.8.8.8` and {API}", "!dig")),
+    ("!pip download pandas -d ../wheels", reaches("", "!pip download")),
+    ("!python -m pip download pandas", reaches("", "!pip download")),
+    (
+        "!pip3 download https://example.org/pkg-1.0-py3-none-any.whl",
+        reaches("`example.org`", "!pip download"),
+    ),
+    ("!apt-get install -y graphviz", reaches("", "!apt-get")),
+    ("!sudo apt update", reaches("", "!apt")),
+    ("!brew install wget", reaches("", "!brew")),
+    ("!npm ci", reaches("", "!npm")),
+    (f'os.system("curl -O {TRIPS_URL}")', reaches(DATA, "os.system")),
+    (f'subprocess.run(["wget", "{TRIPS_URL}"], check=True)', reaches(DATA, "subprocess.run")),
+    (
+        f'URL = "{TRIPS_URL}"\nsubprocess.check_output(f"curl -s {{URL}}", shell=True)',
+        reaches(DATA, "subprocess.check_output"),
+    ),
+    (f'URL = "{TRIPS_URL}"\nsubprocess.run(["curl", URL])', reaches(DATA, "subprocess.run")),
+    ('subprocess.run(["git", "clone", repo])', reaches("", "subprocess.run")),
+    (f'get_ipython().system("curl -O {TRIPS_URL}")', reaches(DATA, "get_ipython().system")),
+    # Python shell calls whose command nh renders
+    (
+        f'URL = "{TRIPS_URL}"\nos.system("wget -q -P ../data/raw " + URL)',
+        reaches(DATA, "os.system"),
+    ),
+    (f'URL = "{TRIPS_URL}"\nos.system("wget %s" % URL)', reaches(DATA, "os.system")),
+    (f'URL = "{TRIPS_URL}"\nos.system("curl -O {{}}".format(URL))', reaches(DATA, "os.system")),
+    (
+        f'URL = "{TRIPS_URL}"\nos.system(" ".join(["curl", "-O", URL]))',
+        reaches(DATA, "os.system"),
+    ),
+    (
+        f'cmd = "curl -L -o t.csv {TRIPS_URL}"\nsubprocess.run(cmd, shell=True)',
+        reaches(DATA, "subprocess.run"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\nsubprocess.run(shlex.split(f"curl -O {{URL}}"))',
+        reaches(DATA, "subprocess.run"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\ncmd = shlex.split(f"curl -O {{URL}}")\nsubprocess.run(cmd)',
+        reaches(DATA, "subprocess.run"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\nsubprocess.run(["bash", "-c", f"curl -O {{URL}}"])',
+        reaches(DATA, "subprocess.run"),
+    ),
+    (
+        'BASE = "https://data.example.org"\nsubprocess.run(["curl", "-O", f"{BASE}/t.csv"])',
+        reaches(DATA, "subprocess.run"),
+    ),
+    ('subprocess.run(f"curl -O {url}", shell=True)', reaches("", "subprocess.run")),
+    (f'ip = get_ipython()\nip.system(f"curl -O {TRIPS_URL}")', reaches(DATA, "ip.system")),
+    # IPython calls, magics with a statement, python -c: the code they run
+    (
+        f'get_ipython().run_line_magic("sx", "curl {TRIPS_URL}")',
+        reaches(DATA, "get_ipython().run_line_magic"),
+    ),
+    (
+        f'get_ipython().run_cell_magic("bash", "", "curl -O {TRIPS_URL}\\n")',
+        reaches(DATA, "get_ipython().run_cell_magic"),
+    ),
+    (
+        f'get_ipython().run_cell_magic("time", "", "pd.read_csv(\'{TRIPS_URL}\')")',
+        reaches(DATA, "get_ipython().run_cell_magic"),
+    ),
+    (
+        'get_ipython().run_line_magic("load", "https://example.org/plot.py")',
+        reaches("`example.org`", "get_ipython().run_line_magic"),
+    ),
+    (
+        'get_ipython().run_line_magic("timeit", "requests.get(\'https://api.example.org/t\')")',
+        reaches(API, "get_ipython().run_line_magic"),
+    ),
+    (
+        '%timeit -n 1 -r 1 requests.get("https://api.example.org/t")',
+        reaches(API, "requests.get"),
+    ),
+    (f'%prun -s cumulative pd.read_csv("{TRIPS_URL}")', reaches(DATA, "pd.read_csv")),
+    (f'%time trips = pd.read_csv("{TRIPS_URL}")', reaches(DATA, "pd.read_csv")),
+    (
+        f"!python -c \"import urllib.request; urllib.request.urlretrieve('{TRIPS_URL}', 't.csv')\"",
+        reaches(DATA, "!python -c"),
+    ),
+    (
+        f"%%bash\npython3 -c \"import pandas as pd; pd.read_csv('{TRIPS_URL}')\"",
+        reaches(DATA, "python3 -c"),
+    ),
+    ("%load https://example.org/snippets/plot.py", reaches("`example.org`", "%load")),
+    (f"%%time\ntrips = pd.read_csv('{TRIPS_URL}')", reaches(DATA, "pd.read_csv")),
+    (
+        f"%%script python3\nimport pandas as pd\npd.read_csv('{TRIPS_URL}')",
+        reaches(DATA, "pd.read_csv"),
+    ),
+    # several sites: the hosts in source order, once each
+    (
+        f'a = pd.read_csv("{TRIPS_URL}")\nb = pd.read_csv("https://api.example.org/b.csv")\nc = pd.read_csv("{TRIPS_URL}")',
+        reaches(f"{DATA} and {API}", "pd.read_csv", 2),
+    ),
+    (
+        "\n".join(f'f{n} = pd.read_csv("https://h{n}.example.org/t.csv")' for n in range(5)),
+        reaches(
+            "`h0.example.org`, `h1.example.org`, `h2.example.org` and 2 more", "pd.read_csv", 4
+        ),
+    ),
+    (
+        f'trips = pd.read_csv("{TRIPS_URL}")\nr = requests.get(url)',
+        reaches(f"{DATA} and other hosts", "pd.read_csv", 1),
+    ),
+]
+
+
+@pytest.mark.parametrize(("code", "message"), L012_FIRES)
+def test_l012_fires_on_every_source(code: str, message: str) -> None:
+    [issue] = network_issues(code)
+    assert (issue.message, issue.severity, issue.key) == (message, "ask", "network")
+    assert issue.fix == L012_FIX
+    assert issue.message == f"The cell {issue.question} ({issue.message.split(' (', 1)[1]}"
+
+
+# Each call, session, method and command network.py lists, in a form only its entry makes fire:
+# a URL nh can't read (no literal URL for the generic rule to catch), a bare host, a command
+# string. Taking an entry out of its table fails its row. The verbs are spelled out here, not
+# read from the scanner.
+_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "request")
+FTP = "`ftp.example.org`"
+SMTP = "`smtp.example.org`"
+L012_EACH_ENTRY = [
+    *[(f"r = requests.{verb}(url)", reaches("", f"requests.{verb}")) for verb in _VERBS],
+    *[(f"r = requests.api.{verb}(url)", reaches("", f"requests.api.{verb}")) for verb in _VERBS],
+    *[(f"r = httpx.{verb}(url)", reaches("", f"httpx.{verb}")) for verb in (*_VERBS, "stream")],
+    ("r = urlopen(url)", reaches("", "urlopen")),
+    ('urlretrieve(url, "t.csv")', reaches("", "urlretrieve")),
+    ('urllib.request.urlretrieve(url, "t.csv")', reaches("", "urllib.request.urlretrieve")),
+    ('r = urllib3.request("GET", url)', reaches("", "urllib3.request")),
+    ('socket.getaddrinfo("api.example.org", 443)', reaches(API, "socket.getaddrinfo")),
+    ('socket.gethostbyname_ex("api.example.org")', reaches(API, "socket.gethostbyname_ex")),
+    ('ftp = ftplib.FTP_TLS("ftp.example.org")', reaches(FTP, "ftplib.FTP_TLS")),
+    ('server = smtplib.SMTP_SSL("smtp.example.org")', reaches(SMTP, "smtplib.SMTP_SSL")),
+    # a session's own host, for a later method given none
+    ('ftp = ftplib.FTP("ftp.example.org")\nftp.connect()', reaches(FTP, "ftplib.FTP", 1)),
+    ('ftp = ftplib.FTP_TLS("ftp.example.org")\nftp.connect()', reaches(FTP, "ftplib.FTP_TLS", 1)),
+    (
+        'server = smtplib.SMTP("smtp.example.org")\nserver.send(b"NOOP\\r\\n")',
+        reaches(SMTP, "smtplib.SMTP", 1),
+    ),
+    (
+        'server = smtplib.SMTP_SSL("smtp.example.org")\nserver.send(b"NOOP\\r\\n")',
+        reaches(SMTP, "smtplib.SMTP_SSL", 1),
+    ),
+    (
+        'pool = urllib3.HTTPConnectionPool("api.example.org")\nr = pool.request("GET", "/t")',
+        reaches(API, "pool.request"),
+    ),
+    (
+        'pool = urllib3.HTTPSConnectionPool("api.example.org")\nr = pool.request("GET", "/t")',
+        reaches(API, "pool.request"),
+    ),
+    # sessions, then a method given a URL nh can't read
+    *[
+        (f"s = {session}()\nr = s.get(url)", reaches("", "s.get"))
+        for session in (
+            "requests.session",
+            "requests.sessions.Session",
+            "httpx.AsyncClient",
+            "urllib3.PoolManager",
+        )
+    ],
+    ('s = urllib3.ProxyManager(proxy)\nr = s.request("GET", url)', reaches("", "s.request")),
+    ("opener = urllib.request.build_opener()\nr = opener.open(url)", reaches("", "opener.open")),
+    *[
+        (f"s = requests.Session()\nr = s.{method}(url)", reaches("", f"s.{method}"))
+        for method in ("post", "put", "patch", "delete", "head", "options", "stream")
+        + ("send", "urlopen")
+    ],
+    (
+        "async def main():\n    async with aiohttp.ClientSession() as s:\n        ws = await s.ws_connect(url)",
+        reaches("", "s.ws_connect"),
+    ),
+    # FTP and SMTP made with no host connect through `connect`; a socket's address
+    ('ftp = ftplib.FTP()\nftp.connect("ftp.example.org")', reaches(FTP, "ftp.connect")),
+    ('ftp = ftplib.FTP_TLS()\nftp.connect("ftp.example.org")', reaches(FTP, "ftp.connect")),
+    (
+        'server = smtplib.SMTP()\nserver.connect("smtp.example.org", 25)',
+        reaches(SMTP, "server.connect"),
+    ),
+    (
+        'server = smtplib.SMTP_SSL()\nserver.connect("smtp.example.org", 465)',
+        reaches(SMTP, "server.connect"),
+    ),
+    (
+        'sock = socket.socket()\nsock.connect_ex(("api.example.org", 443))',
+        reaches(API, "sock.connect_ex"),
+    ),
+    (
+        'sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\nsock.sendto(b"ping", ("api.example.org", 53))',
+        reaches(API, "sock.sendto"),
+    ),
+    # Python shell calls given a command string
+    (f'out = os.popen("curl -s {TRIPS_URL}").read()', reaches(DATA, "os.popen")),
+    (f'subprocess.call("curl -O {TRIPS_URL}", shell=True)', reaches(DATA, "subprocess.call")),
+    (
+        f'subprocess.check_call("curl -O {TRIPS_URL}", shell=True)',
+        reaches(DATA, "subprocess.check_call"),
+    ),
+    (f'p = subprocess.Popen("curl -O {TRIPS_URL}", shell=True)', reaches(DATA, "subprocess.Popen")),
+    (f'out = subprocess.getoutput("curl -s {TRIPS_URL}")', reaches(DATA, "subprocess.getoutput")),
+    (
+        f'code, out = subprocess.getstatusoutput("curl -s {TRIPS_URL}")',
+        reaches(DATA, "subprocess.getstatusoutput"),
+    ),
+    (
+        f'out = get_ipython().getoutput("curl -s {TRIPS_URL}")',
+        reaches(DATA, "get_ipython().getoutput"),
+    ),
+    # the host tools, the package managers' verbs, each shell for %%script, its value options
+    *[
+        (f"!{tool} api.example.org", reaches(API, f"!{tool}"))
+        for tool in ("ftp", "telnet", "ncat", "netcat", "ping6", "nslookup", "host")
+        + ("traceroute", "whois")
+    ],
+    ("!yarn add lodash", reaches("", "!yarn")),
+    ("!pnpm add lodash", reaches("", "!pnpm")),
+    ("!npm i lodash", reaches("", "!npm")),
+    ("!apt-get upgrade -y", reaches("", "!apt-get")),
+    *[
+        (f"%%script {shell}\ncurl -O {TRIPS_URL}", reaches(DATA, "curl"))
+        for shell in ("sh", "zsh", "dash", "ksh")
+    ],
+    (f"%%script --err e bash\ncurl -O {TRIPS_URL}", reaches(DATA, "curl")),
+    (f"%%script --proc p bash\ncurl -O {TRIPS_URL}", reaches(DATA, "curl")),
+    (f"%%sx\ncurl -O {TRIPS_URL}", reaches(DATA, "curl")),
+    # rendered commands: shlex.join, shlex.quote, str(), a name holding a list
+    (
+        'os.system(shlex.join(["kaggle", "datasets", "download", "-d", "org/trips"]))',
+        reaches("", "os.system"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\nos.system("curl -sO " + shlex.quote(URL))',
+        reaches(DATA, "os.system"),
+    ),
+    (f'URL = "{TRIPS_URL}"\nq = shlex.quote(URL)\n!curl -sO {{q}}', reaches(DATA, "!curl")),
+    (f'URLS = ["{TRIPS_URL}"]\nq = shlex.quote(URLS[0])\n!curl -sO {{q}}', reaches(DATA, "!curl")),
+    (
+        f'URL = "{TRIPS_URL}"\nsubprocess.run(["curl", "-sO", str(URL)])',
+        reaches(DATA, "subprocess.run"),
+    ),
+    (
+        f'URL = "{TRIPS_URL}"\nARGS = ["curl", "-sO", URL]\nsubprocess.run(ARGS)',
+        reaches(DATA, "subprocess.run"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("code", "message"), L012_EACH_ENTRY)
+def test_l012_each_listed_call_and_command_fires_by_itself(code: str, message: str) -> None:
+    assert network_message(code) == message
+
+
+# What hands a URL back (a name, a loop or a call that passes it on), each by itself: the URL
+# reaches the call that reads it, not the one that passed it on.
+_URLS = f'URLS = ["{TRIPS_URL}"]\n'
+_URL = f'URL = "{TRIPS_URL}"\n'
+_LOOP = "\n    frames.append(pd.read_csv(u))"
+L012_PASSES_ON = [
+    *[
+        _URLS + f"for u in {wrap}(URLS):{_LOOP}"
+        for wrap in ("sorted", "reversed", "set", "frozenset", "list", "tuple", "iter")
+        + ("tqdm", "tqdm.tqdm", "copy.copy", "copy.deepcopy")
+    ],
+    _URLS + f"for u in filter(None, URLS):{_LOOP}",
+    _URLS + f"for i, u in enumerate(URLS):{_LOOP}",
+    _URLS + f'for name, u in zip(["trips"], URLS):{_LOOP}',
+    _URLS + f"from tqdm.auto import tqdm\nfor u in tqdm(URLS):{_LOOP}",
+    _URLS + f"from tqdm.notebook import tqdm\nfor u in tqdm(URLS):{_LOOP}",
+    _URLS + f"import tqdm.auto\nfor u in tqdm.auto.tqdm(URLS):{_LOOP}",
+    _URLS + f"import tqdm.notebook\nfor u in tqdm.notebook.tqdm(URLS):{_LOOP}",
+    _URLS + f"for u in URLS.copy():{_LOOP}",
+    f'SOURCES = {{"trips": "{TRIPS_URL}"}}\nfor u in SOURCES.values():{_LOOP}',
+    _URLS + "trips = pd.read_csv(max(URLS))",
+    _URLS + "trips = pd.read_csv(min(URLS))",
+    _URLS + "trips = pd.read_csv(next(iter(URLS)))",
+    *[
+        _URL + f"trips = pd.read_csv(URL.{method})"
+        for method in ("strip()", "rstrip()", "lstrip()", "lower()", "casefold()")
+        + ('replace("2023", "2024")', 'removeprefix(" ")', 'removesuffix("/")')
+        + ("encode().decode()",)
+    ],
+    _URL + 'trips = pd.read_csv(URL.partition("?")[0])',
+    _URL + 'BASE = URL.rpartition("/")[0]\ntrips = pd.read_csv(BASE + "/trips-2024.csv")',
+    _URL + "trips = pd.read_csv(urlparse(URL).geturl())",
+    _URL + "trips = pd.read_csv(urlunsplit(urlsplit(URL)))",
+    _URL + "trips = pd.read_csv(urldefrag(URL)[0])",
+]
+
+
+@pytest.mark.parametrize("code", L012_PASSES_ON)
+def test_l012_a_url_passed_on_reaches_the_call_that_reads_it(code: str) -> None:
+    assert network_message(code) == reaches(DATA, "pd.read_csv")
+
+
+L012_QUIET = [
+    # not network (plan default 12): databases, env-sourced URLs, run-time URLs, loopback, files
+    'engine = sqlalchemy.create_engine("postgresql://analyst:pw@db.example.org:5432/sales")',
+    'trips = pd.read_sql("SELECT * FROM trips LIMIT 5", "mysql+pymysql://u:p@db.example.org/x")',
+    'con = psycopg.connect(host="db.example.org", dbname="sales")',
+    'con = sqlite3.connect("../data/raw/trips.db")',
+    'con = duckdb.connect("md:trips")',
+    'trips = pd.read_csv(os.environ["DATA_URL"])',
+    f'trips = pd.read_csv(os.getenv("DATA_URL", "{TRIPS_URL}"))',
+    f'trips = pd.read_csv(os.environ.get("DATA_URL", "{TRIPS_URL}"))',
+    f'URL = getenv("DATA_URL", "{TRIPS_URL}")',
+    f'SRC, OUT = "{TRIPS_URL}", "out.csv"\ntrips.to_csv(OUT)',  # each name its own value
+    f'URL = environ.get("DATA_URL", "{TRIPS_URL}")',
+    f'src = np.select([is_remote, is_local], ["{TRIPS_URL}", "../data/raw/t.csv"])',
+    f'req = requests.Request("GET", "{TRIPS_URL}")',
+    f'req = httpx.Request("GET", "{TRIPS_URL}")',
+    'DATA_URL = os.environ.get("DATA_URL") or env_values["DATA_URL"].strip("\'\\"")\ntrips = pd.read_csv(DATA_URL)',
+    'trips = pd.read_csv(f"https://{HOST}/trips.csv")',
+    'trips = pd.read_csv("https://" + host + "/trips.csv")',
+    'trips = pd.read_csv("https://{}/trips.csv".format(host))',
+    'trips = pd.read_csv("https://%s/trips.csv" % host)',
+    "trips = pd.read_csv(make_url(year))",
+    "trips = pd.read_csv(cfg.url)",
+    'trips = pd.read_csv("http://localhost:8000/trips.csv")',
+    'r = requests.get("http://127.0.0.1:5000/api")',
+    'r = requests.get("http://[::1]:8888/api/status")',
+    'r = requests.get("http://0.0.0.0:8000/")',
+    'r = requests.get("http://lab.localhost/api")',
+    'r = requests.get(f"http://localhost:{port}/api/kernels")',
+    'conn = http.client.HTTPConnection("localhost", 8888)\nconn.request("GET", "/api")',
+    "!curl -s http://localhost:8888/api/status",
+    'trips = pd.read_csv("file:///home/me/trips.csv")',
+    'trips = pd.read_csv("../data/raw/trips.csv")',
+    'trips = pd.read_parquet("data/raw/trips/")',
+    # prose holding a URL, and the quiet calls
+    f'print("Source: {TRIPS_URL}")',
+    f'plt.title("Trips (from {TRIPS_URL})")',
+    f'URL = "{TRIPS_URL}"\nprint(URL)',
+    f'URL = "{TRIPS_URL}"\nprint(f"reading {{URL}}")',
+    f'URL = "{TRIPS_URL}"\ndisplay(Markdown(f"[trips]({{URL}})"))',
+    f'URL = "{TRIPS_URL}"\nlogger.info("reading %s", URL)',
+    f'URL = "{TRIPS_URL}"\nlogging.getLogger(__name__).debug(URL)',
+    f'URL = "{TRIPS_URL}"\nwarnings.warn(f"{{URL}} is slow")',
+    f'URL = "{TRIPS_URL}"\nraise ValueError(f"bad URL: {{URL}}")',
+    f'URL = "{TRIPS_URL}"\nraise ValueError(URL)',
+    f'URL = "{TRIPS_URL}"\nok = name.endswith(URL)',
+    f'URL = "{TRIPS_URL}"\nfrom rich import print as rprint\nrprint(URL)',
+    # containers, frames and labels that hold a URL as a value
+    'pd.DataFrame({"url": ["https://a.example.com/x", "https://b.example.com/y"]})',
+    f'URL = "{TRIPS_URL}"\nsources = pd.Series([URL, URL])',
+    'df[df["referrer"].isin(["https://www.google.com/"])]',
+    f'URL = "{TRIPS_URL}"\nmine = df["src"].eq(URL)',
+    f'URL = "{TRIPS_URL}"\ndf = df.fillna({{"src": URL}}).assign(origin=URL)',
+    f'URL = "{TRIPS_URL}"\nflag = np.where(df["src"] == URL, 1, 0)',
+    f'URL = "{TRIPS_URL}"\ncounts = Counter([URL])',
+    f'URL = "{TRIPS_URL}"\nlocal = Path("../data/raw") / Path(URL).name',
+    f'URL = "{TRIPS_URL}"\nname = os.path.basename(URL)',
+    f'URL = "{TRIPS_URL}"\nkey = hashlib.sha256(URL.encode()).hexdigest()',
+    f'URL = "{TRIPS_URL}"\nquoted = shlex.quote(URL)',
+    f'URL = "{TRIPS_URL}"\nax.set_title(URL)',
+    f'ax.set_title("{TRIPS_URL}")',
+    f'URL = "{TRIPS_URL}"\ntrips.plot(title=URL)',
+    f'URL = "{TRIPS_URL}"\nax.plot(x, y, label=URL)',
+    f'URL = "{TRIPS_URL}"\nfor row in tqdm(rows, desc=URL):\n    pass',
+    f'URL = "{TRIPS_URL}"\nfig.update_layout(title=URL)',
+    f'URL = "{TRIPS_URL}"\nparser.add_argument("--url", default=URL)',
+    f'URL = "{TRIPS_URL}"\nfrom pydantic import HttpUrl\nu = HttpUrl(URL)',
+    'trips = pd.read_csv(f"https://{sub}.example.org/t.csv")',
+    'note(f"https://data.example.org/t.csv was {state}")',
+    f'URL = "{TRIPS_URL}"\nhost = urlparse(URL).netloc',
+    f'URL = "{TRIPS_URL}"\nparts = urllib.parse.urlsplit(URL)',
+    f'URL = "{TRIPS_URL}"\nok = URL.startswith("https://")',
+    f'URL = "{TRIPS_URL}"\nname = URL.split("/")[-1]',
+    f'URL = "{TRIPS_URL}"\nok = re.match(r"https://", URL)',
+    f'URL = "{TRIPS_URL}"\nn = len(URL)',
+    f'URL = "{TRIPS_URL}"\nreq = Request(URL)',
+    f'URL = "{TRIPS_URL}"\nconfig = dict(url=URL)',
+    f'URL = "{TRIPS_URL}"\ntext = json.dumps({{"url": URL}})',
+    f'URL = "{TRIPS_URL}"\nwith open("sources.txt", "w") as f:\n    f.write(URL)',
+    f'URL = "{TRIPS_URL}"\nkey = {{"a": 1}}.get("k", URL)',
+    'IFrame("https://data.example.org/dashboard", width=600, height=400)',
+    f'URL = "{TRIPS_URL}"',
+    f'SOURCES = {{"trips": "{TRIPS_URL}"}}',
+    # shell that stays here, or is L009's
+    f"!echo {TRIPS_URL}",
+    f"!printf '%s\\n' {TRIPS_URL}",
+    "!pip install git+https://github.com/org/pkg",
+    "%pip install https://example.org/pkg-1.0-py3-none-any.whl",
+    "!python -m pip install https://example.org/pkg-1.0-py3-none-any.whl",
+    *[f"!{tool} install -c https://conda.example.org/main trips" for tool in ("conda", "mamba")],
+    "!micromamba install -c https://conda.example.org/main trips",
+    "!uv pip install https://example.org/pkg-1.0-py3-none-any.whl",
+    f"!bash -c 'echo {TRIPS_URL}'",
+    "!git status",
+    "!git clone",
+    "!git clone ../other-repo copy",
+    "!git clone /srv/repos/trips.git",
+    "!git clone file:///srv/repos/trips.git",
+    "!git submodule status",
+    "!git submodule foreach git status",
+    "!git fetch ../other-repo",
+    "!git pull file:///srv/repos/trips.git main",
+    "!git log --oneline -5",
+    "!kaggle --version",
+    "!apt list --installed",
+    "!npm run build",
+    "!pip list",
+    f"%%script --bg bash\necho {TRIPS_URL}",
+    'subprocess.run(["ls", "-la", "../data/raw"])',
+    f'URL = "{TRIPS_URL}"\nos.system("echo " + URL)',
+    f'URL = "{TRIPS_URL}"\ncmd = f"curl -O {{URL}}"\nprint(cmd)',
+    "%timeit trips.dropna()",
+    "!curl --version",
+    "!scp trips.csv backup/trips.csv",
+    "!rsync -av data/ /mnt/backup/",
+    "!ls -la ../data/raw",
+    # cells nh doesn't read as code
+    f'%%html\n<img src="{TRIPS_URL}">',
+    "%%sql\nSELECT * FROM trips",
+    f"%%writefile fetch.py\nimport requests\nrequests.get('{TRIPS_URL}')",
+    "",
+]
+
+
+@pytest.mark.parametrize("code", L012_QUIET)
+def test_l012_is_quiet_on_code_that_stays_here(code: str) -> None:
+    assert network_issues(code) == []
+
+
+# Each quiet call, label keyword, write, logging call, shell word and option network.py lists,
+# given the URL by itself: taking the entry out makes the row ask. Spelled out here, not read
+# from the scanner.
+L012_QUIET_EACH = [
+    *[
+        _URL + f"x = {name}(URL)"
+        for name in ("print", "pprint", "pp", "display", "repr", "ascii", "format", "len")
+        + ("bool", "type", "hash", "id", "callable", "help", "Markdown", "HTML", "Latex")
+        + ("Code", "IFrame", "display_markdown", "display_html", "warn", "DataFrame", "Series")
+        + ("Index", "Categorical", "array", "asarray", "Counter", "OrderedDict", "defaultdict")
+        + ("deque", "HttpUrl", "AnyUrl", "AnyHttpUrl", "ValueError", "UserWarning")
+        + ("os.getenv", "os.getenvb", "os.environ.get", "os.environ.setdefault", "json.dumps")
+        + ("json.dump", "warnings.warn", "np.select", "yarl.URL", "getenv")
+        # urllib.parse's functions, imported or not; the quiet modules
+        + ("urljoin", "urlparse", "urlsplit", "urlunparse", "urlunsplit", "urlencode", "quote")
+        + ("quote_plus", "unquote", "unquote_plus", "parse_qs", "parse_qsl", "urldefrag")
+        + ("urllib.parse.quote", "re.escape", "logging.info", "IPython.display.Image")
+        + ("textwrap.dedent", "os.path.basename", "posixpath.basename", "ntpath.basename")
+        + ("pathlib.PurePosixPath", "hashlib.md5", "shlex.shlex")
+    ],
+    _URL + "x = isinstance(URL, str)",
+    _URL + "x = issubclass(URL, str)",
+    _URL + "log = logging.getLogger(URL)",
+    _URL + 'from numpy import where\nx = where(is_remote, URL, "")',
+    _URL + 'URL = environ.get("DATA_URL", URL)\ntrips = pd.read_csv(URL)',
+    # methods that compare, relabel or label
+    *[
+        _URL + f"x = obj.{method}(URL)"
+        for method in ("isin", "eq", "ne", "lt", "le", "gt", "ge", "fillna", "where", "mask")
+        + ("assign", "rename", "groupby", "contains", "drop", "query", "set_title", "set_xlabel")
+        + ("set_ylabel", "set_zlabel", "suptitle", "supxlabel", "supylabel", "xlabel", "ylabel")
+        + ("text", "annotate", "figtext", "legend", "set_label", "set_text", "set_caption")
+        + ("set_xticklabels", "set_yticklabels", "add_annotation", "update_layout")
+        + ("update_xaxes", "update_yaxes", "properties", "add_argument")
+        # file writes
+        + ("write", "writelines", "writerow", "writerows", "write_text", "write_bytes")
+    ],
+    *[
+        _URL + f"chart(rows, {keyword}=URL)"
+        for keyword in (
+            "title",
+            "label",
+            "xlabel",
+            "ylabel",
+            "zlabel",
+            "desc",
+            "description",
+            "caption",
+            "help",
+            "name",
+            "text",
+            "legend",
+        )
+    ],
+    *[
+        _URL + f"log.{method}(URL)"
+        for method in ("debug", "info", "warning", "warn", "error", "critical", "exception")
+        + ("fatal", "log")
+    ],
+    # a lookup's default is handed back, not requested
+    *[_URL + f'x = cache.{method}("trips", URL)' for method in ("get", "pop", "setdefault")],
+    # shell words that only say their arguments
+    *[f"!{word} {TRIPS_URL}" for word in ("echo", "printf", "print", "true", ":")],
+]
+
+
+@pytest.mark.parametrize("code", L012_QUIET_EACH)
+def test_l012_each_listed_quiet_call_is_quiet(code: str) -> None:
+    assert network_issues(code) == []
+
+
+# A name a mutating method fills (`URLS.extend([...])`) holds the URL; the method itself is no
+# request.
+L012_FILLS = [
+    "URLS = []\nURLS.append(URL)",
+    "URLS = []\nURLS.extend([URL])",
+    "URLS = []\nURLS.insert(0, URL)",
+    "URLS = set()\nURLS.add(URL)",
+    "URLS = set()\nURLS.update({URL})",
+    "URLS = deque()\nURLS.appendleft(URL)",
+    "URLS = deque()\nURLS.extendleft([URL])",
+    'SOURCES = {}\nSOURCES.setdefault("trips", URL)\nURLS = SOURCES.values()',
+]
+
+
+@pytest.mark.parametrize("fill", L012_FILLS)
+def test_l012_a_filled_name_holds_the_url(fill: str) -> None:
+    code = f"{_URL}{fill}\nfor u in URLS:{_LOOP}"
+    assert network_message(code) == reaches(DATA, "pd.read_csv")
+
+
+# Options that take a value, so the word after them is not the host, command or statement.
+L012_VALUE_OPTIONS = [
+    *[
+        (f"!ssh {option} x analyst@api.example.org", reaches(API, "!ssh"))
+        for option in ("-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m")
+        + ("-O", "-o", "-P", "-p", "-Q", "-R", "-S", "-W", "-w", "-B")
+    ],
+    *[
+        (f"!git {option} x fetch https://github.com/org/repo", reaches(GITHUB, "!git fetch"))
+        for option in ("-C", "-c", "--git-dir", "--work-tree", "--namespace")
+    ],
+    *[
+        (f"!env {option} x curl -sO {TRIPS_URL}", reaches(DATA, "!curl"))
+        for option in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string")
+    ],
+    *[
+        (f"%timeit {option} 3 pd.read_csv(URL)", reaches(DATA, "pd.read_csv"))
+        for option in ("-n", "-r", "-p", "-l", "-s", "-T", "-D")
+    ],
+]
+
+
+@pytest.mark.parametrize(("code", "message"), L012_VALUE_OPTIONS)
+def test_l012_an_option_s_value_is_not_its_word(code: str, message: str) -> None:
+    assert network_message(_URL + code if code.startswith("%") else code) == message
+
+
+def test_l012_canonical_text() -> None:
+    [issue] = lint(f'TRIPS_URL = "{TRIPS_URL}"\ntrips = pd.read_csv(TRIPS_URL)').asks
+    assert issue.rule == "L012" and issue.key == "network"
+    assert (
+        issue.message == "The cell connects to `data.example.org` over the network (`pd.read_csv`)."
+    )
+    assert issue.question == "connects to `data.example.org` over the network"
+    assert issue.fix == L012_FIX
+    unknown = lint("r = requests.get(url)").asks[0]
+    assert unknown.question == "connects to the network"
+
+
+APPROVED_FORMS = [
+    (TRIPS_URL, ["data.example.org"]),
+    ("https://analyst:pw@DATA.Example.ORG.:8443/trips.csv?token=x", ["data.example.org"]),
+    (TRIPS_URL, ["DATA.EXAMPLE.ORG."]),
+    (TRIPS_URL, ["data.example.org:443"]),
+    (TRIPS_URL, ["analyst@data.example.org"]),
+    (TRIPS_URL, ["[::1]", "data.example.org", 7, None, "not a host!"]),
+    ("https://bücher.example/trips.csv", ["xn--bcher-kva.example"]),
+    ("https://BÜCHER.example/trips.csv", ["Bücher.Example."]),
+    ("https://xn--bcher-kva.example/trips.csv", ["bücher.example"]),
+    ("http://[2001:DB8::1]:8080/trips.csv", ["2001:db8::1"]),
+    ("s3://trips-bucket/2023/trips.parquet", ["s3://trips-bucket"]),
+    ("s3a://trips-bucket/2023/trips.parquet", ["S3://Trips-Bucket/"]),
+    ("gcs://trips-bucket/t.parquet", ["gs://trips-bucket"]),
+    ("hf://datasets/org/trips/t.parquet", ["huggingface.co"]),
+    ("https://user:p%40ss@data.example.org/x.csv", ["data.example.org"]),
+    ("https://user:pa$$w0rd@data.example.org/x.csv", ["data.example.org"]),
+]
+
+
+@pytest.mark.parametrize(("url", "approved"), APPROVED_FORMS)
+def test_l012_skips_an_approved_host(url: str, approved: list[Any]) -> None:
+    code = f'DATA_URL = "{url}"\ntrips = pd.read_csv(DATA_URL)'
+    assert network_issues(code) != []
+    hosts = [h for h in approved if isinstance(h, str)]
+    assert network_issues(code, approved=frozenset(hosts)) == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        f"!curl -O {TRIPS_URL}",
+        f"%%bash\nwget {TRIPS_URL}",
+        f'r = requests.get("{TRIPS_URL}")',
+        'with httpx.Client(base_url="https://data.example.org") as c:\n    r = c.get("/t")',
+        'sock = socket.create_connection(("data.example.org", 443))',
+        "!git clone git@data.example.org:org/repo.git",
+        f'a = pd.read_csv("{TRIPS_URL}")\nb = pd.read_csv("http://localhost:8000/b.csv")',
+    ],
+)
+def test_l012_approved_hosts_cover_every_kind_of_site(code: str) -> None:
+    assert network_issues(code) != []
+    assert network_issues(code, approved=["data.example.org"]) == []
+
+
+def test_l012_approval_is_exact() -> None:
+    """A subdomain isn't covered, nor is a parent domain; a site nh can't read is never
+    skipped, and a cell with an approved and another host names only the other."""
+    sub = 'trips = pd.read_csv("https://api.data.example.org/t.csv")'
+    assert network_message(sub, ["data.example.org"]) == reaches(
+        "`api.data.example.org`", "pd.read_csv"
+    )
+    assert network_message(TRIPS_URL.join(['t = pd.read_csv("', '")']), ["example.org"]) is not None
+    assert network_message("r = requests.get(url)", ["data.example.org"]) == reaches(
+        "", "requests.get"
+    )
+    both = f'a = pd.read_csv("{TRIPS_URL}")\nb = pd.read_csv("https://api.example.org/b.csv")'
+    assert network_message(both, ["data.example.org"]) == reaches(API, "pd.read_csv")
+    one_site = f'frames = read_all(["{TRIPS_URL}", "https://api.example.org/b.csv"])'
+    assert network_message(one_site, ["data.example.org"]) == reaches(API, "read_all")
+    unreadable = f'frames = read_all(["{TRIPS_URL}", "https://faß.de/b.csv"])'
+    assert network_message(unreadable, ["data.example.org"]) == reaches("", "read_all")
+    alias = "!scp a.csv data.example.org:/x backup:/srv"
+    assert network_message(alias, ["data.example.org"]) == reaches("", "!scp")
+
+
+def test_l012_buckets_and_hosts_are_separate_keys() -> None:
+    s3 = 'trips = pd.read_parquet("s3://trips-bucket/t.parquet")'
+    assert network_issues(s3, approved=["s3://trips-bucket"]) == []
+    for other in (["trips-bucket"], ["gs://trips-bucket"], ["s3://trips-bucket/2023"]):
+        assert network_message(s3, other) == reaches(BUCKET, "pd.read_parquet"), other
+    named = 'trips = pd.read_csv("https://trips-bucket/t.csv")'
+    assert network_message(named, ["s3://trips-bucket"]) == reaches("`trips-bucket`", "pd.read_csv")
+
+
+def test_l012_idna_deviation_characters_are_never_approved() -> None:
+    """IDNA 2003 maps `faß.de` to `fass.de`; requests sends `xn--fa-hia.de`: a host nh can't
+    read, so no entry approves it."""
+    code = 'r = requests.get("https://faß.de/data.json")'
+    for approved in (["fass.de"], ["faß.de"], ["xn--fa-hia.de"]):
+        assert network_message(code, approved) == reaches("", "requests.get"), approved
+    wire = 'r = requests.get("https://xn--fa-hia.de/data.json")'
+    assert network_issues(wire, approved=["xn--fa-hia.de"]) == []
+
+
+ABOVE = [
+    f'TRIPS_URL = "{TRIPS_URL}"',
+    'client = httpx.Client(base_url="https://api.example.org")',
+    "import requests as rq\nfrom urllib.request import urlopen as fetch_url",
+    'HOST = "data.example.org"',
+]
+
+
+@pytest.mark.parametrize(
+    ("code", "above", "alone"),
+    [
+        (
+            'stations = pd.read_csv(TRIPS_URL.rsplit("/", 1)[0] + "/stations.csv")',
+            reaches(DATA, "pd.read_csv"),
+            None,
+        ),
+        ("trips = pd.read_csv(TRIPS_URL)", reaches(DATA, "pd.read_csv"), None),
+        ('r = client.get("/trips")', reaches(API, "client.get"), None),
+        ("r = rq.get(url)", reaches("", "rq.get"), None),
+        ("body = fetch_url(url).read()", reaches("", "fetch_url"), None),
+        ('trips = pd.read_csv(f"https://{HOST}/t.csv")', reaches(DATA, "pd.read_csv"), None),
+        ("!curl -O {TRIPS_URL}", reaches(DATA, "!curl"), reaches("", "!curl")),
+    ],
+)
+def test_l012_reads_names_from_the_cells_above(code: str, above: str, alone: str | None) -> None:
+    """A name, session or import bound in an earlier cell (one the user approved, say) counts
+    here; without the cells above nh knows nothing of it. The approved list still applies."""
+    assert network_message(code) == alone
+    assert [i.message for i in network_issues(code, code_above=ABOVE)] == [above]
+    both = ["data.example.org", "api.example.org"]
+    left = [i.message for i in network_issues(code, approved=both, code_above=ABOVE)]
+    assert left == ([] if "`" in above.split(" (")[0] else [above])
+
+
+def test_l012_cells_above_bind_but_never_ask() -> None:
+    from nh_gateway.lint import network
+
+    reads = "trips = pd.read_csv(URL)"
+    assert network_issues("trips.head()", code_above=[f'pd.read_csv("{TRIPS_URL}")']) == []
+    assert network_issues(reads, code_above=[f'URL = "{TRIPS_URL}"']) != []
+    rebound = [f'URL = "{TRIPS_URL}"', 'URL = "../data/raw/trips.csv"']
+    assert network_issues(reads, code_above=rebound) == []  # the last binding counts
+    here = f'URL = "../data/raw/trips.csv"\n{reads}'
+    assert network_issues(here, code_above=[f'URL = "{TRIPS_URL}"']) == []
+    broken = [f'URL = "{TRIPS_URL}"', "def broken(:", "%%bash\nURL=x", "%%sql\nSELECT 1"]
+    assert network_issues(reads, code_above=broken) != []  # an unparsable cell binds nothing
+    assert network_issues(reads, code_above=[f'%%time\nURL = "{TRIPS_URL}"']) != []
+    assert network.bindings([f'URL = "{TRIPS_URL}"', "def broken(:"]) == network.bindings(
+        [f'URL = "{TRIPS_URL}"']
+    )
+
+
+def test_l012_a_walk_of_the_cells_above_that_raises_leaves_the_seed_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nh_gateway.lint import network
+
+    def boom(source: str, seed: Any) -> Any:
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(network, "_cell_seed", boom)
+    above = [f'URL = "{TRIPS_URL}"']
+    assert network.bindings(above) == network.EMPTY
+    assert network_issues("trips = pd.read_csv(URL)", code_above=above) == []
+    assert network_issues(f'trips = pd.read_csv("{TRIPS_URL}")', code_above=above) != []
+
+
+def test_l012_walks_each_cell_above_once() -> None:
+    from nh_gateway.lint import network
+
+    above = [f'URL_{n} = "https://h{n}.example.org/t.csv"' for n in range(200)]
+    network._cell_seed.cache_clear()
+    started = time.perf_counter()
+    for _ in range(5):
+        [issue] = network_issues("trips = pd.read_csv(URL_199)", code_above=above)
+    assert time.perf_counter() - started < 3.0
+    assert issue.message == reaches("`h199.example.org`", "pd.read_csv")
+    info = network._cell_seed.cache_info()
+    assert info.misses == 200 and info.hits == 4 * 200
+
+
+def test_l012_reads_the_approved_hosts_file(tmp_path: Path) -> None:
+    """A missing or corrupt file approves nothing (the gateway reads it per call)."""
+    from nh_gateway._shared import hosts
+
+    code = f'trips = pd.read_csv("{TRIPS_URL}")'
+    path = tmp_path / "approved_hosts.json"
+    for text in [None, "", "{", '{"hosts": ["data.example.org"]}', '"data.example.org"', "\xff"]:
+        if text is not None:
+            path.write_bytes(text.encode("utf-8", "surrogateescape") if text != "\xff" else b"\xff")
+        assert network_issues(code, approved=hosts.read_approved(path)) != [], text
+    path.write_text('["data.example.org"]', encoding="utf-8")
+    assert network_issues(code, approved=hosts.read_approved(path)) == []
+
+
+SECRET_URL = (
+    "https://analyst:s3cr3t-pw@data.example.org:8443/private/trips.csv?token=tok_abc123#frag"
+)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        f'trips = pd.read_csv("{SECRET_URL}")',
+        f'URL = "{SECRET_URL}"\nr = requests.get(URL, auth=("analyst", "s3cr3t-pw"))',
+        f'r = requests.Session().get("{SECRET_URL}", headers={{"Authorization": "Bearer tok_abc123"}})',
+        f'!curl -H "Authorization: Bearer tok_abc123" "{SECRET_URL}"',
+        f'os.system("curl -u analyst:s3cr3t-pw {SECRET_URL}")',
+        "!scp trips.csv analyst@data.example.org:/private/tok_abc123/",
+    ],
+)
+def test_l012_text_holds_no_userinfo_path_query_or_token(code: str) -> None:
+    [issue] = network_issues(code)
+    text = f"{issue.message} {issue.question} {issue.fix}"
+    assert "`data.example.org`" in text
+    for part in ("analyst", "s3cr3t", "8443", "private", "trips.csv", "tok_abc", "frag", "Bearer"):
+        assert part not in text, (part, text)
+
+
+@pytest.mark.parametrize(
+    ("level", "mode", "where"),
+    [
+        ("ask", "advise", "ask"),
+        ("ask", "strict", "ask"),
+        ("error", "advise", "error"),
+        ("hint", "advise", "hint"),
+        ("hint", "strict", "error"),
+        ("off", "advise", None),
+        ("off", "strict", None),
+    ],
+)
+def test_l012_levels(level: str, mode: str, where: str | None) -> None:
+    cfg = config(network=level)
+    cfg.data["lint"]["mode"] = mode
+    report = lint(f'trips = pd.read_csv("{TRIPS_URL}")\ntrips.head()', cfg=cfg)
+    found = {s: rules(report, s) for s in ("error", "hint", "ask")}
+    assert found == {s: (["L012"] if s == where else []) for s in found}
+    assert report.ok == (where != "error")
+
+
+def test_l012_is_off_without_a_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At `off` the scan never runs; a scan that fails finds nothing, as L011's (§6.7)."""
+    from nh_gateway.lint import network
+
+    calls: list[str] = []
+    monkeypatch.setattr(network, "scan", lambda *args: calls.append("scan") or [])
+    lint(f'trips = pd.read_csv("{TRIPS_URL}")', cfg=config(network="off"))
+    assert calls == []
+
+    def boom(*args: Any) -> Any:
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(network, "scan", boom)
+    report = lint(f'!pip install x\ntrips = pd.read_csv("{TRIPS_URL}")')
+    assert rules(report, "ask") == ["L009"]
+
+
+def test_l012_asks_with_l009_in_one_question() -> None:
+    """Both asks, the install first: the gate joins their clauses into one question
+    (approvals.question; its text is pinned in tests/gateway/test_approvals.py)."""
+    report = lint(f'!pip install seaborn\ntrips = pd.read_csv("{TRIPS_URL}")')
+    assert rules(report, "ask") == ["L009", "L012"] and report.ok
+    assert [issue.question for issue in report.asks] == [
+        "installs `seaborn` into the kernel only, and the next env sync removes it "
+        "(`uv add seaborn` keeps it)",
+        "connects to `data.example.org` over the network",
+    ]
+    order = [rule for rule, _, _ in lint_module._CHECKS]
+    assert order.index("L009") + 1 == order.index("L012")
+
+
+def test_l012_scan_knows_the_same_python_cell_magics() -> None:
+    from nh_gateway.lint import network
+
+    assert network._PYTHON_CELL_MAGICS == lint_module.PYTHON_CELL_MAGICS
+
+
+def test_l012_scan_is_fast_on_a_long_cell() -> None:
+    lines = [
+        f'f{n} = pd.read_csv(f"https://h{n % 7}.example.org/{{y}}.csv").dropna()'
+        for n in range(400)
+    ]
+    lines += [f"!curl -s https://h{n % 7}.example.org/{n}.csv | head" for n in range(100)]
+    started = time.perf_counter()
+    [issue] = network_issues("\n".join(lines))
+    assert time.perf_counter() - started < 3.0
+    assert "and 4 more" in issue.question
+
+
+def _first_cell_with_url(url: str) -> str:
+    block = _first_cell_blocks()[0]
+    assert 'DATA_PATH = "../data/raw/sales.csv"' in block and "pd.read_csv(DATA_PATH)" in block
+    return block.replace('DATA_PATH = "../data/raw/sales.csv"', f'DATA_URL = "{url}"').replace(
+        "pd.read_csv(DATA_PATH)", "pd.read_csv(DATA_URL)"
+    )
+
+
+def test_l012_first_cell_with_a_url_asks_unless_its_host_is_approved() -> None:
+    """/nh:init's first cell reads a plain data URL as a literal (first-cell.md): scaffold
+    approves its host, so nh writes it with no question; any other host asks."""
+    cell = _first_cell_with_url(TRIPS_URL)
+    approved = lint(cell, kernel_python=(3, 11), approved_hosts=frozenset({"data.example.org"}))
+    assert approved.asks == [] and approved.errors == []
+    [issue] = lint(cell, kernel_python=(3, 11)).asks
+    assert issue.question == "connects to `data.example.org` over the network"
+    credentials = _first_cell_blocks()[1]  # the URL comes from .env: not network (default 12)
+    assert network_issues(credentials) == []
 
 
 # L010 -------------------------------------------------------------------------------------------
@@ -2649,6 +3873,8 @@ def test_l011_known_gaps(code: str) -> None:
         ('import os\nprint(os.environ["OPENAI_API_KEY"])', "L011", "secret_print"),
         ("%env", "L011", "secret_print"),
         ("!printenv OPENAI_API_KEY", "L011", "secret_print"),
+        ('trips = pd.read_csv("https://data.example.org/t.csv")', "L012", "network"),
+        ("!curl -O https://data.example.org/t.csv", "L012", "network"),
     ],
 )
 def test_configurable_hard_rules(code: str, rule: str, key: str) -> None:
@@ -2683,6 +3909,8 @@ CORPUS = [
     'import os\n\nkey = os.environ["OPENAI_API_KEY"]\nprint(key)',
     "%env",
     "api_key = load_key()\nprint(api_key)",
+    'trips = pd.read_csv("https://analyst:pw@data.example.org/t.csv")',
+    "r = requests.get(url)",
 ]
 
 
