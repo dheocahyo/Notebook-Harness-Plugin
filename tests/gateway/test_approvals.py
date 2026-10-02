@@ -1,0 +1,776 @@
+"""FR-12 cell approvals (design §6.4): a cell the lint asks about (L009 by default) waits for the
+user's yes (E122), and the yes in the next message lets exactly that call through once. Through
+the real hooks and the gateway (FakeBackend)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastmcp import Client
+
+from nh_gateway import config
+from nh_gateway._shared.paths import Layout, atomic_write_json
+from nh_gateway.app import create_server
+from nh_gateway.backend.fake import FakeBackend
+from nh_gateway.lint.lint import Issue
+from nh_gateway.policy.errors import CATALOGUE, RETURN_TO_WORKFLOW, WRITER_LINE, NhError
+from nh_gateway.policy.turn import TurnState
+from nh_gateway.tools import approvals
+from tests.fakes.turns import Turns, text
+from tests.gateway.conftest import NOTEBOOK, Harness, make_project
+
+SESSION = "sess-1"
+LOAD = dict(
+    title="Load sales data",
+    notes=[
+        "Builds a small frame of prices by region.",
+        "Keeps the missing price so later steps can drop it.",
+    ],
+    intent="load the sales data",
+    code="import pandas as pd\n\ndf = pd.DataFrame({'region': ['a', 'b', 'a'], 'price': [1.0, None, 3.0]})\ndf.shape",
+)
+INSTALL = dict(
+    title="Install seaborn for the plots",
+    notes=["Installs seaborn into the kernel.", "The next plots use its styles."],
+    intent="install seaborn",
+    code="%pip install seaborn\nsorted(['b', 'a'])",
+)
+PLOTLY = dict(INSTALL, title="Install plotly", code="%pip install plotly\nsorted(['d', 'c'])")
+FIRST = "Not written: this needs the user's yes first."
+QUESTION = (
+    "This cell installs `seaborn` into the kernel only, and the next env sync removes it "
+    "(`uv add seaborn` keeps it). Run it as it is?"
+)
+FINDING = "- L009: The cell installs `seaborn` into the kernel only (`%pip install seaborn`)."
+ASK_NEXT = f"Next: Ask the user, then stop: '{QUESTION}'. After a yes, send the same call again."
+ASKED = [FIRST, "nh: E122", FINDING, ASK_NEXT]
+WRITER_ASKED = [
+    FIRST,
+    "nh: E122",
+    FINDING,
+    f"- The main conversation asks the user: '{QUESTION}'",
+    f"Next: {RETURN_TO_WORKFLOW}",
+]
+HELD = [
+    "- The user's yes in this message is for the other cell nh asked about, and it covers only "
+    "that exact call.",
+    "Next: Send the call the user said yes to first, exactly as before (same tool, cell and "
+    "code); propose this cell in your reply instead.",
+]
+YES_ANSWERS = ("yes", "go")
+ANSWERS = ("yes", "no", "what would that change?", "go", "go on")
+
+
+def nh_code_cells(h: Harness) -> list[dict]:
+    return [
+        c
+        for c in h.cells()
+        if c["cell_type"] == "code" and c.get("metadata", {}).get("nh", {}).get("role") == "code"
+    ]
+
+
+def ledger(h: Harness) -> dict[str, Any]:
+    path = Layout(h.project).ledger_file(SESSION)
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def pending(h: Harness) -> dict[str, Any] | None:
+    return ledger(h).get("pending")
+
+
+def events(h: Harness, name: str) -> list[dict[str, Any]]:
+    path = Layout(h.project).log_file
+    lines = path.read_text().splitlines() if path.exists() else []
+    return [e for e in map(json.loads, lines) if e["event"] == name]
+
+
+def install_key(code: str = INSTALL["code"]) -> str:
+    return approvals.cell_key(NOTEBOOK, "add", code)
+
+
+def lines(result: Any) -> list[str]:
+    return text(result).splitlines()
+
+
+def assert_asked(result: Any, writer: bool = False) -> None:
+    assert result.is_error and lines(result) == (WRITER_ASKED if writer else ASKED), text(result)
+
+
+def assert_written(result: Any) -> None:
+    body = text(result)
+    assert not result.is_error and "nh: cell=" in body and "nh: E" not in body, body
+
+
+async def add(h: Harness, who: str, turn: str, run: str, **cell: Any) -> Any:
+    """``nh_add_cell`` from the main conversation, or from nh:cell-writer in run ``run`` (which
+    is launched in ``turn`` first if it is new)."""
+    args = cell or INSTALL
+    if who == "main":
+        return await h.call("nh_add_cell", turn, **args)
+    folder = h.turns.transcript_dir(run)
+    if not folder.exists():
+        h.turns.workflow_launched(turn, run, tool_use_id=f"toolu_{run}", task_id=f"task-{run}")
+    return await h.turns.writer_call(h.client, f"w-{run}", run, "nh_add_cell", args, turn)
+
+
+def test_e122_texts_are_pinned() -> None:
+    assert CATALOGUE["E122"] == (
+        "Not {verb}: this needs the user's yes first.",
+        "Ask the user nh's question, then stop. After a yes, send the same call again.",
+    )
+    assert approvals.ASK_NEXT == (
+        "Ask the user, then stop: '{question}'. After a yes, send the same call again."
+    )
+    assert "already waiting for the user's answer" in approvals.WAITING_LINE
+    assert approvals.HEADLESS_NEXT.startswith("No one can answer here (NH_HEADLESS=1)")
+    assert [approvals.HELD_LINE, f"Next: {approvals.HELD_NEXT}"] == HELD
+
+
+def test_the_question_is_redacted_when_built() -> None:
+    """NhError scrubs the whole refusal too; the question itself must already be clean."""
+    leak = "git+https://user:s3cretPassw0rdXYZ@github.com/org/lib.git"
+    issue = Issue("L009", "package_install", "ask", "m", "f", f"installs `{leak}` here")
+    asked = approvals.question([issue])
+    assert "s3cretPassw0rdXYZ" not in asked and "[redacted:" in asked, asked
+    assert asked.startswith("This cell installs `git+https://") and asked.endswith("as it is?")
+
+
+def test_an_ask_without_a_clause_still_reads_as_a_sentence() -> None:
+    """Only a hand-built Config gets a non-ask rule to ask (config.ASK_RULES, design §6.4)."""
+    issue = Issue("L008", "notebook_write", "ask", "The code writes a notebook file (`x`).", "f")
+    assert approvals.question([issue]) == (
+        "This cell trips nh's rule L008 (The code writes a notebook file (`x`)). Run it as it is?"
+    )
+
+
+# --- the matrix: answer x when x who ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("who", ["main", "writer"])
+@pytest.mark.parametrize("when", ["same message", "next message", "two messages later"])
+@pytest.mark.parametrize("answer", ANSWERS)
+async def test_only_a_yes_in_the_next_message_grants_the_cell(
+    nh: Harness, answer: str, when: str, who: str
+) -> None:
+    nh.turns.prompt("p1", text="install seaborn so we can style the plots")
+    assert_asked(await add(nh, who, "p1", "wf_run-1"), writer=who == "writer")
+    asked = pending(nh)
+    assert asked is not None and asked["turn_id"] == "p1" and asked["key"] == install_key()
+    if when == "same message":  # typed while Claude works: absorbed, never an answer (6.1)
+        nh.turns.prompt("p1", text=answer)
+        turn, run = "p1", "wf_run-1"
+    elif when == "next message":
+        nh.turns.prompt("p2", text=answer)
+        turn, run = "p2", "wf_run-2"
+    else:
+        nh.turns.prompt("p2", text=answer)
+        nh.turns.prompt("p3", text=answer)
+        turn, run = "p3", "wf_run-3"
+    result = await add(nh, who, turn, run)
+    if answer in YES_ANSWERS and when == "next message":
+        assert_written(result)
+        assert "into the kernel only" not in text(result)  # an ask is never shown as a hint
+        assert [c["source"] for c in nh_code_cells(nh)] == [INSTALL["code"]]
+        assert pending(nh) is None  # used once
+        assert [e["turn_id"] for e in events(nh, "cell_granted")] == [turn]
+        [added] = events(nh, "cell_added")
+        assert "L009" not in added["hints"]  # an ask is never logged as a hint
+    else:
+        assert_asked(result, writer=who == "writer")
+        assert not nh_code_cells(nh)
+        now = pending(nh)
+        assert now is not None and now["key"] == install_key() and now["turn_id"] == turn
+
+
+@pytest.mark.parametrize(("asker", "retrier"), [("writer", "main"), ("main", "writer")])
+async def test_a_yes_grants_the_same_call_from_either_thread(
+    nh: Harness, asker: str, retrier: str
+) -> None:
+    """nh:cell-writer can't ask the user: its question is recorded for the main conversation,
+    whose identical call in the yes message is granted (design §6.4, Writers)."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await add(nh, asker, "p1", "wf_run-1"), writer=asker == "writer")
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await add(nh, retrier, "p2", "wf_run-2"))
+    [cell] = nh_code_cells(nh)
+    assert cell["metadata"]["nh"]["turn_id"] == "p2"
+    assert pending(nh) is None
+
+
+async def test_a_yes_typed_mid_turn_never_answers_this_messages_question(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await add(nh, "main", "p1", "r"))
+    nh.turns.prompt("p1", text="yes")  # absorbed into p1
+    assert_asked(await add(nh, "main", "p1", "r"))
+    # Its answer was never recorded, so the next message's "go on" is no yes either.
+    nh.turns.prompt("p2", text="go on")
+    assert_asked(await add(nh, "main", "p2", "r"))
+    assert not nh_code_cells(nh)
+
+
+# --- one question at a time -------------------------------------------------------------------
+
+
+async def test_the_first_ask_of_a_message_wins(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="set up the plotting libraries")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    waiting = await nh.call("nh_add_cell", "p1", **PLOTLY)
+    assert waiting.is_error and lines(waiting) == [
+        FIRST,
+        "nh: E122",
+        "- L009: The cell installs `plotly` into the kernel only (`%pip install plotly`).",
+        "- nh is already waiting for the user's answer to this message's first question; it "
+        "asks one at a time.",
+        "Next: Ask the user only nh's first question of this message, then stop; write nothing "
+        "more until they answer.",
+    ]
+    assert QUESTION not in text(waiting) and "plotly` keeps" not in text(waiting)
+    assert pending(nh)["key"] == install_key()  # the first question stays
+    nh.turns.prompt("p2", text="yes")
+    # The yes answered the seaborn question, not plotly's: plotly is held, the yes kept.
+    plotly = await nh.call("nh_add_cell", "p2", **PLOTLY)
+    assert plotly.is_error and lines(plotly)[-2:] == HELD, text(plotly)
+    assert pending(nh)["key"] == install_key() and pending(nh)["turn_id"] == "p1"
+    assert not nh_code_cells(nh)
+    nh.turns.prompt("p3", text="go on")  # the yes was never used: the next message drops it
+    plotly = await nh.call("nh_add_cell", "p3", **PLOTLY)
+    assert plotly.is_error and "This cell installs `plotly` into the kernel only" in text(plotly)
+    assert pending(nh)["key"] == install_key(PLOTLY["code"])
+    assert not nh_code_cells(nh)
+
+
+@pytest.mark.parametrize("who", ["main", "writer"])
+async def test_a_different_ask_in_the_yes_message_keeps_the_yes(nh: Harness, who: str) -> None:
+    """The yes is for the call the user saw: another asked-for call in the yes message doesn't
+    replace it (design §6.4, Held), so the approved call still goes through after it."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p2", text="yes")
+    pinned = dict(INSTALL, code="%pip install seaborn==0.13\nsorted(['b', 'a'])")
+    held = await add(nh, who, "p2", "wf_run-2", **pinned)
+    assert held.is_error and "nh: E122" in text(held)
+    if who == "main":
+        assert lines(held)[-2:] == HELD
+    else:
+        assert lines(held)[-2:] == [HELD[0], f"Next: {RETURN_TO_WORKFLOW}"]
+    assert "Run it as it is" not in text(held)  # nothing new to ask
+    assert pending(nh)["key"] == install_key() and pending(nh)["turn_id"] == "p1"
+    assert_written(await add(nh, who, "p2", "wf_run-2"))  # the approved call, same thread
+    assert pending(nh) is None
+    again = await add(nh, who, "p2", "wf_run-2", **pinned)
+    assert again.is_error and "nh: E122" not in text(again)  # the message has its cell now
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "held"]
+
+
+async def test_the_second_question_is_refused_and_the_first_still_granted(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="set up the plotting libraries")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    assert "already waiting" in text(await nh.call("nh_add_cell", "p1", **PLOTLY))
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "waiting"]
+
+
+async def test_the_same_call_again_in_the_asking_message_repeats_the_question(
+    nh: Harness,
+) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    for _ in range(4):  # never a lint reject: no E121 however often it asks
+        assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    first = pending(nh)
+    assert first is not None and first["turn_id"] == "p1"
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked"] + ["repeated"] * 3
+    assert ledger(nh)["turns"]["p1"]["lint_rejects"] == 0
+
+
+async def test_a_cell_written_in_the_asking_message_clears_its_question(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the data, and install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    assert_written(await nh.call("nh_add_cell", "p1", **LOAD))
+    assert pending(nh) is None
+    nh.turns.prompt("p2", text="yes")  # the question was superseded: nothing to grant
+    assert_asked(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert pending(nh)["turn_id"] == "p2"
+
+
+async def test_an_edit_written_in_the_asking_message_clears_its_question(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the data")
+    failed = await nh.call("nh_add_cell", "p1", **dict(LOAD, code="undefined_name"))
+    uid = failed.meta["nh/cell_id"]
+    with_install = "%pip install seaborn\n" + LOAD["code"]
+    asked = await nh.call("nh_edit_cell", "p1", cell_id=uid, code=with_install)
+    assert asked.is_error and "nh: E122" in text(asked)
+    assert pending(nh)["key"] == approvals.cell_key(NOTEBOOK, f"edit:{uid}", with_install)
+    assert not (await nh.call("nh_edit_cell", "p1", cell_id=uid, code=LOAD["code"])).is_error
+    assert pending(nh) is None
+
+
+async def test_a_write_that_fails_to_start_keeps_the_question(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a write whose run started supersedes the question (design §6.4, Clearing)."""
+    nh.turns.prompt("p1", text="load the data, and install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    real = nh.backend.start_execution
+
+    async def down(*args: Any, **kwargs: Any) -> Any:
+        raise NhError("E130")
+
+    monkeypatch.setattr(nh.backend, "start_execution", down)
+    failed = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert failed.is_error and "nh: E130" in text(failed), text(failed)
+    assert not nh_code_cells(nh)  # rolled back
+    assert pending(nh)["turn_id"] == "p1" and pending(nh)["key"] == install_key()
+    monkeypatch.setattr(nh.backend, "start_execution", real)
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+
+
+async def test_an_edit_that_fails_to_start_keeps_the_question(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit path clears the question only once its run started, as the add path does."""
+    nh.turns.prompt("p1", text="load the data")
+    failed = await nh.call("nh_add_cell", "p1", **dict(LOAD, code="undefined_name"))
+    uid = failed.meta["nh/cell_id"]
+    with_install = "%pip install seaborn\n" + LOAD["code"]
+    asked = await nh.call("nh_edit_cell", "p1", cell_id=uid, code=with_install)
+    assert asked.is_error and "nh: E122" in text(asked)
+    real = nh.backend.start_execution
+
+    async def down(*args: Any, **kwargs: Any) -> Any:
+        raise NhError("E130")
+
+    monkeypatch.setattr(nh.backend, "start_execution", down)
+    edited = await nh.call("nh_edit_cell", "p1", cell_id=uid, code=LOAD["code"])
+    assert edited.is_error and "nh: E130" in text(edited), text(edited)
+    assert [c["source"] for c in nh_code_cells(nh)] == ["undefined_name"]  # rolled back
+    key = approvals.cell_key(NOTEBOOK, f"edit:{uid}", with_install)
+    assert pending(nh)["turn_id"] == "p1" and pending(nh)["key"] == key
+    monkeypatch.setattr(nh.backend, "start_execution", real)
+    nh.turns.prompt("p2", text="yes")
+    granted = await nh.call("nh_edit_cell", "p2", cell_id=uid, code=with_install)
+    assert not granted.is_error and "Updated" in text(granted), text(granted)
+
+
+# --- single use ------------------------------------------------------------------------------
+
+
+async def test_a_grant_is_used_once(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    again = await nh.call("nh_add_cell", "p2", **dict(INSTALL, title="Install seaborn again"))
+    assert again.is_error and "nh: E110" in text(again)  # the yes message's one cell
+    nh.turns.prompt("p3", text="yes")  # nothing was asked in p2: no grant
+    assert_asked(await nh.call("nh_add_cell", "p3", **INSTALL))
+    assert len(nh_code_cells(nh)) == 1
+
+
+async def test_a_retry_that_keeps_the_install_asks_again(nh: Harness) -> None:
+    broken = dict(INSTALL, code="%pip install seaborn\nnever = 1 / 0")
+    nh.turns.prompt("p1", text="install seaborn")
+    asked = await nh.call("nh_add_cell", "p1", **broken)
+    assert asked.is_error and "nh: E122" in text(asked)
+    nh.turns.prompt("p2", text="yes")
+    failed = await nh.call("nh_add_cell", "p2", **broken)
+    assert not failed.is_error and "Fix it with nh_edit_cell" in text(failed), text(failed)
+    uid = failed.meta["nh/cell_id"]
+    fixed = await nh.call("nh_edit_cell", "p2", cell_id=uid, code=INSTALL["code"])
+    assert fixed.is_error and "nh: E122" in text(fixed)  # the grant is spent
+    now = pending(nh)
+    assert now["turn_id"] == "p2"
+    assert now["key"] == approvals.cell_key(NOTEBOOK, f"edit:{uid}", INSTALL["code"])
+    fine = await nh.call("nh_edit_cell", "p2", cell_id=uid, code="sorted(['b', 'a'])")
+    assert not fine.is_error, text(fine)  # without the install: written, clears the question
+    assert pending(nh) is None
+
+
+# --- the key: this exact cell ----------------------------------------------------------------
+
+
+async def test_title_notes_intent_position_and_trailing_space_keep_the_key(nh: Harness) -> None:
+    nh.turns.prompt("p0", text="load the data")
+    loaded = await nh.call("nh_add_cell", "p0", **LOAD)
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p2", text="go")
+    same = dict(
+        title="Add seaborn to the kernel",
+        notes=["Installs seaborn now, as the user approved.", "Plots below use it."],
+        intent="yes, install seaborn",
+        code="\n" + INSTALL["code"].replace("\n", "   \r\n") + "  \n\n",
+        after_cell_id=loaded.meta["nh/cell_id"],
+        notebook=NOTEBOOK,
+    )
+    assert_written(await nh.call("nh_add_cell", "p2", **same))
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "%pip install seaborn==0.13\nsorted(['b', 'a'])",
+        "%pip install seaborn\nsorted(['b', 'a'])  # sorted",
+        "%pip install seaborn\nsorted(['b', 'a'])\nlen('x')",
+        "%pip   install seaborn\nsorted(['b', 'a'])",
+    ],
+)
+async def test_any_other_code_change_is_a_new_question(nh: Harness, code: str) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p2", text="yes")
+    changed = await nh.call("nh_add_cell", "p2", **dict(INSTALL, code=code))
+    assert changed.is_error and "nh: E122" in text(changed), text(changed)
+    assert lines(changed)[-2:] == HELD  # not granted; the yes stays for the call it approved
+    assert pending(nh)["turn_id"] == "p1" and pending(nh)["key"] == install_key()
+    nh.turns.prompt("p3", text="go on")  # no yes: the changed cell asks its own question
+    asked = await nh.call("nh_add_cell", "p3", **dict(INSTALL, code=code))
+    assert asked.is_error and "Next: Ask the user, then stop:" in text(asked), text(asked)
+    now = pending(nh)
+    assert now["turn_id"] == "p3" and now["key"] == install_key(code)
+    assert not nh_code_cells(nh)
+
+
+def test_the_key_hashes_notebook_target_and_normalised_code() -> None:
+    code = INSTALL["code"]
+    key = approvals.cell_key(NOTEBOOK, "add", code)
+    assert key == approvals.cell_key(NOTEBOOK, "add", f"\n\n{code}  \n\n")
+    assert key == approvals.cell_key(NOTEBOOK, "add", code.replace("\n", "\r\n"))
+    assert key != approvals.cell_key("notebooks/other.ipynb", "add", code)
+    assert key != approvals.cell_key(NOTEBOOK, "edit:nh-0001", code)
+    assert key != approvals.cell_key(NOTEBOOK, "add", "  " + code)  # indentation counts
+    assert key != approvals.cell_key(NOTEBOOK, "add", code.replace("\n", "\n\n"))
+    assert len(key) == 64 and code not in key
+
+
+async def test_an_edit_question_is_keyed_to_its_cell(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the data")
+    uid = (await nh.call("nh_add_cell", "p1", **LOAD)).meta["nh/cell_id"]
+    nh.turns.prompt("p2", text="install seaborn in the load cell")
+    edit = dict(cell_id=uid, code=INSTALL["code"] + "\n" + LOAD["code"])
+    asked = await nh.call("nh_edit_cell", "p2", **edit)
+    assert asked.is_error and "nh: E122" in text(asked) and QUESTION in text(asked)
+    assert pending(nh)["key"] == approvals.cell_key(NOTEBOOK, f"edit:{uid}", edit["code"])
+    nh.turns.prompt("p3", text="yes")
+    as_add = await nh.call("nh_add_cell", "p3", **dict(INSTALL, code=edit["code"]))
+    assert as_add.is_error and "nh: E122" in text(as_add)  # another cell: not granted
+    assert [c["source"] for c in nh_code_cells(nh)] == [LOAD["code"]]
+
+
+async def test_a_granted_edit_changes_the_cell(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the data")
+    uid = (await nh.call("nh_add_cell", "p1", **LOAD)).meta["nh/cell_id"]
+    nh.turns.prompt("p2", text="install seaborn in the load cell")
+    code = INSTALL["code"] + "\n" + LOAD["code"]
+    assert "nh: E122" in text(await nh.call("nh_edit_cell", "p2", cell_id=uid, code=code))
+    nh.turns.prompt("p3", text="yes")
+    edited = await nh.call("nh_edit_cell", "p3", cell_id=uid, code=code, title="Load and style")
+    assert not edited.is_error and "Updated" in text(edited), text(edited)
+    assert [c["source"] for c in nh_code_cells(nh)] == [code]
+    assert pending(nh) is None
+
+
+# --- headless --------------------------------------------------------------------------------
+
+HEADLESS_NEXT = (
+    "Next: No one can answer here (NH_HEADLESS=1): write nothing, and tell the user this cell "
+    f"needs their yes in an interactive session: '{QUESTION}'"
+)
+
+
+@pytest.mark.parametrize("who", ["main", "writer"])
+async def test_headless_fails_closed(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch, who: str
+) -> None:
+    monkeypatch.setenv("NH_HEADLESS", "1")
+    nh.turns.prompt("p1", text="install seaborn")
+    refused = await add(nh, who, "p1", "wf_run-1")
+    if who == "main":
+        assert lines(refused) == [FIRST, "nh: E122", FINDING, HEADLESS_NEXT]
+    else:
+        assert lines(refused) == [
+            FIRST,
+            "nh: E122",
+            FINDING,
+            "- No one can answer here (NH_HEADLESS=1); the cell needs the user's yes in an "
+            f"interactive session: '{QUESTION}'",
+            f"Next: {RETURN_TO_WORKFLOW}",
+        ]
+    assert pending(nh) is None  # nothing is recorded: no yes can arrive
+    nh.turns.prompt("p2", text="yes")
+    again = await add(nh, who, "p2", "wf_run-2")
+    assert again.is_error and "NH_HEADLESS=1" in text(again)
+    assert not nh_code_cells(nh)
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["headless", "headless"]
+
+
+async def test_headless_grants_nothing_even_with_a_yes_record(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))  # asked while interactive
+    nh.turns.prompt("p2", text="yes")
+    monkeypatch.setenv("NH_HEADLESS", "1")
+    refused = await nh.call("nh_add_cell", "p2", **INSTALL)
+    assert lines(refused) == [FIRST, "nh: E122", FINDING, HEADLESS_NEXT]
+    assert not nh_code_cells(nh)
+    assert pending(nh)["turn_id"] == "p1"  # the ledger isn't touched while headless
+    monkeypatch.delenv("NH_HEADLESS")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+
+
+# --- the ledger ------------------------------------------------------------------------------
+
+
+async def test_a_v1_ledger_file_loads_and_the_flow_works(nh: Harness) -> None:
+    old = TurnState(session_id=SESSION, prompt_id="p0", opened_at=time.time() - 60)
+    # A v1 file has no pending question, whatever it holds: this one is never granted.
+    stray = {"kind": "cell", "key": install_key(), "turn_id": "p1", "ts": time.time()}
+    atomic_write_json(
+        Layout(nh.project).ledger_file(SESSION),
+        {"v": 1, "turns": {"p0": old.__dict__}, "pending": stray},
+    )
+    nh.turns.prompt("p1", text="install seaborn")
+    nh.turns.prompt("p2", text="yes")
+    assert_asked(await nh.call("nh_add_cell", "p2", **INSTALL))
+    saved = ledger(nh)
+    assert saved["v"] == 2 and "p0" in saved["turns"] and saved["pending"]["turn_id"] == "p2"
+    nh.turns.prompt("p3", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p3", **INSTALL))
+
+
+async def test_no_code_or_question_is_stored(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    assert "nh: E122" in text(await nh.call("nh_add_cell", "p1", **PLOTLY))
+    stored = Layout(nh.project).ledger_file(SESSION).read_text()
+    assert set(json.loads(stored)["pending"]) == {"kind", "key", "turn_id", "ts"}
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    log = Layout(nh.project).log_file.read_text()
+    for raw in (stored, Layout(nh.project).ledger_file(SESSION).read_text(), log):
+        for word in ("seaborn", "plotly", "pip install", "Run it as it is", "env sync"):
+            assert word not in raw, word
+    assert install_key() in stored
+    asked = events(nh, "cell_asked")
+    assert asked and all(set(e) >= {"rules", "outcome"} and e["rules"] == ["L009"] for e in asked)
+
+
+# --- what comes first ------------------------------------------------------------------------
+
+
+async def test_e110_still_holds_in_the_yes_message(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **LOAD))
+    late = await nh.call("nh_add_cell", "p2", **INSTALL)
+    assert late.is_error and "nh: E110" in text(late)  # no third exception to E110
+    assert len(nh_code_cells(nh)) == 1
+    assert pending(nh)["turn_id"] == "p1"  # the grant wasn't used; the next message drops it
+    nh.turns.prompt("p3", text="go on")
+    assert_asked(await nh.call("nh_add_cell", "p3", **INSTALL))
+    assert pending(nh)["turn_id"] == "p3"
+
+
+@pytest.mark.parametrize("message", ["run the next 3", "explain the install", "/nh:plan a model"])
+async def test_e109_comes_first_in_a_no_write_message(nh: Harness, message: str) -> None:
+    nh.turns.prompt("p1", text=message)
+    refused = await nh.call("nh_add_cell", "p1", **INSTALL)
+    assert refused.is_error and "nh: E109" in text(refused) and "E122" not in text(refused)
+    assert pending(nh) is None
+
+
+async def test_lint_errors_come_before_the_question(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    refused = await nh.call("nh_add_cell", "p1", **dict(INSTALL, notes=["Only one bullet."]))
+    assert refused.is_error and "nh: E120" in text(refused) and "L009" not in text(refused)
+    assert pending(nh) is None
+
+
+async def test_the_question_carries_the_calls_lead_lines(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load the data")
+    assert_written(await nh.call("nh_add_cell", "p1", **LOAD))
+    nh.backend.restart_kernel()
+    nh.turns.prompt("p2", text="install seaborn")
+    asked = await nh.call("nh_add_cell", "p2", **INSTALL)
+    assert asked.is_error and lines(asked)[0].startswith("NEW kernel: earlier variables are gone")
+    assert lines(asked)[1:] == ASKED
+
+
+async def test_a_writers_refusal_returns_to_the_workflow(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    refused = await add(nh, "writer", "p1", "wf_run-1")
+    assert lines(refused)[-1] == f"Next: {RETURN_TO_WORKFLOW}" and WRITER_LINE not in text(refused)
+    assert pending(nh)["key"] == install_key()  # recorded for the main conversation
+
+
+# --- the levels, through the gateway ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("toml", "outcome"),
+    [
+        ("", "E122"),
+        ('[lint]\nmode = "strict"\n', "E122"),
+        ('[lint.rules]\npackage_install = "error"\n', "E120"),
+        ('[lint.rules]\npackage_install = "hint"\n', "written"),
+        ('[lint.rules]\npackage_install = "off"\n', "written"),
+        ('[lint.rules]\npackage_install = "maybe"\n', "E122"),  # falls back to the default
+    ],
+)
+async def test_the_rule_level_decides_what_an_install_gets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str, outcome: str
+) -> None:
+    project = make_project(tmp_path, toml)
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    async with Client(create_server(project, backend)) as client:
+        h = Harness(project, backend, client, Turns(project, tmp_path / "data"))
+        h.turns.prompt("p1", text="install seaborn")
+        result = await h.call("nh_add_cell", "p1", **INSTALL)
+    body = text(result)
+    if outcome == "written":
+        assert_written(result)
+        hinted = "The cell installs `seaborn` into the kernel only" in body
+        assert hinted == ("hint" in toml), body  # a hint after the run; off says nothing
+    else:
+        assert result.is_error and f"nh: {outcome}" in body, body
+    if outcome == "E120":
+        assert "Don't call again yet: ask the user whether to install the package" in body
+
+
+SECRET_INSTALL = dict(
+    INSTALL,
+    code="%pip install git+https://user:s3cretPassw0rdXYZ@github.com/org/lib.git "
+    "git+https://ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8@github.com/org/other.git\n"
+    "sorted(['b', 'a'])",
+)
+LEAKS = ("s3cretPassw0rdXYZ", "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")
+
+
+@pytest.mark.parametrize("who", ["main", "writer"])
+async def test_no_secret_reaches_the_question(nh: Harness, who: str) -> None:
+    nh.turns.prompt("p1", text="install our lib")
+    asked = await add(nh, who, "p1", "wf_run-1", **SECRET_INSTALL)
+    body = text(asked)
+    assert asked.is_error and "nh: E122" in body and "This cell installs" in body, body
+    assert "[redacted:" in body and not any(leak in body for leak in LEAKS), body
+
+
+async def test_no_secret_reaches_the_hint_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = make_project(tmp_path, '[lint.rules]\npackage_install = "hint"\n')
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    async with Client(create_server(project, backend)) as client:
+        h = Harness(project, backend, client, Turns(project, tmp_path / "data"))
+        h.turns.prompt("p1", text="install our lib")
+        result = await h.call("nh_add_cell", "p1", **SECRET_INSTALL)
+    body = text(result)
+    assert not result.is_error and "into the kernel only" in body, body
+    assert "[redacted:" in body and not any(leak in body for leak in LEAKS), body
+
+
+async def test_a_quoted_spec_reads_cleanly_inside_the_question(nh: Harness) -> None:
+    """Shell quoting in the question uses double quotes: E122 puts it in single quotes."""
+    nh.turns.prompt("p1", text="install pandas 2")
+    asked = await nh.call("nh_add_cell", "p1", **dict(INSTALL, code="%pip install 'pandas>=2'"))
+    assert lines(asked)[-1] == (
+        "Next: Ask the user, then stop: 'This cell installs `pandas>=2` into the kernel only, "
+        'and the next env sync removes it (`uv add "pandas>=2"` keeps it). Run it as it is?\'. '
+        "After a yes, send the same call again."
+    )
+
+
+async def test_a_rule_that_cant_ask_keeps_its_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """notebook_write = "ask" is a config problem; the rule stays an error (design §6.4)."""
+    project = make_project(tmp_path, '[lint.rules]\nnotebook_write = "ask"\n')
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    async with Client(create_server(project, backend)) as client:
+        h = Harness(project, backend, client, Turns(project, tmp_path / "data"))
+        h.turns.prompt("p1", text="save the notebook")
+        code = "import nbformat\nnb = nbformat.v4.new_notebook()\nnbformat.write(nb, 'x.ipynb')"
+        result = await h.call("nh_add_cell", "p1", **dict(LOAD, code=code))
+    body = text(result)
+    assert result.is_error and "nh: E120" in body and "L008" in body, body
+    assert "E122" not in body and pending(h) is None
+    assert config.load(project).problems == ["lint.rules.notebook_write must be off|hint|error"]
+
+
+# --- locking ---------------------------------------------------------------------------------
+
+
+async def test_the_grant_is_checked_and_used_inside_the_lock(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two identical granted calls of the yes message at once, the first holding its write open
+    (a slow insert): the turn lock serialises them, so one is written and the other gets E110,
+    and no question is left pending. With the grant check moved before ``svc.locks.hold`` (E110
+    still checked first), the second call passes E110 while the first is inside its insert,
+    finds the grant spent and asks again, leaving a pending question; this test then fails
+    (checked in a scratch copy, design §6.4)."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p2", text="yes")
+    real = nh.backend.insert_cells
+
+    async def slow(*args: Any, **kwargs: Any) -> Any:  # the first call holds its write open
+        await asyncio.sleep(0.1)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(nh.backend, "insert_cells", slow)
+    one = dict(INSTALL, title="Install seaborn now")
+    two = dict(INSTALL, title="Install seaborn for plots")
+    results = await asyncio.gather(
+        nh.call("nh_add_cell", "p2", **one), nh.call("nh_add_cell", "p2", **two)
+    )
+    bodies = sorted(text(r) for r in results)
+    assert sum(not r.is_error for r in results) == 1, bodies
+    assert any("nh: E110" in b for b in bodies) and not any("nh: E122" in b for b in bodies)
+    assert len(nh_code_cells(nh)) == 1
+    assert pending(nh) is None
+
+
+async def test_the_edit_grant_is_checked_and_used_inside_the_lock(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The edit-path twin of the test above: two identical granted ``nh_edit_cell`` calls of
+    the yes message at once, the first holding its update open. One is written; the other is
+    refused by the edit checks (E133 or E112, never E122), and no question is left pending.
+    With edit's grant check moved before ``svc.locks.hold``, the second call finds the grant
+    spent and asks again (checked in a scratch copy, design §6.4)."""
+    nh.turns.prompt("p1", text="load the data")
+    uid = (await nh.call("nh_add_cell", "p1", **LOAD)).meta["nh/cell_id"]
+    nh.turns.prompt("p2", text="install seaborn in the load cell")
+    code = INSTALL["code"] + "\n" + LOAD["code"]
+    assert "nh: E122" in text(await nh.call("nh_edit_cell", "p2", cell_id=uid, code=code))
+    nh.turns.prompt("p3", text="yes")
+    real = nh.backend.update_cells
+
+    async def slow(*args: Any, **kwargs: Any) -> Any:  # the first call holds its write open
+        await asyncio.sleep(0.1)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(nh.backend, "update_cells", slow)
+    results = await asyncio.gather(
+        nh.call("nh_edit_cell", "p3", cell_id=uid, code=code, title="Load and style"),
+        nh.call("nh_edit_cell", "p3", cell_id=uid, code=code, title="Load, then style"),
+    )
+    bodies = sorted(text(r) for r in results)
+    assert sum(not r.is_error for r in results) == 1, bodies
+    assert not any("nh: E122" in b for b in bodies), bodies
+    [refused] = [text(r) for r in results if r.is_error]
+    assert "nh: E133" in refused or "nh: E112" in refused, refused  # its run, going or ok
+    assert [c["source"] for c in nh_code_cells(nh)] == [code]
+    assert pending(nh) is None

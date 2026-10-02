@@ -3019,6 +3019,80 @@ def test_every_new_v02_code_in_the_gateway_is_documented():
         assert f"| **{rule}** " in troubleshooting, rule
 
 
+def test_the_ask_flow_is_documented_where_the_model_reads_it():
+    """Design §6.4: E122's flow in the skill (one pointer line), asks.md, errors.md, tools.md
+    and the docs, worded as the gateway's own texts."""
+    from nh_gateway.app import INSTRUCTIONS
+    from nh_gateway.tools import approvals
+
+    def flat(path: Path) -> str:
+        return " ".join(_read(path).split())
+
+    skill = _read(PLUGIN / "skills" / "notebook" / "SKILL.md")
+    pointer = [line for line in skill.splitlines() if "(reference/asks.md)" in line]
+    assert pointer == [
+        "- E122: ask the user nh's one question, then stop: [reference/asks.md](reference/asks.md)."
+    ]
+    asks = flat(NOTEBOOK_REFS / "asks.md")
+    for phrase in (
+        "puts the question in its `Next:` line",
+        "One question, then stop.",
+        "Never rephrase its code between the question and the retry",
+        '"already waiting for the user\'s answer"',
+        "send the exact same call again",
+        '"go" on its own',
+        "Anything else",
+        "`NH_HEADLESS=1`",
+        "nh:cell-writer inside nh:qa-cell can't ask the user",
+        'is for the other cell"',  # held, in the yes message (design §6.4)
+        "before any other cell",
+        "The better way to install stays `uv add <pkg>` with Bash",
+        "Re-running a cell that installs (`nh_run`)",
+    ):
+        assert phrase in asks, phrase
+    assert "is for the other cell nh asked about" in approvals.HELD_LINE
+    # Conda: env sync prunes what environment.yml doesn't list, so a conda install isn't the way.
+    conda_way = "add it to environment.yml, then `nhctl env sync`"
+    for name, doc in (
+        ("SKILL.md", " ".join(skill.split())),
+        ("asks.md", asks),
+        ("errors.md", flat(NOTEBOOK_REFS / "errors.md")),
+        ("tools.md", flat(NOTEBOOK_REFS / "tools.md")),
+    ):
+        assert "conda install)" not in doc and "project's conda install" not in doc, name
+        assert conda_way in doc or "(conda: environment.yml, then" in doc, name
+    assert "which nh asks the user about (E122)" in " ".join(skill.split())
+    assert "send the same call again" in approvals.ASK_NEXT
+    assert "already waiting for the user's answer" in approvals.WAITING_LINE
+    assert "NH_HEADLESS=1" in approvals.HEADLESS_NEXT
+    errors_md = _read(NOTEBOOK_REFS / "errors.md")
+    e122 = next(line for line in errors_md.splitlines() if line.startswith("| E122 |"))
+    for phrase in (
+        "L009",
+        "send the exact same call again",
+        "already waiting for the user's answer",
+        "NH_HEADLESS=1",
+        "(asks.md)",
+    ):
+        assert phrase in e122, phrase
+    l009 = next(line for line in errors_md.splitlines() if line.startswith("| L009 |"))
+    assert 'package_install = "error"' in l009 and "`E122`" in l009
+    assert '`"hint"` under `[lint] mode = "strict"`' in l009  # strict makes a hint an error
+    assert "is for the other cell" in e122
+    tools_md = flat(NOTEBOOK_REFS / "tools.md")
+    assert "nh asks the user first (`E122`" in tools_md and "([asks.md](asks.md))" in tools_md
+    harness = flat(REPO / "docs" / "harness-toml.md")
+    assert 'Each rule is `"off"`, `"hint"`, `"error"` or `"ask"`.' in harness
+    assert 'Only `package_install` can be `"ask"`' in harness
+    assert "Strict mode leaves an ask an ask." in harness
+    assert _documented_keys()["lint.rules"]["package_install"] == '"ask"'
+    assert config.DEFAULTS["lint"]["rules"]["package_install"] == "ask"
+    troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
+    assert "An install (L009) is no rejection: nh asks you first (**E122**)" in troubleshooting
+    # INSTRUCTIONS already ask before installs (design §6.2); C5a leaves them as they are.
+    assert "Ask before installing packages or writing outside the project." in INSTRUCTIONS
+
+
 def test_inspect_rows_default_is_the_configured_head_rows():
     assert TOOL_DEFAULTS["nh_inspect"]["rows"] is None
     assert "| `rows` | `[inspect].head_rows` (5) |" in _read(NOTEBOOK_REFS / "tools.md")

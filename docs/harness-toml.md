@@ -138,7 +138,7 @@ reject the cell; hints arrive with the result, after the run.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `"advise"` | `advise`: hints are advisory. `strict`: every hint is enforced as a hard rule. |
+| `mode` | `"advise"` | `advise`: hints are advisory. `strict`: every hint is enforced as a hard rule; a rule at `"ask"` still asks. |
 | `comment_ratio` | `8` | At most one comment per this many code lines (L105). `0` means no comments. |
 | `max_line_length` | `99` | Longest line, in characters (L101). |
 | `max_cell_lines` | `40` | Longest cell, in lines (L102). |
@@ -147,15 +147,20 @@ reject the cell; hints arrive with the result, after the run.
 
 ## `[lint.rules]`
 
-Each rule is `"off"`, `"hint"` or `"error"`. `"error"` rejects the cell before
-it is written; `"hint"` reports it after the run; `"off"` skips it. With
+Each rule is `"off"`, `"hint"`, `"error"` or `"ask"`. `"error"` rejects the
+cell before it is written; `"hint"` reports it after the run; `"off"` skips it.
+`"ask"` makes nh ask you in chat before it writes the cell (E122): your yes, on
+its own in your next message, lets that exact cell through once; anything else
+drops it. Strict mode leaves an ask an ask. Only `package_install` can be
+`"ask"`: nh has a question for it, and none for the other rules. Any other
+value falls back to the rule's default and shows under `--- config ---`. With
 `secret_print` at `"hint"` or `"off"`, a cell can print an env var's value into
 the notebook; nh still hides the values it knows as secrets from Claude
 (`[redacted:NAME]`).
 
 | Key | Rule | Default | Fires on |
 |---|---|---|---|
-| `package_install` | L009 | `"error"` | a package install in a cell: `!pip install`, `%pip install`, `%conda install`, `!uv add` and the like (`%pip list` is fine). The agent asks you and installs with a command you approve instead. |
+| `package_install` | L009 | `"ask"` | a package install (or removal) in a cell: `!pip install`, `%pip install`, `%conda install`, `!uv add` and the like (`%pip list` is fine). nh asks you first, naming the packages, since the next env sync removes a kernel-only install (`uv add <pkg>` keeps it). `"error"` refuses such cells, and the agent asks you and installs with a command you approve instead. |
 | `notebook_write` | L008 | `"error"` | a cell that writes an `.ipynb` file |
 | `markdown_output` | L010 | `"error"` | `%%markdown`, `%%html`, or `Markdown()`/`HTML()`/`Latex()` showing prose |
 | `secret_print` | L011 | `"error"` | code that would show an env var's value, secret or not (nh can't tell which values are secrets): `print(os.environ["API_KEY"])`, `os.getenv("API_KEY")` as the last line, a variable holding one, `os.environ.keys()` shown (its repr holds every value), `%env`, `!env`, `!printenv`, `!echo $API_KEY`, `!cat .env`, a `.env` file read in Python and shown. Checking is fine: `print("API_KEY" in os.environ)`, `print(bool(os.getenv("API_KEY")))`, `sorted(os.environ)`, `len(key)`, passing it on (`create_engine(url)`), or an env var the cell set to a literal (`os.environ["MODE"] = "dev"`) |
@@ -203,4 +208,4 @@ as `# %%`), L003 (title), L004 (bullets), L005 (missing intent) and L007
 |---|---|
 | `NH_JUPYTER_URL` | Overrides `[jupyter].url`. The only way to use a JupyterLab on another host. |
 | `NH_JUPYTER_TOKEN` | Token for the server at `NH_JUPYTER_URL` or `[jupyter].url`. |
-| `NH_HEADLESS=1` | Forces `approve_before_run = false`, for runs with nobody to answer prompts. |
+| `NH_HEADLESS=1` | Forces `approve_before_run = false`, for runs with nobody to answer prompts (set it for `claude -p`: nh can't tell such a run apart by itself). A cell nh would ask about (a rule at `"ask"`, E122) is refused, since no yes can arrive. |

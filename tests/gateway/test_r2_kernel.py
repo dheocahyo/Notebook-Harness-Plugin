@@ -127,7 +127,10 @@ async def test_the_new_kernel_lead_rides_on_a_refusal_and_is_told_once(nh: Harne
     await nh.call("nh_add_cell", "p1", **LOAD)
     nh.backend.restart_kernel()
     nh.turns.prompt("p2")
-    refused = await nh.call("nh_add_cell", "p2", **dict(DROP, code="!pip install seaborn\nx = 1"))
+    # A hard-rule refusal (L008; an install is an ask since v0.2, design §6.4).
+    refused = await nh.call(
+        "nh_add_cell", "p2", **dict(DROP, code="nbformat.write(nb, 'x.ipynb')\nx = 1")
+    )
     body = text(refused)
     assert refused.is_error and "nh: E120" in body
     assert body.startswith("NEW kernel: earlier variables are gone"), body

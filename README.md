@@ -24,10 +24,10 @@ your files.
   code, real output and kernel variables without running anything. The
   writer may fix the cell from QA's findings (twice by default) before
   Claude replies. It is still one cell per message, and one undo removes it.
-- **Guardrails.** No package installs from cells, no raw `.ipynb` edits, no
-  cells that print an env var's value, no writes from subagents except nh's
-  own cell writer inside `/nh:qa-cell`. nh's server enforces every rule and
-  refuses what it can't verify.
+- **Guardrails.** No raw `.ipynb` edits, no cells that print an env var's
+  value, no writes from subagents except nh's own cell writer inside
+  `/nh:qa-cell`, and a cell that installs packages waits for your yes. nh's
+  server enforces every rule and refuses what it can't verify.
 
 ## Requirements
 

@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from nh_gateway.config import Config, load
+from nh_gateway.config import ASK_RULES, Config, load
 from nh_gateway.lint import lint as lint_module
 from nh_gateway.lint import secret_scan
 from nh_gateway.lint.lint import Issue, LintReport, lint_cell
@@ -45,13 +46,15 @@ def lint(code: str = "df_clean = df.dropna()\ndf_clean.shape", **overrides: Any)
 
 
 def rules(report: LintReport, severity: str = "error") -> list[str]:
-    return [i.rule for i in (report.errors if severity == "error" else report.hints)]
+    found = {"error": report.errors, "hint": report.hints, "ask": report.asks}[severity]
+    return [i.rule for i in found]
 
 
 def test_clean_cell_passes() -> None:
     report = lint()
     assert report.ok
     assert report.errors == []
+    assert report.asks == []
     assert report.title == GOOD["title"]
     assert report.bullets == GOOD["notes"]
     assert (report.defs, report.uses, report.parsed) == ({"df_clean"}, {"df"}, True)
@@ -351,11 +354,19 @@ def test_l008_reads_and_comments_are_fine(code: str) -> None:
     ],
 )
 def test_l009_package_installs(code: str) -> None:
+    # An ask by default (design §6.4): no error, no hint; the cell waits for the user's yes.
     report = lint(code)
-    assert "L009" in rules(report)
-    issue = next(i for i in report.errors if i.rule == "L009")
+    assert rules(report, "ask") == ["L009"] and report.ok
+    assert "L009" not in rules(report) + rules(report, "hint")
+    issue = next(i for i in report.asks if i.rule == "L009")
+    assert issue.severity == "ask"
     assert "seaborn" in issue.message
     assert "ask the user" in issue.fix
+    assert "`seaborn`" in issue.question and "uv add" in issue.question
+    # The same finding refuses the cell when the rule is set to error.
+    strict = lint(code, cfg=config(package_install="error"))
+    issue = next(i for i in strict.errors if i.rule == "L009")
+    assert "seaborn" in issue.message and "ask the user" in issue.fix
 
 
 @pytest.mark.parametrize(
@@ -369,7 +380,325 @@ def test_l009_package_installs(code: str) -> None:
     ],
 )
 def test_l009_not_installs(code: str) -> None:
-    assert "L009" not in rules(lint(code))
+    report = lint(code)  # in no list: L009 is an ask by default (design §6.4)
+    assert "L009" not in rules(report) + rules(report, "hint") + rules(report, "ask")
+    assert report.asks == []
+
+
+def test_l009_is_an_ask_by_default() -> None:
+    assert load(None).rule("package_install") == "ask"
+
+
+@pytest.mark.parametrize(
+    ("level", "mode", "where"),
+    [
+        ("ask", "advise", "ask"),
+        ("ask", "strict", "ask"),  # strict turns hints into errors and leaves an ask an ask
+        ("error", "advise", "error"),
+        ("error", "strict", "error"),
+        ("hint", "advise", "hint"),
+        ("hint", "strict", "error"),
+        ("off", "advise", None),
+        ("off", "strict", None),
+    ],
+)
+def test_l009_levels(level: str, mode: str, where: str | None) -> None:
+    cfg = config(package_install=level)
+    cfg.data["lint"]["mode"] = mode
+    report = lint("!pip install seaborn", cfg=cfg)
+    found = {s: rules(report, s) for s in ("error", "hint", "ask")}
+    assert found == {s: (["L009"] if s == where else []) for s in found}
+    assert report.ok == (where != "error")
+
+
+L009_TEXTS = [
+    (
+        "!pip install seaborn",
+        "The cell installs `seaborn` into the kernel only (`!pip install seaborn`).",
+        "Remove the install and ask the user; after a yes, install it with `uv add seaborn` "
+        "through Bash: the next env sync removes kernel-only installs.",
+        "installs `seaborn` into the kernel only, and the next env sync removes it "
+        "(`uv add seaborn` keeps it)",
+    ),
+    (
+        "%pip install -q seaborn==0.13 numpy 'pandas>=2' > /dev/null",
+        "The cell installs `seaborn==0.13`, `numpy` and `pandas>=2` into the kernel only "
+        "(`%pip install -q seaborn==0.13 numpy 'pandas>=2' > /dev/null`).",
+        "Remove the install and ask the user; after a yes, install them with "
+        '`uv add seaborn==0.13 numpy "pandas>=2"` through Bash: the next env sync removes '
+        "kernel-only installs.",
+        "installs `seaborn==0.13`, `numpy` and `pandas>=2` into the kernel only, and the next "
+        'env sync removes them (`uv add seaborn==0.13 numpy "pandas>=2"` keeps them)',
+    ),
+    (
+        "!pip install -r requirements.txt -i https://pypi.example.com/simple",
+        "The cell installs the packages in `requirements.txt` (from "
+        "`https://pypi.example.com/simple`) into the kernel only "
+        "(`!pip install -r requirements.txt -i https://pypi.example.co…`).",
+        "Remove the install and ask the user; after a yes, install them with "
+        "`uv add -r requirements.txt -i https://pypi.example.com/simple` through Bash: the next "
+        "env sync removes kernel-only installs.",
+        "installs the packages in `requirements.txt` (from `https://pypi.example.com/simple`) "
+        "into the kernel only, and the next env sync removes them "
+        "(`uv add -r requirements.txt -i https://pypi.example.com/simple` keeps them)",
+    ),
+    (
+        "import subprocess, sys\nsubprocess.check_call([sys.executable, '-m', 'pip', 'install',"
+        " 'plotly', '--quiet'])\n!pip install kaleido && echo done  # export",
+        "The cell installs `plotly` and `kaleido` into the kernel only (`subprocess.check_call"
+        "([sys.executable, '-m', 'pip', 'instal…` (+1 more)).",
+        "Remove the install and ask the user; after a yes, install them with "
+        "`uv add plotly kaleido` through Bash: the next env sync removes kernel-only installs.",
+        "installs `plotly` and `kaleido` into the kernel only, and the next env sync removes "
+        "them (`uv add plotly kaleido` keeps them)",
+    ),
+    (
+        "!uv add seaborn",
+        "The cell adds `seaborn` to the project's dependencies (`!uv add seaborn`).",
+        "Remove it and ask the user; after a yes, run `uv add seaborn` through Bash.",
+        "adds `seaborn` to the project's dependencies with `uv add`",
+    ),
+    (
+        "%pip uninstall -y seaborn",
+        "The cell removes `seaborn` from the kernel (`%pip uninstall -y seaborn`).",
+        "Remove it and ask the user; after a yes, run `uv remove seaborn` through Bash.",
+        "removes `seaborn` from the kernel",
+    ),
+    (
+        "!pip install -e .",
+        "The cell installs `.` (editable) into the kernel only (`!pip install -e .`).",
+        "Remove the install and ask the user; after a yes, install it with "
+        "`uv add --editable .` through Bash: the next env sync removes kernel-only installs.",
+        "installs `.` (editable) into the kernel only, and the next env sync removes it "
+        "(`uv add --editable .` keeps it)",
+    ),
+    (
+        "!conda config --add channels conda-forge",  # detected, but no command L009 can name
+        "The cell installs packages into the kernel only "
+        "(`!conda config --add channels conda-forge`).",
+        "Remove the install and ask the user; after a yes, install them with "
+        "`uv add <package>` through Bash: the next env sync removes kernel-only installs.",
+        "installs packages into the kernel only, and the next env sync removes them "
+        "(`uv add <package>` keeps them)",
+    ),
+    # Every kind of command gets its own clause, in the order the kinds first appear (plan-R1).
+    (
+        "%pip install plotly\n%pip uninstall -y seaborn\nsorted([1])",
+        "The cell installs `plotly` into the kernel only; it also removes `seaborn` from the "
+        "kernel (`%pip install plotly` (+1 more)).",
+        "Remove the package commands and ask the user; after a yes, install it with "
+        "`uv add plotly`, then run `uv remove seaborn` through Bash: the next env sync removes "
+        "kernel-only installs.",
+        "installs `plotly` into the kernel only, and the next env sync removes it "
+        "(`uv add plotly` keeps it); it also removes `seaborn` from the kernel",
+    ),
+    (
+        "%pip uninstall -y seaborn\n%pip install plotly\nsorted([1])",
+        "The cell removes `seaborn` from the kernel; it also installs `plotly` into the kernel "
+        "only (`%pip uninstall -y seaborn` (+1 more)).",
+        "Remove the package commands and ask the user; after a yes, run `uv remove seaborn`, "
+        "then install it with `uv add plotly` through Bash: the next env sync removes "
+        "kernel-only installs.",
+        "removes `seaborn` from the kernel; it also installs `plotly` into the kernel only, and "
+        "the next env sync removes it (`uv add plotly` keeps it)",
+    ),
+    (
+        "!uv add polars\n!pip install kaleido",
+        "The cell adds `polars` to the project's dependencies; it also installs `kaleido` into "
+        "the kernel only (`!uv add polars` (+1 more)).",
+        "Remove the package commands and ask the user; after a yes, run `uv add polars`, then "
+        "install it with `uv add kaleido` through Bash: the next env sync removes kernel-only "
+        "installs.",
+        "adds `polars` to the project's dependencies with `uv add`; it also installs `kaleido` "
+        "into the kernel only, and the next env sync removes it (`uv add kaleido` keeps it)",
+    ),
+    (
+        "!pip install plotly && pip uninstall -y seaborn",
+        "The cell installs `plotly` into the kernel only; it also removes `seaborn` from the "
+        "kernel (`!pip install plotly && pip uninstall -y seaborn`).",
+        "Remove the package commands and ask the user; after a yes, install it with "
+        "`uv add plotly`, then run `uv remove seaborn` through Bash: the next env sync removes "
+        "kernel-only installs.",
+        "installs `plotly` into the kernel only, and the next env sync removes it "
+        "(`uv add plotly` keeps it); it also removes `seaborn` from the kernel",
+    ),
+    (  # a removal detection alone misses is still named once the cell asks
+        "%pip install plotly\n!pip uninstall -y seaborn",
+        "The cell installs `plotly` into the kernel only; it also removes `seaborn` from the "
+        "kernel (`%pip install plotly` (+1 more)).",
+        "Remove the package commands and ask the user; after a yes, install it with "
+        "`uv add plotly`, then run `uv remove seaborn` through Bash: the next env sync removes "
+        "kernel-only installs.",
+        "installs `plotly` into the kernel only, and the next env sync removes it "
+        "(`uv add plotly` keeps it); it also removes `seaborn` from the kernel",
+    ),
+    (
+        "!uv add x\n!uv remove y",
+        "The cell adds `x` to the project's dependencies; it also removes `y` from the "
+        "project's dependencies (`!uv add x` (+1 more)).",
+        "Remove the package commands and ask the user; after a yes, run `uv add x`, then run "
+        "`uv remove y` through Bash.",
+        "adds `x` to the project's dependencies with `uv add`; it also removes `y` from the "
+        "project's dependencies with `uv remove`",
+    ),
+    # Where a package comes from is named, and kept in the suggested command (gate-6).
+    (
+        "%pip install torch --index-url https://download.pytorch.org/whl/cu121",
+        "The cell installs `torch` (from `https://download.pytorch.org/whl/cu121`) into the "
+        "kernel only (`%pip install torch --index-url https://download.pytorch.org…`).",
+        "Remove the install and ask the user; after a yes, install it with "
+        "`uv add torch --index-url https://download.pytorch.org/whl/cu121` through Bash: the "
+        "next env sync removes kernel-only installs.",
+        "installs `torch` (from `https://download.pytorch.org/whl/cu121`) into the kernel only, "
+        "and the next env sync removes it "
+        "(`uv add torch --index-url https://download.pytorch.org/whl/cu121` keeps it)",
+    ),
+    (
+        "%pip install --extra-index-url=https://pkgs.example.net/simple internal-utils",
+        "The cell installs `internal-utils` (from `https://pkgs.example.net/simple`) into the "
+        "kernel only (`%pip install --extra-index-url=https://pkgs.example.net/sim…`).",
+        "Remove the install and ask the user; after a yes, install it with "
+        "`uv add internal-utils --extra-index-url https://pkgs.example.net/simple` through "
+        "Bash: the next env sync removes kernel-only installs.",
+        "installs `internal-utils` (from `https://pkgs.example.net/simple`) into the kernel "
+        "only, and the next env sync removes it "
+        "(`uv add internal-utils --extra-index-url https://pkgs.example.net/simple` keeps it)",
+    ),
+    (
+        "%pip install -e ../mylib",
+        "The cell installs `../mylib` (editable) into the kernel only "
+        "(`%pip install -e ../mylib`).",
+        "Remove the install and ask the user; after a yes, install it with "
+        "`uv add --editable ../mylib` through Bash: the next env sync removes kernel-only "
+        "installs.",
+        "installs `../mylib` (editable) into the kernel only, and the next env sync removes it "
+        "(`uv add --editable ../mylib` keeps it)",
+    ),
+    (  # conda's channel is named; pip's -c (constraints) is not; never carried into uv add
+        "%conda install -c conda-forge seaborn\n%pip install -c limits.txt plotly",
+        "The cell installs `seaborn` (from channel `conda-forge`) and `plotly` into the kernel "
+        "only (`%conda install -c conda-forge seaborn` (+1 more)).",
+        "Remove the install and ask the user; after a yes, install them with "
+        "`uv add seaborn plotly` through Bash: the next env sync removes kernel-only installs.",
+        "installs `seaborn` (from channel `conda-forge`) and `plotly` into the kernel only, and "
+        "the next env sync removes them (`uv add seaborn plotly` keeps them)",
+    ),
+    (  # a string argument ends at its closing quote
+        "import subprocess\nsubprocess.run('pip install x', shell=True)",
+        "The cell installs `x` into the kernel only "
+        "(`subprocess.run('pip install x', shell=True)`).",
+        "Remove the install and ask the user; after a yes, install it with `uv add x` through "
+        "Bash: the next env sync removes kernel-only installs.",
+        "installs `x` into the kernel only, and the next env sync removes it (`uv add x` keeps it)",
+    ),
+    (  # a word the shell reads otherwise is double-quoted, escaped (plan-R7)
+        '%pip install "seaborn[stats]" $PKG',
+        "The cell installs `seaborn[stats]` and `$PKG` into the kernel only "
+        '(`%pip install "seaborn[stats]" $PKG`).',
+        "Remove the install and ask the user; after a yes, install them with "
+        '`uv add "seaborn[stats]" "\\$PKG"` through Bash: the next env sync removes '
+        "kernel-only installs.",
+        "installs `seaborn[stats]` and `$PKG` into the kernel only, and the next env sync "
+        'removes them (`uv add "seaborn[stats]" "\\$PKG"` keeps them)',
+    ),
+]
+
+
+@pytest.mark.parametrize(("code", "message", "fix", "question"), L009_TEXTS)
+def test_l009_names_the_packages_and_what_keeps_them(
+    code: str, message: str, fix: str, question: str
+) -> None:
+    [issue] = lint(code).asks
+    assert (issue.rule, issue.message, issue.fix, issue.question) == (
+        "L009",
+        message,
+        fix,
+        question,
+    )
+
+
+def test_l009_in_a_conda_project_points_at_environment_yml() -> None:
+    cfg = load(None)
+    cfg.data["project"]["env_manager"] = "conda"
+    [issue] = lint("%conda install -c conda-forge seaborn", cfg=cfg).asks
+    assert issue.message == (
+        "The cell installs `seaborn` (from channel `conda-forge`) into the kernel only "
+        "(`%conda install -c conda-forge seaborn`)."
+    )
+    assert issue.fix == (
+        "Remove the install and ask the user; after a yes, add `seaborn` (from channel "
+        "`conda-forge`) to environment.yml and run `nhctl env sync` through Bash: the next env "
+        "sync removes kernel-only installs."
+    )
+    assert issue.question == (
+        "installs `seaborn` (from channel `conda-forge`) into the kernel only, and the next env "
+        "sync removes it (adding it to environment.yml keeps it)"
+    )
+    [removal] = lint("%conda remove seaborn", cfg=cfg).asks
+    assert removal.fix == (
+        "Remove it and ask the user; after a yes, remove `seaborn` from environment.yml and run "
+        "`nhctl env sync` through Bash."
+    )
+    [two] = lint("%conda remove seaborn plotly", cfg=cfg).asks
+    assert two.fix == (
+        "Remove it and ask the user; after a yes, remove `seaborn` and `plotly` from "
+        "environment.yml and run `nhctl env sync` through Bash."
+    )
+    [mixed] = lint("%pip install plotly\n%conda remove -y seaborn", cfg=cfg).asks
+    assert mixed.fix == (
+        "Remove the package commands and ask the user; after a yes, add `plotly` to "
+        "environment.yml and run `nhctl env sync`, then remove `seaborn` from environment.yml "
+        "and run `nhctl env sync` through Bash: the next env sync removes kernel-only installs."
+    )
+    assert mixed.question == (
+        "installs `plotly` into the kernel only, and the next env sync removes it (adding it to "
+        "environment.yml keeps it); it also removes `seaborn` from the kernel"
+    )
+    [forced] = lint("%conda install -f seaborn", cfg=cfg).asks  # conda's -f takes no value
+    assert "`seaborn`" in forced.question
+
+
+def test_l009_text_scan_is_linear() -> None:
+    """A long flagged line costs time in proportion to its length: a command's tool and verb
+    have no other tool word between them (design §6.4). The quadratic scan took ~22 s here."""
+    code = "!pip install x\n!" + "uv pip " * 8000 + "&& " * 10
+    started = time.perf_counter()
+    [issue] = lint(code).asks
+    assert time.perf_counter() - started < 3.0
+    assert issue.rule == "L009" and "`x`" in issue.question
+
+
+# One cell per rule that can ask (config.ASK_RULES): C5b and C5c add theirs here.
+ASK_SAMPLES = {"package_install": ("L009", "!pip install seaborn")}
+
+
+@pytest.mark.parametrize("level", ["ask", "hint", "error"])
+def test_every_ask_rule_has_a_question(level: str) -> None:
+    assert set(ASK_SAMPLES) == set(ASK_RULES)
+    for key, (rule, code) in ASK_SAMPLES.items():
+        report = lint(code, cfg=config(**{key: level}))
+        [issue] = [i for i in report.errors + report.hints + report.asks if i.rule == rule]
+        assert issue.question and not issue.question.endswith("."), key
+
+
+@pytest.mark.parametrize(
+    ("key", "rule", "code"),
+    [
+        ("notebook_write", "L008", "import nbformat\nnbformat.write(nb, 'x.ipynb')"),
+        ("markdown_output", "L010", "%%markdown\n# Results"),
+        ("long_line", "L101", "x = " + " + ".join(["1"] * 60)),
+    ],
+)
+def test_a_rule_that_cant_ask_at_ask_is_an_error(key: str, rule: str, code: str) -> None:
+    """config.load refuses "ask" for these; a hand-built Config that holds it fails closed."""
+    report = lint(code, cfg=config(**{key: "ask"}))
+    assert rule in rules(report) and rule not in rules(report, "ask") + rules(report, "hint")
+
+
+def test_only_an_ask_rule_has_a_question() -> None:
+    report = lint("# %%\n!pip install x", title="a b c d e f g h i")
+    assert all(issue.question == "" for issue in report.errors + report.hints)
+    assert [issue.question != "" for issue in report.asks] == [True]
 
 
 # L010 -------------------------------------------------------------------------------------------
@@ -1981,8 +2310,11 @@ def test_l011_is_an_error_by_default_and_blocks_the_write() -> None:
 
 
 def test_l011_comes_after_the_other_hard_rules_in_order() -> None:
-    report = lint('!pip install openai\nimport os\nprint(os.getenv("OPENAI_API_KEY"))')
+    code = '!pip install openai\nimport os\nprint(os.getenv("OPENAI_API_KEY"))'
+    report = lint(code, cfg=config(package_install="error"))
     assert rules(report) == ["L009", "L011"]
+    default = lint(code)  # L009 is an ask by default (design §6.4): the error refuses first
+    assert rules(default) == ["L011"] and rules(default, "ask") == ["L009"]
     order = [rule for rule, _, _ in lint_module._CHECKS]
     assert order.index("L010") + 1 == order.index("L011") < order.index("L014")
 
@@ -1996,8 +2328,10 @@ def test_l011_a_scan_failure_drops_only_the_secret_rules(monkeypatch: pytest.Mon
         raise RecursionError("deep")
 
     monkeypatch.setattr(secret_scan, "scan", boom)
-    report = lint('!pip install x\nimport os\nprint(os.getenv("K"))')
+    code = '!pip install x\nimport os\nprint(os.getenv("K"))'
+    report = lint(code, cfg=config(package_install="error"))
     assert rules(report) == ["L009"]
+    assert rules(lint(code)) == [] and rules(lint(code), "ask") == ["L009"]
 
 
 def test_l011_loop_walk_is_two_passes() -> None:
@@ -2329,8 +2663,12 @@ def test_configurable_hard_rules(code: str, rule: str, key: str) -> None:
 
 # report shape -------------------------------------------------------------------------------------
 def test_all_problems_reported_at_once_in_rule_order() -> None:
-    report = lint("# %%\n!pip install x", title="a b c d e f g h i", notes=["one"], intent="")
+    args: dict[str, Any] = dict(title="a b c d e f g h i", notes=["one"], intent="")
+    report = lint("# %%\n!pip install x", cfg=config(package_install="error"), **args)
     assert rules(report) == ["L002", "L003", "L004", "L005", "L009"]
+    default = lint("# %%\n!pip install x", **args)  # the ask rides along with the errors
+    assert rules(default) == ["L002", "L003", "L004", "L005"]
+    assert rules(default, "ask") == ["L009"]
 
 
 CORPUS = [
@@ -2352,9 +2690,12 @@ CORPUS = [
 @pytest.mark.parametrize("kernel", [None, (3, 11)])
 def test_messages_quote_code_not_line_numbers(code: str, kernel: Any) -> None:
     report = lint(code, kernel_python=kernel)
-    for issue in report.errors + report.hints:
-        text = f"{issue.message} {issue.fix}"
-        assert not re.search(r"\b(?:line|lines|row)\s+\d", text, re.I), text
-        assert "nh-" not in text
-        assert issue.severity in ("error", "hint")
-        assert issue.fix.endswith(".")
+    found = [("error", report.errors), ("hint", report.hints), ("ask", report.asks)]
+    for severity, issues in found:
+        for issue in issues:  # every finding sits in the list of its own severity
+            text = f"{issue.message} {issue.fix} {issue.question}"
+            assert not re.search(r"\b(?:line|lines|row)\s+\d", text, re.I), text
+            assert "nh-" not in text
+            assert issue.severity == severity
+            assert issue.fix.endswith(".")
+    assert sum(len(issues) for _, issues in found) > 0

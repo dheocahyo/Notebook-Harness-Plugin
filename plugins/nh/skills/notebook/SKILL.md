@@ -35,6 +35,7 @@ Read dumps every output. Hooks block those paths; don't look for workarounds.
   `title` and `notes`. Explanations go in chat, which has no length limit.
 - Ultracode on (a system reminder says so) or `/nh:qa-cell`: the nh:qa-cell
   workflow writes and checks the cell: [reference/qa-workflow.md](reference/qa-workflow.md).
+- E122: ask the user nh's one question, then stop: [reference/asks.md](reference/asks.md).
 
 ## Tools
 Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections: [reference/tools.md](reference/tools.md).
@@ -108,8 +109,7 @@ as its review:
 - **explain** / `/nh:explain`: no cell. `nh_inspect` it, then a numbered walkthrough in chat
   quoting its code piece by piece with the real values from its output; end by proposing
   one next step, not taken. Never in the notebook; change nothing unless it names a change verb (E109).
-- **tidy**: apply the readability hints with `nh_edit_cell`; this is the
-  message's cell.
+- **tidy**: apply the readability hints with `nh_edit_cell`; this is the message's cell.
 
 ## Readable, simple code
 Code length has no cap; readability is what counts. Before/after pairs:
@@ -129,9 +129,9 @@ Code length has no cap; readability is what counts. Before/after pairs:
 - Use installed packages (`nh_inspect` lists them); import where first used.
 
 ## Never
-- Install packages without asking. Ask first; after a yes, run `uv add <pkg>`
-  (or the project's conda install) with Bash, then write the cell. Never
-  `%pip install` or `!pip install` in a cell.
+- Install packages without asking. Ask first; after a yes, run `uv add <pkg>` with Bash (conda:
+  add it to environment.yml, then `nhctl env sync`), then write the cell. Prefer that to
+  `%pip install` or `!pip install` in a cell, which nh asks the user about (E122).
 - Re-run earlier cells, restart the kernel, or write outside the project unasked.
 - Show a secret, any piece of it (prefix, suffix, masked preview) or its length.
   Check one with `print("NAME" in os.environ)`; nh refuses showing its value (L011).

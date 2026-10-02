@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any
 
 RESERVED_SECTIONS = {"preset", "guardrails", "secrets", "libraries", "comprehension"}
+# A [lint.rules] level; "ask" holds the cell for the user's yes (design §6.4).
+RULE_LEVELS = ("off", "hint", "error", "ask")
+# The rules that can ask: each one's finding carries the user's question (design §6.4). C5b and
+# C5c add network and outside_write.
+ASK_RULES = frozenset({"package_install"})
+HEADLESS_ENV = "NH_HEADLESS"
 
 
 def _packaged_defaults() -> dict[str, Any]:
@@ -81,14 +87,27 @@ def load(project: Path | None) -> Config:
         _merge(data, user, "", problems)
     _apply_env(data)
     for key, value in data["lint"]["rules"].items():
-        if value not in ("off", "hint", "error"):
-            problems.append(f"lint.rules.{key} must be off|hint|error")
+        levels = rule_levels(key)
+        if value not in levels:
+            problems.append(f"lint.rules.{key} must be {'|'.join(levels)}")
             data["lint"]["rules"][key] = DEFAULTS["lint"]["rules"].get(key, "hint")
     return Config(data=data, problems=problems, source_mtime=mtime)
 
 
+def rule_levels(key: str) -> tuple[str, ...]:
+    """The levels a [lint.rules] key takes: "ask" only for a rule that can ask (design §6.4)."""
+    return RULE_LEVELS if key in ASK_RULES else tuple(v for v in RULE_LEVELS if v != "ask")
+
+
+def headless() -> bool:
+    """``NH_HEADLESS=1``: a run with nobody to answer (a ``claude -p`` run sets it; the gateway
+    can't see ``-p`` itself). No approval prompt, and no yes can arrive for a question nh asks,
+    so E122 stands (design §6.4)."""
+    return os.environ.get(HEADLESS_ENV) == "1"
+
+
 def _apply_env(data: dict[str, Any]) -> None:
-    if os.environ.get("NH_HEADLESS") == "1":
+    if headless():
         data["approval"]["approve_before_run"] = False
     if url := os.environ.get("NH_JUPYTER_URL"):
         data["jupyter"]["url"] = url

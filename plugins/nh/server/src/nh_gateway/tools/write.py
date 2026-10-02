@@ -30,6 +30,7 @@ from ..lint.lint import LintReport, lint_cell
 from ..policy.errors import RETURN_TO_WORKFLOW, NhError, scrub
 from ..policy.turn import TurnContext, TurnState
 from ..state import write_last_cell
+from . import approvals
 from .common import (
     RETRYABLE,
     RunRecord,
@@ -158,7 +159,8 @@ def _lint_failure(
     if "L009" in rules:
         next_step = (
             "Don't call again yet: ask the user whether to install the package. After a yes, run "
-            "`uv add <package>` (or `conda install`) with Bash, then write the cell without the install."
+            "`uv add <package>` with Bash (in a conda project, add it to environment.yml and run "
+            "`nhctl env sync`), then write the cell without the install."
         )
     elif "L002" in rules:
         next_step = (
@@ -714,6 +716,8 @@ async def add_cell(
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)
+        # FR-12 (design §6.4): a cell the lint asks about waits for the user's yes.
+        approvals.gate_cell(svc, turn, approvals.cell_key(ref.rel_path, "add", code), report.asks)
 
         probe_names = set(report.uses) | set(report.defs)
         before = await probe_before(svc, ref, probe_names)
@@ -789,6 +793,7 @@ async def add_cell(
             rollback=rollback,
             history=history,
         )
+        approvals.wrote(svc, turn)
         history_notes = record_history(svc, **history)
         stale = await mark_downstream(
             svc, ref, cells, index, set(report.defs), by=uid, turn=turn, reason="upstream-edit"
@@ -950,6 +955,9 @@ async def edit_cell(
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)
+        approvals.gate_cell(
+            svc, turn, approvals.cell_key(ref.rel_path, f"edit:{uid}", code), report.asks
+        )
 
         probe_names = set(report.uses) | set(report.defs)
         before_probe = await probe_before(svc, ref, probe_names)
@@ -1109,6 +1117,7 @@ async def edit_cell(
             rollback=rollback,
             history=history,
         )
+        approvals.wrote(svc, turn)
         history_notes = record_history(svc, **history)
         svc.stale.clear(ref.rel_path, [uid])
         stale = await mark_downstream(

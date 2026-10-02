@@ -35,6 +35,7 @@ def lint(code: str, cfg: Config | None = None, **overrides: Any) -> LintReport:
 def hints(code: str, **overrides: Any) -> dict[str, str]:
     report = lint(code, **overrides)
     assert report.errors == [], [e.message for e in report.errors]
+    assert report.asks == [], [a.message for a in report.asks]
     return {h.rule: h.message for h in report.hints}
 
 

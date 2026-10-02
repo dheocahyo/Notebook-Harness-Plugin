@@ -19,13 +19,14 @@ from typing import Literal
 
 from nh_gateway._shared.patterns import CELL_NOTEBOOK_WRITES, CELL_PACKAGE_INSTALL, CELL_SEPARATORS
 from nh_gateway._shared.text import count_words, normalize_bullet, normalize_title, split_notes
-from nh_gateway.config import Config
+from nh_gateway.config import ASK_RULES, Config
 from nh_gateway.dataflow import EVERYTHING, Flow, base_name, flow_of
 from nh_gateway.lint import secret_scan
 from nh_gateway.lint.magics import Masked, lines_of, mask
 
-Severity = Literal["error", "hint"]
-Finding = tuple[str, str]  # (message, fix)
+Severity = Literal["error", "hint", "ask"]
+# (message, fix), or (message, fix, question) for a rule that can be an ask (design §6.4)
+Finding = tuple[str, str] | tuple[str, str, str]
 
 # Cell magics whose body is Python source (ruff skips the same set).
 PYTHON_CELL_MAGICS = frozenset({"time", "timeit", "capture", "prun", "debug", "python", "python3"})
@@ -63,6 +64,38 @@ _SHELL_INSTALL = re.compile(
 _OS_INSTALL = re.compile(
     r"\bos\.(?:system|popen)\([^)]*\b(?:pip3?|conda|mamba|uv)\b[^)]*\b(?:install|add)\b", re.I
 )
+# L009's text (design §6.4). A line that may hold a package command (a magic, a shell call from
+# Python, or a shell cell's command), where a line splits into commands, and a command: a tool
+# word, then its verb, with no other tool word between them (so the scan stays linear).
+_COMMAND_LINE = re.compile(r"^\s*[!%]|\b(?:os\.(?:system|popen)|subprocess\.[a-z_]+)\(")
+_SHELL_PACKAGE_LINE = re.compile(
+    r"^\s*(?:sudo\s+)?(?:python3?\s+-m\s+pip|pip3?|conda|mamba|micromamba|uv(?:\s+pip)?)"
+    r"\s+(?:install|add|uninstall|remove)\b",
+    re.I,
+)
+_COMMAND_SPLIT = re.compile(r"&&|\|\||;|(?<=\s)\|")
+_TOOL = r"\b(?:pip3?|conda|mamba|micromamba|uv)\b"
+_COMMAND = re.compile(
+    rf"(?P<tool>{_TOOL})(?P<mid>(?:(?!{_TOOL}).)*?)(?<![\w-])"
+    r"(?P<verb>uninstall|install|remove|add)\b",
+    re.I,
+)
+_CONDA_TOOLS = frozenset({"conda", "mamba", "micromamba"})
+_COMMAND_END = re.compile(r"\)|[\'\"]\]|[\'\"]\s*,\s*(?![\'\"\s])|\s\d*>|\s#")
+_INSTALL_WORD = re.compile(r"[\w.\-+=<>!~@:/${}*%,#&?]+(?:\[[\w,.\-]*\])?")
+# The options whose value L009 names (design §6.4); the values of the others in _VALUE_OPTION
+# (pip's, uv's and conda's) are left out, so they aren't read as packages.
+_REQUIREMENT_OPTION = re.compile(r"-r|--requirements?|--file")
+_EDITABLE_OPTION = re.compile(r"-e|--editable")
+_INDEX_OPTION = re.compile(r"-[if]|--(?:index-url|extra-index-url|index|default-index|find-links)")
+_CHANNEL_OPTION = re.compile(r"-c|--channel")
+_VALUE_OPTION = re.compile(
+    r"-[cefinprt]|--(?:requirements?|file|constraint|editable|index-url|extra-index-url"
+    r"|find-links|target|prefix|root|python|name|channel|index|default-index|group|optional"
+    r"|extra|package|src|trusted-host|platform|python-version|upgrade-strategy|only-binary"
+    r"|no-binary|log|cache-dir|timeout|retries|proxy|cert|client-cert)"
+)
+_SHELL_SAFE = re.compile(r"[\w@%+=:,./-]+")
 _PROSE_CALL_TEXT = re.compile(
     r"\b(?:Markdown|HTML|Latex)\s*\(\s*[rRbBuUfF]{0,2}(\"\"\"|'''|\"|')(.*?)\1", re.S
 )
@@ -117,12 +150,14 @@ class Issue:
     severity: Severity
     message: str  # human sentence, quotes code, never line numbers
     fix: str  # one sentence telling the agent what to change
+    question: str = ""  # an ask's clause for the user ("installs `x` into the kernel only")
 
 
 @dataclass
 class LintReport:
     errors: list[Issue]
     hints: list[Issue]
+    asks: list[Issue]  # what holds the cell for the user's yes (E122, design §6.4)
     code_lines: int
     comment_lines: int
     defs: set[str]
@@ -268,10 +303,12 @@ def lint_cell(
         except Exception:  # a heuristic that trips on odd code must never break a write
             continue
         if found:
-            issues.append(Issue(rule, key, level, *found))
+            message, fix, *question = found
+            issues.append(Issue(rule, key, level, message, fix, *question))
     return LintReport(
         errors=sorted((i for i in issues if i.severity == "error"), key=lambda i: i.rule),
         hints=[i for i in issues if i.severity == "hint"],
+        asks=[i for i in issues if i.severity == "ask"],
         code_lines=len(cell.code_lines),
         comment_lines=len(cell.comment_lines),
         defs=set(cell.flow.defs),
@@ -287,9 +324,14 @@ def _error(rule: str, key: str, message: str, fix: str) -> Issue:
 
 
 def _level(cfg: Config, key: str) -> Severity | None:
+    """The rule's configured level. Strict mode makes every hint an error and leaves an ask an
+    ask: only the user decides an install. Only a rule that can ask asks; ``config.load`` refuses
+    "ask" for the others, and one that gets it anyway is an error (design §6.4)."""
     level = cfg.rule(key)
     if level == "off":
         return None
+    if level == "ask":
+        return "ask" if key in ASK_RULES else "error"
     if level == "error" or cfg["lint"]["mode"] == "strict":
         return "error"
     return "hint"
@@ -581,21 +623,199 @@ def _path_text(node: ast.AST | None, paths: dict[str, str]) -> str:
 
 
 def _package_install(cell: _Cell) -> Finding | None:
+    """L009, an ask by default (design §6.4): its message names what each package command of the
+    cell does (installs, adds, removes) and to which packages, and its question says what keeps
+    an install: the next env sync removes a kernel-only one."""
     text = cell.code_text
     patterns = [CELL_PACKAGE_INSTALL, _MAGIC_INSTALL, _OS_INSTALL]
-    if cell.masked.cell_magic in _SHELL_CELL_MAGICS:
+    shell = cell.masked.cell_magic in _SHELL_CELL_MAGICS
+    if shell:
         patterns.append(_SHELL_INSTALL)
-    match = next((m for p in patterns if (m := p.search(text))), None)
-    if match is None:
+    found = _line_starts(text, patterns)
+    if not found:
         return None
-    at = match.start() + len(match.group(0)) - len(match.group(0).lstrip())
-    end = text.find("\n", at)
-    line = text[text.rfind("\n", 0, at) + 1 : end if end >= 0 else len(text)]
+    lines: list[str] = []
+    kinds: dict[str, list[_PackageCommand]] = {}
+    start = 0
+    for line in text.split("\n"):  # detection's lines, and any other line with a package command
+        commands: list[_PackageCommand] = []
+        if (
+            start in found
+            or _COMMAND_LINE.search(line)
+            or (shell and _SHELL_PACKAGE_LINE.match(line))
+        ):
+            commands = list(_package_commands(line))  # each line is scanned once
+        if start in found or commands:
+            lines.append(line)
+            for command in commands:
+                kinds.setdefault(command.kind, []).append(command)
+        start += len(line) + 1
+    if not kinds:
+        kinds["install"] = []
+    conda = cell.cfg["project"].get("env_manager") == "conda"
+    texts = [_package_text(kind, commands, conda) for kind, commands in kinds.items()]
+    if list(kinds) == ["install"]:
+        lead = "Remove the install"
+    else:
+        lead = "Remove it" if len(kinds) == 1 else "Remove the package commands"
+    tail = ": the next env sync removes kernel-only installs." if "install" in kinds else "."
+    shown = f"{_quote(lines[0])}{_more(len(lines))}"
     return (
-        f"The code installs packages ({_quote(line)}).",
-        "Remove the install and ask the user; after a yes, install with `uv add` or "
-        "`conda install` through Bash.",
+        f"The cell {'; it also '.join(t[0] for t in texts)} ({shown}).",
+        f"{lead} and ask the user; after a yes, {', then '.join(t[2] for t in texts)} through "
+        f"Bash{tail}",
+        "; it also ".join(t[1] for t in texts),
     )
+
+
+def _line_starts(text: str, patterns: list[re.Pattern[str]]) -> set[int]:
+    """Where each line that one of ``patterns`` matches starts."""
+    starts: set[int] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            at = match.start() + len(match.group(0)) - len(match.group(0).lstrip())
+            starts.add(text.rfind("\n", 0, at) + 1)
+    return starts
+
+
+@dataclass
+class _PackageCommand:
+    """One package command of an L009 line (design §6.4)."""
+
+    kind: str  # install | uv-add | remove | uv-remove
+    packages: list[str]
+    editables: list[str]
+    files: list[str]  # requirement files
+    index: list[tuple[str, str]]  # pip's and uv's index options, as written: (option, value)
+    channels: list[str]  # conda's
+
+
+def _package_commands(line: str) -> Iterator[_PackageCommand]:
+    """The package commands of one line, split at ``&&``, ``||``, ``;`` and `` |``: a tool word,
+    its verb, and the words after it up to where the command ends."""
+    for part in _COMMAND_SPLIT.split(line):
+        command = _COMMAND.search(part)
+        if command is None:
+            continue
+        conda = command["tool"].lower() in _CONDA_TOOLS
+        project = command["tool"].lower() == "uv"  # `uv pip install` matches at its `pip`
+        if command["verb"].lower() in ("uninstall", "remove"):
+            kind = "uv-remove" if project else "remove"
+        else:
+            kind = "uv-add" if project and command["verb"].lower() == "add" else "install"
+        rest = part[command.end() :]
+        end = _COMMAND_END.search(rest)
+        rest = rest[: end.start()] if end else rest
+        found = _PackageCommand(kind, [], [], [], [], [])
+        seen: set[str] = set()  # found.packages as a set: the scan stays linear
+        option: str | None = None
+        for word in (w.strip(",") for w in _INSTALL_WORD.findall(rest)):
+            if option is not None:
+                _option_value(found, option, word, conda)
+                option = None
+            elif word.startswith("-"):
+                name, eq, value = word.partition("=")
+                if eq:
+                    _option_value(found, name, value, conda)
+                elif _VALUE_OPTION.fullmatch(name) and not (conda and name == "-f"):
+                    option = name  # conda's -f is --force, which takes no value
+            elif any(ch.isalnum() for ch in word) and word not in seen:
+                seen.add(word)
+                found.packages.append(word)
+        yield found
+
+
+def _option_value(found: _PackageCommand, option: str, value: str, conda: bool) -> None:
+    """Keep the value of an option L009 names; pip's -c (constraints) and the rest are dropped."""
+    if not value:
+        return
+    if _REQUIREMENT_OPTION.fullmatch(option):
+        found.files.append(value)
+    elif _EDITABLE_OPTION.fullmatch(option):
+        found.editables.append(value)
+    elif conda and _CHANNEL_OPTION.fullmatch(option):
+        found.channels.append(value)
+    elif not conda and _INDEX_OPTION.fullmatch(option):
+        found.index.append((option, value))
+
+
+def _package_text(kind: str, commands: list[_PackageCommand], conda: bool) -> tuple[str, str, str]:
+    """(message clause, question clause, fix part) of one kind of package command."""
+    names: list[str] = []
+    targets: list[str] = []  # the suggested command's words
+    packages: list[str] = []
+    options: list[str] = []
+    option_set: set[str] = set()
+    files = False
+    seen: set[tuple[str, str]] = set()
+    for command in commands:
+        mine: list[str] = []
+        for what, value in (
+            *(("package", p) for p in command.packages),
+            *(("editable", e) for e in command.editables),
+            *(("file", f) for f in command.files),
+        ):
+            if (what, value) in seen:
+                continue
+            seen.add((what, value))
+            if what == "package":
+                mine.append(f"`{value}`")
+                targets.append(_shell_word(value))
+                packages.append(_shell_word(value))
+            elif what == "editable":
+                mine.append(f"`{value}` (editable)")
+                targets += ["--editable", _shell_word(value)]
+            else:
+                mine.append(f"the packages in `{value}`")
+                targets += ["-r", _shell_word(value)]
+                files = True
+        for option, value in command.index:
+            pair = f"{option} {_shell_word(value)}"
+            if pair not in option_set:
+                option_set.add(pair)
+                options.append(pair)
+        sources = [f"`{v}`" for _, v in command.index] + [
+            f"channel `{c}`" for c in command.channels
+        ]
+        if mine and sources:
+            mine[-1] += f" (from {_and(sources)})"
+        names += mine
+    named = _and(names) if names else "packages"
+    them = "it" if len(names) == 1 and not files else "them"
+    add = " ".join([*(targets or ["<package>"]), *options])
+    remove = " ".join(packages or ["<package>"])
+    if kind == "install":
+        message = f"installs {named} into the kernel only"
+        if conda:
+            keeps = f"adding {them} to environment.yml keeps {them}"
+            fix = f"add {named} to environment.yml and run `nhctl env sync`"
+        else:
+            keeps = f"`uv add {add}` keeps {them}"
+            fix = f"install {them} with `uv add {add}`"
+        return message, f"{message}, and the next env sync removes {them} ({keeps})", fix
+    if kind == "uv-add":
+        message = f"adds {named} to the project's dependencies"
+        return message, f"{message} with `uv add`", f"run `uv add {add}`"
+    if kind == "uv-remove":
+        message = f"removes {named} from the project's dependencies"
+        return message, f"{message} with `uv remove`", f"run `uv remove {remove}`"
+    message = f"removes {named} from the kernel"
+    if conda:
+        return message, message, f"remove {named} from environment.yml and run `nhctl env sync`"
+    return message, message, f"run `uv remove {remove}`"
+
+
+def _shell_word(word: str) -> str:
+    """``word`` as one shell argument, double-quoted when the shell would read it otherwise:
+    L009's question sits inside E122's single quotes (design §6.4)."""
+    if _SHELL_SAFE.fullmatch(word):
+        return word
+    return '"' + re.sub(r'([\\"$`])', r"\\\1", word) + '"'
+
+
+def _and(parts: list[str]) -> str:
+    """`a`, `b` and `c`."""
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
 def _markdown_output(cell: _Cell) -> Finding | None:

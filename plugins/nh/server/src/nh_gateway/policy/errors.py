@@ -105,6 +105,10 @@ CATALOGUE: dict[str, tuple[str, str]] = {
         "Not written: too many rejected attempts this message.",
         "Explain to the user what you are trying to write and ask how to proceed.",
     ),
+    "E122": (
+        "Not {verb}: this needs the user's yes first.",
+        "Ask the user nh's question, then stop. After a yes, send the same call again.",
+    ),
     "E125": (
         "Not written: the code holds nh's [redacted:…] marker, not the real value.",
         # nh doesn't load .env into the kernel: os.environ alone misses a .env value (C3 review)
