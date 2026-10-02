@@ -115,6 +115,7 @@ class RtcBackend:
         self._notices: dict[str, list[str]] = {}
         self._disk = DiskReadBackend(layout.project, cfg_cache)
         self._janitor: asyncio.Task[None] | None = None
+        self._saves: set[asyncio.Future[None]] = set()  # save requests after runs, kept alive
 
     async def _retry(self, op: Callable[[], Awaitable[T]]) -> T:
         """Run ``op``; when the server went away or changed its token, rediscover it and run it once more.
@@ -295,7 +296,7 @@ class RtcBackend:
             with contextlib.suppress(OSError):
                 self._running_file(cell_id).unlink()
         if stuck:
-            await doc.settle()
+            await doc.save()
             self._note(
                 ref,
                 f"{len(stuck)} nh cell(s) were still marked running from an earlier nh session; "
@@ -378,25 +379,25 @@ class RtcBackend:
         doc = await self._retry(lambda: self._doc(ref))
         doc.set_meta(key, value)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
 
     async def insert_cells(self, ref: NotebookRef, index: int, cells: list[NewCell]) -> None:
         doc = await self._retry(lambda: self._doc(ref))
         doc.insert(index, cells)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
 
     async def update_cells(self, ref: NotebookRef, patches: list[CellPatch]) -> None:
         doc = await self._retry(lambda: self._doc(ref))
         doc.update(patches)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
 
     async def delete_cells(self, ref: NotebookRef, ids: list[str]) -> list[CellView]:
         doc = await self._retry(lambda: self._doc(ref))
         deleted = doc.delete(ids)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
         return deleted
 
     # ------------------------------------------------------------------ kernel
@@ -561,9 +562,13 @@ class RtcBackend:
     def _running_file(self, cell_id: str) -> Path:
         return self.layout.running / f"{safe_name(cell_id)}.json"
 
-    def _run_done(self, cell_id: str) -> None:
+    def _run_done(self, cell_id: str, doc: RtcDocument) -> None:
+        """A run ended: drop its record and have the room save its outputs (design §6.13)."""
         with contextlib.suppress(OSError):
             self._running_file(cell_id).unlink()
+        task = asyncio.ensure_future(doc.save())
+        self._saves.add(task)
+        task.add_done_callback(self._saves.discard)
 
     def _marked_running(self, ref: NotebookRef) -> set[str] | None:
         """Ids of the cells the notebook marks running; None when nh has no synced copy of it."""
@@ -651,7 +656,7 @@ class RtcBackend:
             api=doc.api,
             kernel_id=handle.kernel_id,
             hard_timeout=hard_timeout,
-            on_done=lambda _result: self._run_done(resolved),
+            on_done=lambda _result: self._run_done(resolved, doc),
             on_lost=lambda: handle.retire("exec"),
         )
         execution = runner.start()

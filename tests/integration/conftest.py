@@ -88,9 +88,11 @@ def start_lab(
     runtime: Path | None = None,
     port: int | None = None,
     token: str | None = None,
+    args: tuple[str, ...] = (),
 ) -> Lab:
     """Start JupyterLab from this venv (cwd ``base``, where its YStore lives) and wait for its
-    runtime file. Pass ``root``/``runtime``/``port`` of an earlier lab to restart "the same" one."""
+    runtime file. Pass ``root``/``runtime``/``port`` (and ``token``) of an earlier lab to restart
+    "the same" one; ``args`` are extra command-line options."""
     root, runtime, config_dir = root or base / "root", runtime or base / "runtime", base / "config"
     for folder in (root, runtime, config_dir):
         folder.mkdir(parents=True, exist_ok=True)
@@ -121,8 +123,9 @@ def start_lab(
         "0.5",
         "--YDocExtension.document_cleanup_delay",
         "3",
+        *args,
     ]
-    with open(log, "wb") as handle:
+    with open(log, "ab") as handle:  # a restart of the same lab appends to its log
         proc = subprocess.Popen(
             command,
             cwd=base,
@@ -160,14 +163,25 @@ def lab(tmp_path_factory) -> Lab:
         _stop(server.proc)
 
 
-def _stop(proc: subprocess.Popen) -> None:
+def _stop(proc: subprocess.Popen, *, runtime: Path | None = None) -> None:
+    """SIGTERM the server's process group, give it 15 s to exit, then SIGKILL the group.
+
+    On SIGTERM the server deletes its rooms and shuts its kernels down; jupyter_client starts each
+    kernel in a session of its own, outside the group, and removes its connection file once the
+    kernel exited or was killed. A server can then hang instead of exiting (a8: nh connected and
+    a cell running); with ``runtime`` the wait ends as soon as no kernel connection file is left
+    there.
+    """
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGTERM)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(15)
+        deadline = time.monotonic() + 15
+        while proc.poll() is None and time.monotonic() < deadline:
+            if runtime is not None and not list(runtime.glob("kernel-*.json")):
+                break
+            time.sleep(0.1)
     with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, signal.SIGKILL)  # kernels the server started live in the same group
+        os.killpg(proc.pid, signal.SIGKILL)  # the server and anything else left in its group
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(5)
 
