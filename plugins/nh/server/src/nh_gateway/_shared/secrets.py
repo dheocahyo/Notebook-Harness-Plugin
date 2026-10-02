@@ -30,7 +30,6 @@ MIN_MARGIN = 1024  # redact_head's overlap past the cut, at least the longest va
 FRAGMENT_MIN = 12  # the shortest cut piece of a secret-named value that is still redacted
 FRAGMENT_MAX_TEXT = 2 << 20  # texts longer than this skip fragment matching (cost)
 PEM_MAX_CHARS = 16384  # how far past BEGIN nh looks for a private key's END line
-PEM_OPEN_MAX_CHARS = 8192  # an unterminated key's body is redacted up to this far
 DOTENV_MAX_BYTES = 1 << 20  # how much of .env nh reads
 KEY_DIGIT_WITHIN = 64  # a key pattern's value needs a digit among its first this many chars
 
@@ -620,7 +619,13 @@ _USERINFO_CUT = re.compile(r"://(?P<s>[^\s/?#@:'\"<>\[]{0,256}:[^\s/?#@'\"<>]{1,
 _AWS = re.compile(r"A(?:KIA|SIA)[A-Z0-9]{16}(?![A-Za-z0-9])")
 _PEM_BEGIN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----")
-_PEM_BODY = re.compile(r"(?:[A-Za-z0-9+/=]|\r?\n|\\r|\\n)*")
+# An unterminated key's body (:func:`_key_run`): base64 and line breaks, a CRLF, and the
+# escaped \r and \n of a JSON or repr view. Two C-speed scans, no backtracking (an alternation
+# kept a backtracking stack of ~140 bytes a char; a Python loop per join cost seconds on 8 MB
+# of escaped joins, review of C12; Python 3.9 has no possessive quantifier): the run of those
+# characters, then the first one in it that isn't part of a join.
+_PEM_CHARS = re.compile(r"[A-Za-z0-9+/=\n\r\\]*")
+_PEM_STRAY = re.compile(r"\\(?![rn])|\r(?!\n)")
 # The literal and the minimum length only: a hit is extended (its tail, below) only once its
 # start is accepted, so a long run turned down at every literal in it (task-…-task-…, sk-sk-…)
 # is never rescanned from each one.
@@ -867,6 +872,10 @@ class Redactor:
         self._bracketed = [entry for entry in self._values if "[" in entry[0] or "]" in entry[0]]
         longest = len(ordered[0][0]) if ordered else 0
         self.margin = max(MIN_MARGIN, longest + 1)
+        # the values that span lines, and the longest one's length (0: none), so how far one may
+        # cross a line break in a text
+        self._multiline = [entry for entry in self._values if "\n" in entry[0]]
+        self.line_reach = max((len(entry[0]) for entry in self._multiline), default=0)
 
     @property
     def names(self) -> list[str]:
@@ -887,23 +896,103 @@ class Redactor:
         """``text`` with every known value and secret-shaped piece replaced by a marker."""
         if not isinstance(text, str) or not text:
             return text
+        spans = self._spans(text)
+        if not spans:
+            return text
+        out = _apply(text, spans)
+        for _ in range(3):  # a bracketed value can reappear next to a marker: [redacted:A]]x
+            again = self._bracketed_spans(out)
+            if again is None:
+                break
+            out = _apply(out, again)
+        return out
+
+    def redact_at(self, text: str, at: int) -> tuple[str, int, int]:
+        """``redact(text)``, and where position ``at`` of ``text`` lands in it: ``(out, lo, hi)``.
+        ``lo == hi`` unless a marker replaced text on both sides of ``at``; ``out[lo:hi]`` is then
+        that marker (or the markers that overlap it, when one completes a bracketed value). So
+        ``out[:lo]`` and ``out[hi:]`` never hold part of a marker: a caller that cut ``text``
+        itself at ``at`` would have split what the marker stands for (the trim, design §6.8)."""
+        at = max(0, min(at, len(text) if isinstance(text, str) else 0))
+        if not isinstance(text, str) or not text:
+            return text, at, at
+        spans = self._spans(text)
+        if not spans:
+            return text, at, at
+        out, lo, hi = _apply_at(text, spans, at, at)
+        rescanned = False
+        for _ in range(3):
+            again = self._bracketed_spans(out)
+            if again is None:
+                break
+            out, lo, hi = _apply_at(out, again, lo, hi)
+            rescanned = True
+        if rescanned:  # a rescan's marker may start inside an earlier one: [redacted:A[redacted:B]
+            start = out.rfind(MARKER, 0, lo)
+            lo = start if start != -1 and out.find("]", start) >= lo else lo
+            start = out.rfind(MARKER, 0, hi)
+            close = out.find("]", start) if start != -1 else -1
+            hi = close + 1 if close >= hi else hi
+        return out, lo, hi
+
+    def spill(self, text: str, at: int) -> int:
+        """Where a value that spans lines, or a cut piece of one, may end in ``text`` when it
+        began before ``at``, a line start: ``at`` plus the longest run ``text[at:]`` shares
+        with the part of such a value after one of its line breaks (``at``: none can)."""
+        if not self._multiline or not 0 <= at < len(text):
+            return at
+        lowered, full = _folded(text[at : at + self.line_reach])
+        which = 0 if full else 1
+        end = at
+        for entry in self._multiline:
+            value = entry[which]
+            newline = value.find("\n")
+            while newline != -1:
+                part = value[newline + 1 :]
+                shared = len(os.path.commonprefix([lowered[: len(part)], part]))
+                end = max(end, at + shared)
+                newline = value.find("\n", newline + 1)
+        return end
+
+    def spill_back(self, text: str, at: int) -> int:
+        """How far ``text`` may be kept before ``at``, a line start, when what follows may not
+        be the text's own (a cut window's last line): up to where a value that spans lines,
+        or a cut piece of one, running on past ``at`` may begin, which is ``at - 1`` minus the
+        longest run ``text[:at - 1]`` shares with the part of such a value before one of its
+        line breaks (``len(text)``: none can, so all of it)."""
+        if not self._multiline or not 0 < at <= len(text) or text[at - 1] != "\n":
+            return len(text)
+        lowered, full = _folded(text[max(0, at - 1 - self.line_reach) : at - 1])
+        which = 0 if full else 1
+        shared = -1
+        for entry in self._multiline:
+            value = entry[which]
+            newline = value.find("\n")
+            while newline != -1:
+                part = value[:newline]
+                common = len(os.path.commonprefix([lowered[::-1], part[::-1]]))
+                shared = max(shared, common if common or not part else -1)
+                newline = value.find("\n", newline + 1)
+        return len(text) if shared < 0 else at - 1 - shared
+
+    def _spans(self, text: str) -> list[Span]:
+        """Every value, cut piece and pattern in ``text``, located on its own offsets."""
         lowered, full = _folded(text)
         spans = self._value_spans(lowered, full)
         if self._strong and len(text) <= FRAGMENT_MAX_TEXT:
             spans += self._fragment_spans(lowered, full)
         spans += pattern_spans(text, lowered)
-        if not spans:
-            return text
-        out = _apply(text, spans)
-        for _ in range(3):  # a bracketed value can reappear next to a marker: [redacted:A]]x
-            if not self._bracketed:
-                break
-            lowered, full = _folded(out)
-            which = 0 if full else 1
-            if not any(entry[which] in lowered for entry in self._bracketed):
-                break
-            out = _apply(out, self._value_spans(lowered, full))
-        return out
+        return spans
+
+    def _bracketed_spans(self, out: str) -> list[Span] | None:
+        """The values to replace again in ``out`` when a bracketed one is in it; else None."""
+        if not self._bracketed:
+            return None
+        lowered, full = _folded(out)
+        which = 0 if full else 1
+        if not any(entry[which] in lowered for entry in self._bracketed):
+            return None
+        return self._value_spans(lowered, full)
 
     def redact_head(self, text: str, limit: int) -> str:
         """The redacted start of ``text``, for a caller that then cuts it at ``limit``.
@@ -1107,14 +1196,93 @@ def _plausible(kind: str, found: str) -> bool:
 
 def _pem_end(text: str, body: int) -> int:
     """Where a private key block that starts its body at ``body`` ends: after its END line,
-    or, unterminated (cut), after the key-shaped characters that follow."""
+    or, unterminated (cut) or with its END line past ``PEM_MAX_CHARS``, after all the
+    key-shaped characters that follow (:func:`_key_run`)."""
     end = text.find("-----END ", body, body + PEM_MAX_CHARS)
     if end != -1:
         match = _PEM_END.match(text, end)
         if match:
             return match.end()
-    match = _PEM_BODY.match(text, body, min(len(text), body + PEM_OPEN_MAX_CHARS))
-    return match.end() if match else body
+    return _key_run(text, body)
+
+
+def _key_run(text: str, start: int) -> int:
+    """The end of the run of key-shaped characters from ``start``: base64, line breaks (``\\n``
+    or ``\\r\\n``) and the escaped ``\\\\r`` and ``\\\\n`` of a JSON or repr view. Unbounded and
+    linear, at C speed: two regex scans (review of C12: a key over 16 KiB showed past 8 KiB)."""
+    run = _PEM_CHARS.match(text, start)
+    end = run.end() if run else start
+    stray = _PEM_STRAY.search(text, start, end)  # a backslash or CR that starts no join
+    return stray.start() if stray else end
+
+
+def _apply_at(text: str, spans: Sequence[Span], lo_at: int, hi_at: int) -> tuple[str, int, int]:
+    """:func:`_apply`, and where ``lo_at`` and ``hi_at`` (``lo_at <= hi_at``) land in its
+    output: a position inside a replaced group goes to its marker's start (``lo``) or end
+    (``hi``), any other one moves by what the markers before it changed. Groups as
+    :func:`_apply` makes them (a test pins it), in one pass: past ``hi_at`` it costs no more."""
+    ordered = sorted(spans, key=_START)
+    pieces: list[str] = []
+    add = pieces.append
+    cursor = size = 0  # size: the output's length so far, kept until both are placed
+    lo = hi = -1
+    group_start, group_end, weight, marker = ordered[0]
+    lead_start, lead_end = group_start, group_end
+    for start, end, span_weight, span_marker in ordered[1:]:
+        if start < group_end:
+            if end > group_end:
+                group_end = end
+            if span_weight > weight or (
+                span_weight == weight and start == lead_start and end > lead_end
+            ):
+                weight, marker, lead_start, lead_end = span_weight, span_marker, start, end
+            continue
+        if hi < 0:
+            lo, hi, size = _place(
+                lo, hi, size, cursor, group_start, group_end, len(marker), lo_at, hi_at
+            )
+        add(text[cursor:group_start])
+        add(marker)
+        cursor = group_end
+        group_start, group_end, weight, marker = start, end, span_weight, span_marker
+        lead_start, lead_end = start, end
+    if hi < 0:
+        lo, hi, size = _place(
+            lo, hi, size, cursor, group_start, group_end, len(marker), lo_at, hi_at
+        )
+    add(text[cursor:group_start])
+    add(marker)
+    cursor = group_end
+    add(text[cursor:])
+    if hi < 0:  # both past the last group
+        lo = lo if lo >= 0 else size + lo_at - cursor
+        hi = size + hi_at - cursor
+    return "".join(pieces), lo, hi
+
+
+def _place(
+    lo: int,
+    hi: int,
+    size: int,
+    cursor: int,
+    group_start: int,
+    group_end: int,
+    marker_len: int,
+    lo_at: int,
+    hi_at: int,
+) -> tuple[int, int, int]:
+    """:func:`_apply_at`'s step for one group: ``lo`` and ``hi`` if they land before or inside
+    it, and the output's length past its marker."""
+    if lo < 0 and lo_at <= group_start:
+        lo = size + lo_at - cursor
+    if hi < 0 and hi_at <= group_start:
+        hi = size + hi_at - cursor
+    size += group_start - cursor
+    if lo < 0 and lo_at < group_end:
+        lo = size
+    if hi < 0 and hi_at < group_end:
+        hi = size + marker_len
+    return lo, hi, size + marker_len
 
 
 def _apply(text: str, spans: Sequence[Span]) -> str:

@@ -771,6 +771,132 @@ def test_an_unterminated_private_key_is_redacted_up_to_its_end() -> None:
     assert PATTERNS_ONLY.redact(escaped) == "'[redacted:private-key]'"
 
 
+def key_lines(count: int, join: str = "\n") -> str:
+    """``count`` 64-char lines of a key's body."""
+    return join.join((PEM_BODY * 3)[i % 64 : i % 64 + 64] for i in range(count))
+
+
+@pytest.mark.parametrize("join", ["\n", "\r\n", "\\n", "\\r\\n"])  # a repr's or JSON's too
+def test_a_private_key_over_16_kib_is_redacted_whole(join: str) -> None:
+    """R6: its END line is past PEM_MAX_CHARS, so the key-shaped run is redacted, however long
+    (it once stopped after 8 KiB)."""
+    body = key_lines(300, join)
+    assert len(body) > secrets.PEM_MAX_CHARS
+    text = f"before{join}-----BEGIN RSA PRIVATE KEY-----{join}{body}{join}-----END RSA PRIVATE KEY-----"
+    out = PATTERNS_ONLY.redact(text)
+    assert out.startswith(f"before{join}[redacted:private-key]") and body[-64:] not in out
+    assert out.endswith("-----END RSA PRIVATE KEY-----")  # the run stops at its first "-"
+
+
+def test_an_unterminated_key_run_is_redacted_to_its_end_in_linear_time() -> None:
+    body = key_lines(40_000)  # 2.6 MB of key-shaped chars, no END line
+    text = f"-----BEGIN PRIVATE KEY-----\n{body}\n next"
+    began = time.perf_counter()
+    assert PATTERNS_ONLY.redact(text) == "[redacted:private-key] next"
+    assert time.perf_counter() - began < 2  # one regex per run, no backtracking stack
+
+
+@pytest.mark.parametrize("join", ["\\n", "A\\n", "AB\\r\\n"])
+def test_a_key_run_dense_in_escaped_joins_takes_two_scans(join: str) -> None:
+    """P6 (C12 review): 8 MB of escaped joins after a BEGIN line (a JSON view of a key, or
+    junk). A Python loop per join took 2 s here; two C-speed scans take a tenth of that."""
+    text = "-----BEGIN PRIVATE KEY-----" + join * (8_000_000 // len(join)) + " next"
+    began = time.perf_counter()
+    assert PATTERNS_ONLY.redact(text) == "[redacted:private-key] next"
+    assert time.perf_counter() - began < 1.5
+
+
+@pytest.mark.parametrize(
+    ("text", "end"),
+    [
+        ("AB\\nCD", 6),  # an escaped line break joins
+        ("AB\\rCD\r\nEF\nGH", 13),  # an escaped CR, a CRLF and a line break join
+        ("AB\\xCD", 2),  # a backslash that escapes anything else ends it
+        ("AB\\\\nCD", 2),  # so does an escaped backslash
+        ("AB\rCD", 2),  # and a CR without its line feed
+        ("AB\r\rCD", 2),
+        ("AB\\", 2),  # and a backslash or CR at the text's end
+        ("AB\r", 2),
+        ("AB-CD", 2),
+        ("", 0),
+    ],
+)
+def test_a_key_run_ends_where_a_char_starts_no_join(text: str, end: int) -> None:
+    assert secrets._key_run(text, 0) == end
+
+
+def test_redact_at_maps_a_position_without_splitting_a_marker(tmp_path: Path) -> None:
+    r = redactor(tmp_path, f"DB_PASSWORD={PASSWORD}\n")
+    text = f"ab {PASSWORD} cd"
+    marker = "[redacted:DB_PASSWORD]"
+    for at in range(-1, len(text) + 2):
+        out, lo, hi = r.redact_at(text, at)
+        assert out == r.redact(text)
+        if at <= 3:  # before the value, or at its start
+            assert lo == hi == max(0, at)
+        elif at < 3 + len(PASSWORD):  # inside it: its marker's two ends
+            assert (lo, hi) == (3, 3 + len(marker))
+        else:  # after it: moved by what the marker changed
+            assert lo == hi == min(at, len(text)) + len(marker) - len(PASSWORD)
+    assert r.redact_at("plain", 3) == ("plain", 3, 3)
+
+
+def test_redact_at_follows_a_marker_that_completes_a_value(tmp_path: Path) -> None:
+    r = redactor(tmp_path, "A_TOKEN=abcdefgh12\nB_SECRET=]zzzzzz9\n")
+    text = "abcdefgh12zzzzzz9"
+    out, lo, hi = r.redact_at(text, 5)  # inside A's value, which B's completes
+    assert out == r.redact(text) == "[redacted:A_TOKEN[redacted:B_SECRET]"
+    assert (lo, hi) == (0, len(out))
+    out, lo, hi = r.redact_at(text, 14)  # inside the part only B's marker covers: both whole
+    assert (lo, hi) == (0, len(out))
+    out, lo, hi = r.redact_at("x " + text + " y", 0)
+    assert (lo, hi) == (0, 0)
+    out, lo, hi = r.redact_at("x " + text + " y", len(text) + 3)
+    assert lo == hi == len(out) - 1
+
+
+def test_redact_at_agrees_with_redact_on_mixed_secrets(tmp_path: Path) -> None:
+    r = redactor(tmp_path, f"DB_PASSWORD={PASSWORD}\nODD_SECRET=abc]def[ghi\n")
+    text = f"x {PASSWORD} token=abc123 {AWS_KEY} abc]def[ghi\n{pem()}\n{GITHUB}{PASSWORD} y"
+    whole = r.redact(text)
+    los = []
+    for at in range(len(text) + 1):
+        out, lo, hi = r.redact_at(text, at)
+        assert out == whole and lo <= hi
+        assert lo == hi or (out[lo] == "[" and out[hi - 1] == "]" and MARKER in out[lo:hi])
+        los.append(lo)
+    assert los == sorted(los)  # a later position never lands earlier
+
+
+def test_spill_is_how_far_a_value_with_a_line_break_may_run_on(tmp_path: Path) -> None:
+    first, second = "Line1-Abc123xyzKq", "Line2-Def456uvwZr"
+    r = redactor(tmp_path, f'MULTI_SECRET="{first}\\n{second}"\n')
+    assert r.line_reach == len(first) + 1 + len(second)
+    assert r.spill(f"{second} rest\nnext", 0) == len(second)  # its part after the break
+    assert r.spill(f"x\n{second[:9]}", 2) == 2 + 9  # a cut piece of it
+    assert r.spill("Line2-other", 0) == len("Line2-")  # a shared start counts too
+    assert r.spill("other line", 0) == 0 and r.spill("", 0) == 0
+    assert redactor(tmp_path, f"DB_PASSWORD={PASSWORD}\n").spill(second, 0) == 0
+
+
+def test_spill_back_is_where_a_value_with_a_line_break_may_begin(tmp_path: Path) -> None:
+    first, second = "Line1-Abc123xyzKq", "Line2-Def456uvwZr"
+    r = redactor(tmp_path, f'MULTI_SECRET="{first}\\n{second}"\n')
+    text = f"row\nx {first}\nLine2-De"
+    at = text.rindex("\n") + 1
+    assert r.spill_back(text, at) == at - 1 - len(first)  # its first line may be the value's
+    text = f"row\n...{first[-9:]}\nLine2-De"  # a cut piece of it (its end) counts too
+    assert r.spill_back(text, text.rindex("\n") + 1) == text.rindex("\n") - 9
+    text = f"row\nx {first[:9]}\nLine2-De"  # its start alone can't run on past the break
+    assert r.spill_back(text, text.rindex("\n") + 1) == len(text)
+    text = "row\nother\nLine2-De"
+    assert r.spill_back(text, text.rindex("\n") + 1) == len(text)  # none can run on past it
+    plain = redactor(tmp_path, f"DB_PASSWORD={PASSWORD}\n")
+    assert plain.spill_back(f"x {first}\nLine2", len(first) + 3) == len(first) + 8
+    r = redactor(tmp_path, 'LEADING_SECRET="\\nAbc123xyzKqWv9"\n')  # a value that starts with one
+    assert r.spill_back("abc\nAbc", 4) == 3
+
+
 def test_a_dataframe_repr_keeps_its_columns(tmp_path: Path) -> None:
     r = redactor(
         tmp_path,
