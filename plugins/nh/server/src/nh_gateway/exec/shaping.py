@@ -844,8 +844,9 @@ def _html_prefix(markup: str) -> str:
     nothing, where ``close()`` shows it as text or ends it there. And it ends before a comment
     that no ``-->`` or ``--!>`` closes in it: the parser closes ``<!-->`` and ``<!--->`` at once
     only when no closer follows in what it was given (Python 3.11.15), and a later one in the
-    whole markup hides the text between (review of C12). Ending before one can leave an
-    earlier one open (its closer was in what is left out), so it ends before that too."""
+    whole markup hides the text between (review of C12; CPython 3.13.15 closes them at once
+    always, as HTML5 does, and then this shows less than the whole). Ending before one can leave
+    an earlier one open (its closer was in what is left out), so it ends before that too."""
     end = len(markup)
     while True:
         last = max(markup.rfind(closer, 0, end) for closer in _COMMENT_CLOSERS)

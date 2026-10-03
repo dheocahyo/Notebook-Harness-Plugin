@@ -1406,18 +1406,30 @@ def test_html_of_1_mb_or_less_over_its_share_redacts_its_text_alone(tmp_path, mo
         assert "key [redacted:github-token] done" in text and rest[:6] not in text, text[:80]
 
 
+def comment_runs_to_a_later_closer(opener: str) -> bool:
+    """Whether this Python's html.parser ends the comment ``opener`` starts at a later ``-->``.
+    ``<!--`` always; ``<!-->`` and ``<!--->`` up to CPython 3.13.12 (and 3.12.14, 3.11.16),
+    while 3.13.15 closes them at once, as HTML5 does."""
+    return "x" not in shaping._html_text(f"{opener}x-->")
+
+
 @pytest.mark.parametrize("opener", ["<!-->", "<!--->", "<!--"])
 def test_html_cut_inside_a_comment_shows_none_of_it(tmp_path, monkeypatch, opener):
     """P3b (C12 review): a comment open at the markup's cut. html.parser closes ``<!-->`` at once
     when no ``-->`` follows in what it was given, so the cut markup showed the comment's text,
-    where the whole markup's later ``-->`` hides it and joins a value split around it."""
+    where the whole markup's later ``-->`` hides it and joins a value split around it. Where
+    html.parser closes ``<!-->`` at once anyway (CPython 3.13.15), the whole markup shows that
+    text too, and the cut still shows none of it."""
     install_secret(tmp_path)
     monkeypatch.setattr(shaping, "TRIM_CHARS", SMALL_TRIM)
     intro = "<p>intro line</p>" * 2000
     markup = f"{intro}<p>{PASSWORD[:14]}{opener}" + "<p>note</p>" * 40_000
     markup += f"-->{PASSWORD[14:]}</p><p>end</p>"
     whole = shaping._clean(shaping._html_text(markup))
-    assert "[redacted:DB_PASSWORD]" in whole and "note" not in whole
+    if comment_runs_to_a_later_closer(opener):
+        assert "[redacted:DB_PASSWORD]" in whole and "note" not in whole
+    else:
+        assert "note" in whole
     shaped = shape([bundle({"text/html": markup})], save_dir=outputs_dir(tmp_path))
     full = (tmp_path / "proj" / shaped.full_path).read_text()
     for text in (full, shaped.text):

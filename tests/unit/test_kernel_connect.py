@@ -341,9 +341,13 @@ def test_a_dead_connection_with_other_requests_traffic_is_still_replaced(
     assert len(records(caplog, logging.INFO, REPLACED)) == 1
 
 
-def test_a_late_answer_on_an_earlier_connection_is_used(fake: Kernel, caplog) -> None:
+def test_a_late_answer_on_an_earlier_connection_is_used(fake: Kernel, caplog, monkeypatch) -> None:
     """An idle but slow kernel: the first connection's answer comes after its window, while the
-    second's check waits. nh uses the first, closes the second, and connects no more."""
+    second's check waits. nh uses the first, closes the second, and connects no more. The window
+    is 1 s here, so the time taken tells taking the answer when it comes (~1.2 s) from waiting
+    out the second window (2 windows and the retry's settle, ~2.1 s) on a slow runner too: with
+    0.2 s windows that was 0.37 s against 0.52 s, and macOS CI took 0.56 s."""
+    monkeypatch.setattr(kernel, "CHECK_TIMEOUT_S", 1.0)
     caplog.set_level(logging.INFO, logger="nh_gateway")
     fake.slow = kernel.CHECK_TIMEOUT_S + 0.15  # inside the second connection's window
     began = time.monotonic()
@@ -353,7 +357,7 @@ def test_a_late_answer_on_an_earlier_connection_is_used(fake: Kernel, caplog) ->
     assert kc is first and first.stops == [] and first.socket.connection_ready.is_set()
     assert closed(second) == [False] and fake.shutdowns == 0
     assert sent(first) == sent(second) == ["kernel_info_request"]
-    assert took < 2 * kernel.CHECK_TIMEOUT_S + RETRY_SETTLE_S
+    assert took < 1.5 * kernel.CHECK_TIMEOUT_S + RETRY_SETTLE_S
     assert len(records(caplog, logging.INFO, REPLACED)) == 1
     [late] = records(caplog, logging.INFO, LATE)
     assert "nh uses it and closes the newer one" in late.getMessage()
