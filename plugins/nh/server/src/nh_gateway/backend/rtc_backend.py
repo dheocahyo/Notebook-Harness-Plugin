@@ -482,15 +482,23 @@ class RtcBackend:
         timeout: float,
     ) -> dict[str, Any]:
         def work() -> dict[str, Any]:
-            client = handle.client("probe", api.server)
-            return probes.run_probe(
-                client,
-                name,
-                args,
-                timeout,
-                lock=handle.probe_lock,
-                interrupt=lambda: api.interrupt(handle.kernel_id),  # only ever stops nh's own probe
-            )
+            # The lock covers the connect too: a run starting now sees this probe (design §6.13).
+            if not handle.probe_lock.acquire(timeout=timeout):
+                return {"error": "KernelBusy: another probe is still running"}
+            try:
+                client = handle.client("probe", api.server)
+                return probes.run_probe(
+                    client,
+                    name,
+                    args,
+                    timeout,
+                    interrupt=lambda: api.interrupt(handle.kernel_id),  # only nh's own probe
+                )
+            finally:
+                if handle.retire_probe:  # a run started meanwhile: don't decode the rest of it
+                    handle.retire_probe = False
+                    handle.retire("probe")
+                handle.probe_lock.release()
 
         return await in_daemon_thread(work, name="nh-probe")
 
@@ -639,7 +647,9 @@ class RtcBackend:
             return doc, handle
 
         doc, handle = await self._retry(prepare)
-        if not handle.probe_lock.locked():
+        if handle.probe_lock.locked():  # a probe is connecting or running: it retires its client
+            handle.retire_probe = True
+        else:
             handle.retire("probe")  # its socket would decode every message of this run again
         client = await in_daemon_thread(handle.client, "exec", doc.api.server, name="nh-connect")
         await doc.ensure()  # the room may have dropped while the kernel client connected

@@ -430,9 +430,16 @@ def attach_session(
 # ---------------------------------------------------------------------------- clients
 
 
-def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> JupyterKernelClient:
-    """Connect a websocket client to an existing kernel. Never starts or owns a kernel."""
-    note_utf8_check()
+CONNECT_SETTLE_S = 0.02  # nothing is sent on a new connection sooner (design §6.13)
+RETRY_SETTLE_S = 0.1  # the same for a connection that replaces an unanswered one
+CHECK_TIMEOUT_S = 0.5  # an idle kernel's first answer to the check came within ~5-50 ms here
+CHECK_POLL_S = 0.002  # how often the check reads the queues of the connections it waits on
+CONNECT_ATTEMPTS = 3
+_unanswered_logged = False
+
+
+def _connect(server: ServerInfo, kernel_id: str, timeout: float) -> JupyterKernelClient:
+    """One websocket client for an existing kernel, unchecked."""
     try:
         kc = JupyterKernelClient(
             server_url=server.url.rstrip("/"),
@@ -452,6 +459,139 @@ def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> Ju
         close_client(kc)
         raise NhError("E134", detail=" (couldn't open the kernel's websocket)")
     return kc
+
+
+def _idle(server: ServerInfo, kernel_id: str) -> bool:
+    """nh's own GET of the kernel model says ``idle``. Any other state, a 404 or an error is no."""
+    try:
+        model = rest.Rest(server).kernel(kernel_id)
+    except Exception as exc:  # RestError, ServerGone, a body that isn't JSON: the state is unknown
+        log.debug("kernel %s: no state for the connection check (%s)", kernel_id, exc)
+        return False
+    return bool(model) and model.get("execution_state") == "idle"
+
+
+def ask(client: Any) -> str | None:
+    """Send the connection check, a ``kernel_info_request`` on the shell channel: its msg_id, or
+    None when the socket closed under us (that check is never answered)."""
+    try:
+        return client.kernel_info()
+    except Exception as exc:
+        log.debug("kernel_info_request not sent: %s", exc)
+        return None
+
+
+def heard(client: Any, msg_id: str | None) -> str | None:
+    """The type of the first queued message whose parent is the check ``msg_id``, or None.
+
+    Its busy status on iopub or its reply on shell: either shows the kernel took the request,
+    and a dead connection shows neither. Doesn't wait. The messages read before it are dropped
+    (``KernelRequest.send()`` drops whatever is queued anyway); the ones after it stay queued.
+    """
+    if msg_id is None:
+        return None
+    for channel in (client.iopub_channel, client.shell_channel):
+        while True:
+            try:
+                msg = channel.get_msg(timeout=0)
+            except queue.Empty:
+                break
+            if (msg.get("parent_header") or {}).get("msg_id") == msg_id:
+                return str((msg.get("header") or {}).get("msg_type") or msg.get("msg_type"))
+    return None
+
+
+def first_answer(asked: list[tuple[Any, str | None]], timeout: float) -> tuple[int, str] | None:
+    """The first of ``asked`` (websocket client, its check's msg_id) to answer its check within
+    ``timeout``: its index and the answer's message type. None at the timeout, or once none of
+    them is connected."""
+    until = time.monotonic() + timeout
+    while True:
+        for i, (client, msg_id) in enumerate(asked):
+            kind = heard(client, msg_id)
+            if kind is not None:
+                return i, kind
+        left = until - time.monotonic()
+        if left <= 0 or not any(client.connection_ready.is_set() for client, _ in asked):
+            return None
+        time.sleep(min(left, CHECK_POLL_S))
+
+
+def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> JupyterKernelClient:
+    """Connect a websocket client to an existing kernel. Never starts or owns a kernel.
+
+    A new kernel websocket whose first request comes right after the handshake is sometimes
+    stuck: the kernel doesn't run its requests until another connection to it opens (design
+    §6.13: ipykernel 7.3.0 behind jupyter_server 2.21.1). Nothing is sent on it for
+    ``CONNECT_SETTLE_S``, and when nh's own GET says the kernel is idle, it must answer a
+    ``kernel_info_request`` (its busy or its reply) within ``CHECK_TIMEOUT_S``. Else nh connects
+    again, settling ``RETRY_SETTLE_S``, at most ``CONNECT_ATTEMPTS`` connections in all, and
+    keeps listening on the unanswered ones: the first to answer is used (a stuck one answers
+    once the next connection opens; a slow kernel's, when it gets to it), and the others are
+    closed in a thread (a stuck one's close can take ~10 s), never the kernel. If none answers,
+    the last one is used, as before the check. A kernel that isn't idle is not checked: a busy
+    one would answer only after its running cell.
+    """
+    global _unanswered_logged
+    note_utf8_check()
+    began = time.monotonic()
+    clients = [_connect(server, kernel_id, timeout)]
+    checks: list[str | None] = []  # each checked connection's msg_id, in order
+    kept: JupyterKernelClient | None = None
+    try:
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            if attempt > 1:
+                log.info(
+                    "kernel %s: no answer to a new connection's kernel_info_request in %.1fs; "
+                    "connecting again (attempt %d of %d), still listening on the unanswered ones",
+                    kernel_id,
+                    CHECK_TIMEOUT_S,
+                    attempt,
+                    CONNECT_ATTEMPTS,
+                )
+                clients.append(_connect(server, kernel_id, timeout))
+            kc = clients[-1]
+            settled = time.monotonic() + (CONNECT_SETTLE_S if attempt == 1 else RETRY_SETTLE_S)
+            idle = _idle(server, kernel_id)
+            time.sleep(max(0.0, settled - time.monotonic()))
+            if not idle:
+                kept = kc
+                return kc
+            sent = time.monotonic()
+            checks.append(ask(kc._manager.client))
+            asked = [(c._manager.client, msg_id) for c, msg_id in zip(clients, checks, strict=True)]
+            found = first_answer(asked, CHECK_TIMEOUT_S)
+            if found is not None:
+                index, kind = found
+                kept = clients[index]
+                if kept is kc:
+                    log.debug(
+                        "connection check answered (%s) in %.3fs", kind, time.monotonic() - sent
+                    )
+                else:
+                    log.info(
+                        "kernel %s: an earlier connection answered nh's kernel_info_request "
+                        "late, %.1fs after nh connected; nh uses it and closes the newer one",
+                        kernel_id,
+                        time.monotonic() - began,
+                    )
+                return kept
+        kept = clients[-1]
+        if not _unanswered_logged:
+            _unanswered_logged = True
+            log.warning(
+                "kernel %s: none of %d new connections answered nh's kernel_info_request in "
+                "%.1fs (stuck connections, or a kernel too slow to answer); nh uses the last "
+                "one, and a probe or run on it may wait for its timeout",
+                kernel_id,
+                CONNECT_ATTEMPTS,
+                time.monotonic() - began,
+            )
+        return kept
+    finally:
+        for other in clients:
+            if other is not kept:
+                close_client_later(other)
 
 
 def close_client(kc: JupyterKernelClient | None) -> None:
@@ -484,6 +624,7 @@ class KernelHandle:
     prefix: str | None = None
     executable: str | None = None
     incarnation: str | None = None  # the kernel process (pid and start), from the attach probe
+    retire_probe: bool = False  # a run started during a probe: it retires its client at its end
 
     def client(self, role: Literal["exec", "probe"], server: ServerInfo) -> Any:
         """The connected websocket client for ``role``, reconnecting if its socket dropped. Blocking."""
