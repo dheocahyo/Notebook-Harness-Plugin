@@ -41,6 +41,9 @@ MAX_ALIASES = 1000  # reset by every human message
 MAX_EARLIER = 1000  # aliases of earlier turns remembered across human messages
 MAX_RUNS = 20
 RUN_OPEN_TTL_S = 3600.0  # a run that never reported stops counting as open
+# The status a TaskStop marks a run done with (hooks/nh_hooks/post_tool.py): a stopped run
+# sends no report, so its writer's question never reached the user (design §6.4, C5d2).
+STOPPED = "killed"
 META_WAIT_S = 2.0  # the writer can call before PostToolUse has recorded its run
 META_POLL_S = 0.1
 # v0.2's fields (design §6.1): the opening message's intent and what the previous turn asked.

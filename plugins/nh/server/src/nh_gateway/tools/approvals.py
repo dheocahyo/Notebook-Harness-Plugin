@@ -2,7 +2,9 @@
 
 The gate runs inside ``svc.locks.hold``. A cell with asks is refused with E122 and its question
 recorded as the session's pending question (a sha256 key, never text); the user's yes in the
-next message lets exactly that call through once.
+next message lets exactly that call through once. nh:cell-writer's question records its run: the
+user sees it only with the run's report, so only a yes typed after that report grants it, unless
+the main conversation was told to ask it itself.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from .. import config
 from .._shared import secrets, turn_record
 from ..lint.lint import Issue
 from ..policy.errors import RETURN_TO_WORKFLOW, NhError
-from ..policy.turn import TurnContext, grant, pending_key
+from ..policy.turn import TurnContext, grant, pending_key, reported_runs
 from .common import Services
 
 KIND = "cell"
@@ -121,15 +123,28 @@ def gate_cell(svc: Services, turn: TurnContext, key: str, asks: list[Issue]) -> 
     current = svc.ledger.pending(session)
     if current is not None and current["turn_id"] == turn.prompt_id:
         same = current["kind"] == KIND and current["key"] == key
+        if same and not writer and record is not None and record["turn_id"] == turn.prompt_id:
+            # ASK_NEXT has the main conversation ask the user itself, before any later message
+            # opens: a writer's question stops waiting for its run's report (design §6.4, C5d2).
+            svc.ledger.asked_directly(session, turn.prompt_id)
         raise refuse("repeated" if same else "waiting")
     if (
         current is not None
-        and grant(current, record, turn.prompt_id, current["kind"], current["key"])[0]
+        and grant(
+            current,
+            record,
+            turn.prompt_id,
+            current["kind"],
+            current["key"],
+            reported=reported_runs(svc.layout, session, current),
+        )[0]
     ):
         raise refuse("held")  # this message's yes is for the call it approved: keep it
     # set_pending refuses only a second question of this message, caught just above under the
-    # same lock, so it records this one.
-    svc.ledger.set_pending(session, KIND, key, turn.prompt_id)
+    # same lock, so it records this one, with the writer's run (design §6.4, C5d2).
+    svc.ledger.set_pending(
+        session, KIND, key, turn.prompt_id, run_id=turn.run_id if writer else None
+    )
     raise refuse("asked")
 
 

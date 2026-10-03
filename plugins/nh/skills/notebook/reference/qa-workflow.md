@@ -69,9 +69,8 @@ Reply by the SKILL.md contract, from `result` and `qa`. Lead with
     new run.
   - Report for an earlier message: say the cell isn't written because nh
     needs the user's yes, and what it would do. Don't ask, and don't send the
-    call in this reply: the message the user wrote meanwhile may count as a
-    yes to a question they never saw. If the user then asks for the cell,
-    send the call in that message: nh asks its question then.
+    call in this reply. If the user then asks for the cell, send the call in
+    that message: nh asks its question then.
   - In the user's next message, a yes ("yes", "ok", "sure", "approved", or
     "go" on its own): call `approval.tool` yourself with `approval.args`,
     unchanged, before anything else, with no nh:qa-cell run. `title`, `notes`

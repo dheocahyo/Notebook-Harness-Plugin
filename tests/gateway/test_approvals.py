@@ -16,10 +16,12 @@ import pytest
 from fastmcp import Client
 
 from nh_gateway import config
+from nh_gateway._shared import turn_record
 from nh_gateway._shared.paths import Layout, atomic_write_json
 from nh_gateway.app import create_server
 from nh_gateway.backend.fake import FakeBackend
 from nh_gateway.lint.lint import Issue
+from nh_gateway.policy import turn as policy_turn
 from nh_gateway.policy.errors import CATALOGUE, RETURN_TO_WORKFLOW, WRITER_LINE, NhError
 from nh_gateway.policy.turn import TurnState
 from nh_gateway.tools import approvals
@@ -166,6 +168,11 @@ async def test_only_a_yes_in_the_next_message_grants_the_cell(
     assert_asked(await add(nh, who, "p1", "wf_run-1"), writer=who == "writer")
     asked = pending(nh)
     assert asked is not None and asked["turn_id"] == "p1" and asked["key"] == install_key()
+    if who == "writer" and when != "same message":
+        # The user sees the writer's question with the run's report, so the answer comes after
+        # it (C5d2: a yes typed before it grants nothing; tested below). In the same message
+        # the run is still going, so its writer can call again.
+        reported(nh, "wf_run-1")
     if when == "same message":  # typed while Claude works: absorbed, never an answer (6.1)
         nh.turns.prompt("p1", text=answer)
         turn, run = "p1", "wf_run-1"
@@ -200,6 +207,8 @@ async def test_a_yes_grants_the_same_call_from_either_thread(
     whose identical call in the yes message is granted (design §6.4, Writers)."""
     nh.turns.prompt("p1", text="install seaborn")
     assert_asked(await add(nh, asker, "p1", "wf_run-1"), writer=asker == "writer")
+    if asker == "writer":  # the user sees its question with the run's report (C5d2)
+        reported(nh, "wf_run-1")
     nh.turns.prompt("p2", text="yes")
     assert_written(await add(nh, retrier, "p2", "wf_run-2"))
     [cell] = nh_code_cells(nh)
@@ -555,7 +564,8 @@ async def test_no_code_or_question_is_stored(nh: Harness) -> None:
     assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
     assert "nh: E122" in text(await nh.call("nh_add_cell", "p1", **PLOTLY))
     stored = Layout(nh.project).ledger_file(SESSION).read_text()
-    assert set(json.loads(stored)["pending"]) == {"kind", "key", "turn_id", "ts"}
+    assert set(json.loads(stored)["pending"]) == {"kind", "key", "turn_id", "ts", "run_id"}
+    assert json.loads(stored)["pending"]["run_id"] is None  # the main conversation's question
     nh.turns.prompt("p2", text="yes")
     assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
     log = Layout(nh.project).log_file.read_text()
@@ -565,6 +575,25 @@ async def test_no_code_or_question_is_stored(nh: Harness) -> None:
     assert install_key() in stored
     asked = events(nh, "cell_asked")
     assert asked and all(set(e) >= {"rules", "outcome"} and e["rules"] == ["L009"] for e in asked)
+
+
+async def test_a_writers_question_stores_its_run_and_no_code_or_question(nh: Harness) -> None:
+    """The pending question records the writer's run id (design §6.4, C5d2): ids and a hash,
+    still no code, package or question text."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    stored = Layout(nh.project).ledger_file(SESSION).read_text()
+    saved = json.loads(stored)["pending"]
+    assert set(saved) == {"kind", "key", "turn_id", "ts", "run_id"}
+    assert (saved["key"], saved["turn_id"], saved["run_id"]) == (install_key(), "p1", "wf_run-1")
+    reported(nh, "wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    layout = Layout(nh.project)
+    files = (layout.ledger_file(SESSION), layout.log_file, layout.workflow_file(SESSION))
+    for raw in (stored, *(path.read_text() for path in files)):
+        for word in ("seaborn", "plotly", "pip install", "Run it as it is", "env sync"):
+            assert word not in raw, word
 
 
 # --- what comes first ------------------------------------------------------------------------
@@ -834,6 +863,8 @@ async def test_a_network_cell_asks_and_the_yes_grants_that_call_once(nh: Harness
     key = approvals.cell_key(NOTEBOOK, "add", NETWORK["code"])
     assert pending(nh)["key"] == key
     assert [e["rules"] for e in events(nh, "cell_asked")] == [["L012"]]
+    if who == "writer":  # the user sees its question with the run's report (C5d2)
+        reported(nh, "wf_run-1")
     nh.turns.prompt("p2", text="yes")
     assert_written(await nh.call("nh_add_cell", "p2", **NETWORK))
     assert [c["source"] for c in nh_code_cells(nh)] == [NETWORK["code"]]
@@ -1048,6 +1079,8 @@ async def test_an_outside_write_asks_and_the_yes_writes_it_once(
     assert not (home / "trips.csv").exists() and nh_code_cells(nh) == []
     assert pending(nh)["key"] == approvals.cell_key(NOTEBOOK, "add", OUTSIDE["code"])
     assert [e["rules"] for e in events(nh, "cell_asked")] == [["L013"]]
+    if who == "writer":  # the user sees its question with the run's report (C5d2)
+        reported(nh, "wf_run-1")
     nh.turns.prompt("p2", text="yes")
     assert_written(await nh.call("nh_add_cell", "p2", **OUTSIDE))
     assert (home / "trips.csv").read_text() == "trip_id,minutes\n1,12\n2,7\n"
@@ -1389,7 +1422,9 @@ async def test_the_asking_runs_writer_gets_e107_and_leaves_the_grant(
     nh: Harness, run_reported: bool
 ) -> None:
     """A run of the asking message never reaches the gate in the yes message (E107, unchanged):
-    it neither uses nor drops the grant, so the main conversation's call is still granted."""
+    it neither uses nor drops the grant, so the main conversation's call is still granted once
+    the run reported before the yes. A yes typed before the report grants nothing (C5d2): the
+    main conversation's call there asks."""
     nh.turns.prompt("p1", text="install seaborn")
     assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
     asked = pending(nh)
@@ -1403,8 +1438,14 @@ async def test_the_asking_runs_writer_gets_e107_and_leaves_the_grant(
         assert late.is_error and "nh: E107" in text(late), text(late)
     assert pending(nh) == asked and not nh_code_cells(nh)
     assert not events(nh, "cell_granted")
-    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
-    assert pending(nh) is None
+    main = await nh.call("nh_add_cell", "p2", **INSTALL)
+    if run_reported:
+        assert_written(main)
+        assert pending(nh) is None
+    else:
+        assert_asked(main)
+        assert pending(nh)["turn_id"] == "p2" and pending(nh)["run_id"] is None
+        assert not nh_code_cells(nh) and not events(nh, "cell_granted")
 
 
 async def test_a_writer_of_the_yes_messages_run_may_send_the_approved_call_once(
@@ -1480,25 +1521,202 @@ async def test_another_cell_written_in_the_reply_turn_clears_the_question(nh: Ha
     assert [c["source"] for c in nh_code_cells(nh)] == [LOAD["code"]]
 
 
-# --- a yes typed during the run (design §6.4, A report for an earlier message; Known gaps) ---
+# --- a yes typed during the run (design §6.4, "A yes typed during the run": C5d2) -----------
+
+QA_EARLIER_PART = "change no cell for it"  # prompt_submit.QA_EARLIER
 
 
+def question_of(h: Harness) -> dict[str, Any]:
+    """The pending question without its time."""
+    current = pending(h)
+    assert current is not None
+    return {k: v for k, v in current.items() if k != "ts"}
+
+
+@pytest.mark.parametrize("where", ["the yes message", "the report's turn"])
 @pytest.mark.parametrize("word", ["ok", "yes", "go"])
-async def test_a_yes_typed_during_the_run_counts_for_the_writers_question(
-    nh: Harness, word: str
+async def test_a_yes_typed_during_the_run_grants_nothing(
+    nh: Harness, word: str, where: str
 ) -> None:
-    """Pinned as it is: the user's message typed after the writer's E122 and before the report
-    is the next message after the asking one, so 6.0 b grants the exact call in it and in the
-    report's turn (an alias of it), though nh's question never reached the user. QA_EARLIER and
-    qa-workflow.md ("don't send the call in this reply") are the guard."""
+    """The user's message typed after the writer's E122 and before the report is the next
+    message after the asking one, but the user hadn't seen nh's question: the run reported
+    after that message opened. The exact call there, or in the report's turn (an alias of it),
+    asks anew (no "held"), as the main conversation's own question; a yes to it grants it."""
     nh.turns.prompt("p1", text="install seaborn")
     assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    assert question_of(nh) == {
+        "kind": "cell",
+        "key": install_key(),
+        "turn_id": "p1",
+        "run_id": "wf_run-1",
+    }
     nh.turns.prompt("p2", text=word)  # typed while the run works in the background
+    if where == "the yes message":  # before the report
+        sent = await nh.call("nh_add_cell", "p2", **INSTALL)
     head = nh.turns.notification(
         "n-wf_run-1", tool_use_id="toolu_wf_run-1", task_id="task-wf_run-1"
     )
-    assert head is not None and "change no cell for it" in json.dumps(head)  # QA_EARLIER
-    assert_written(await nh.call("nh_add_cell", "n-wf_run-1", **INSTALL))
+    assert head is not None and QA_EARLIER_PART in json.dumps(head)  # for an earlier message
+    if where == "the report's turn":
+        sent = await nh.call("nh_add_cell", "n-wf_run-1", **INSTALL)
+    assert_asked(sent)  # nh's question, with the main conversation's Next
+    mine = {"kind": "cell", "key": install_key(), "turn_id": "p2", "run_id": None}
+    assert question_of(nh) == mine
+    again = await nh.call("nh_add_cell", "n-wf_run-1", **INSTALL)  # the report's turn: p2's
+    assert_asked(again)
+    assert question_of(nh) == mine
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "asked", "repeated"]
+    assert not events(nh, "cell_granted") and not nh_code_cells(nh)
+    nh.turns.prompt("p3", text="yes")  # the user saw nh's question this time
+    assert_written(await nh.call("nh_add_cell", "p3", **INSTALL))
+    assert [e["turn_id"] for e in events(nh, "cell_granted")] == ["p3"]
+    assert pending(nh) is None
+
+
+@pytest.mark.parametrize("yes_typed", ["after the report", "during the run"])
+async def test_another_asked_for_cell_is_held_only_by_a_yes_to_a_question_the_user_saw(
+    nh: Harness, yes_typed: str
+) -> None:
+    """ "Held" checks grant() with the pending question's own kind and key and the run's report
+    too: a yes typed during the run holds nothing, so another cell nh asks about records its
+    own question."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    if yes_typed == "after the report":
+        reported(nh, "wf_run-1")
+        nh.turns.prompt("p2", text="yes")
+        turn = "p2"
+    else:
+        nh.turns.prompt("p2", text="yes")
+        reported(nh, "wf_run-1")
+        turn = "n-wf_run-1"
+    other = await nh.call("nh_add_cell", turn, **PLOTLY)
+    assert other.is_error and "nh: E122" in text(other), text(other)
+    if yes_typed == "after the report":
+        assert lines(other)[-2:] == HELD
+        assert question_of(nh)["key"] == install_key() and question_of(nh)["turn_id"] == "p1"
+        assert_written(await nh.call("nh_add_cell", turn, **INSTALL))
+        return
+    assert lines(other)[-1].startswith(
+        "Next: Ask the user, then stop: 'This cell installs `plotly`"
+    )
+    assert question_of(nh) == {
+        "kind": "cell",
+        "key": install_key(PLOTLY["code"]),
+        "turn_id": "p2",
+        "run_id": None,
+    }
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "asked"]
+
+
+async def test_a_stopped_runs_question_is_never_granted(nh: Harness) -> None:
+    """TaskStop marks the run done, but a stopped run sends no report: its writer's question
+    never reached the user, so the next message's yes grants nothing."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    nh.turns.task_stopped("p1", "task-wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    assert_asked(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert question_of(nh)["turn_id"] == "p2" and question_of(nh)["run_id"] is None
+    assert not events(nh, "cell_granted") and not nh_code_cells(nh)
+
+
+def past_its_hour(h: Harness, run: str) -> None:
+    """The run never reported and was launched over an hour ago: it no longer counts as open."""
+    layout = Layout(h.project)
+    data = json.loads(layout.workflow_file(SESSION).read_text())
+    for entry in data["runs"]:
+        if entry["run_id"] == run:
+            entry["ts"] = time.time() - turn_record.RUN_OPEN_TTL_S - 1
+    atomic_write_json(layout.workflow_file(SESSION), data)
+
+
+@pytest.mark.parametrize("ended", ["stopped", "past its hour"])
+async def test_a_question_the_main_conversation_asks_itself_is_granted_once(
+    nh: Harness, ended: str
+) -> None:
+    """The run won't bring its writer's question to the user (stopped, or past its hour with no
+    report), so E108 lets the main conversation's identical call through in the asking message:
+    its E122 "repeated" has it ask the user itself, so the question becomes its own and the
+    yes in the next message grants it once (design §6.4, "The main conversation asks it
+    itself")."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    # The writer's own repeat returns to the workflow: its question still waits for the report.
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    assert question_of(nh)["run_id"] == "wf_run-1"
+    waits = await nh.call("nh_add_cell", "p1", **INSTALL)
+    assert waits.is_error and "nh: E108" in text(waits), text(waits)
+    if ended == "stopped":
+        nh.turns.task_stopped("p1", "task-wf_run-1")
+    else:
+        past_its_hour(nh, "wf_run-1")
+    assert question_of(nh)["run_id"] == "wf_run-1"
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))  # ASK_NEXT: it asks the user
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "repeated", "repeated"]
+    mine = {"kind": "cell", "key": install_key(), "turn_id": "p1", "run_id": None}
+    assert question_of(nh) == mine
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert [e["turn_id"] for e in events(nh, "cell_granted")] == ["p2"]
+    assert pending(nh) is None
+    once = await nh.call("nh_add_cell", "p2", **INSTALL)
+    assert once.is_error and "nh: E110" in text(once), text(once)
+
+
+async def test_a_repeat_after_a_later_message_opened_keeps_the_writers_run(nh: Harness) -> None:
+    """A late call that ``canonical()`` maps to the asking message (an earlier notification's
+    prompt) after the user's next message opened: that message may have been typed before the
+    main conversation asked, so the question keeps its run and the yes there grants nothing."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    nh.turns.notification("n-other", tool_use_id=None, task_id="bash-1")  # another task's
+    nh.turns.task_stopped("p1", "task-wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    late = await nh.call("nh_add_cell", "n-other", **INSTALL)  # counted against p1
+    assert_asked(late)
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "repeated"]
+    writers = {"kind": "cell", "key": install_key(), "turn_id": "p1", "run_id": "wf_run-1"}
+    assert question_of(nh) == writers
+    assert_asked(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert question_of(nh) == dict(writers, turn_id="p2", run_id=None)
+    assert not events(nh, "cell_granted") and not nh_code_cells(nh)
+
+
+class _NoRuns:
+    """``policy.turn``'s ``turn_record``, failing the test if it reads the runs file."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "find_runs":
+            pytest.fail("policy.turn read the runs")
+        return getattr(turn_record, name)
+
+
+async def test_the_gate_reads_no_runs_for_the_main_conversations_question(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a writer's question needs its run's report: for the main conversation's own, the
+    repeated call, the "held" check and the grant never read the runs (design §6.4)."""
+    monkeypatch.setattr(policy_turn, "turn_record", _NoRuns())
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))  # repeated
+    nh.turns.prompt("p2", text="yes")
+    other = await nh.call("nh_add_cell", "p2", **PLOTLY)
+    assert other.is_error and lines(other)[-2:] == HELD, text(other)
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "repeated", "held"]
+
+
+async def test_the_main_conversations_question_needs_no_report(nh: Harness) -> None:
+    """The main conversation asked the user itself: a run that hasn't reported (one launched
+    in the asking message after the question) changes nothing."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.workflow_launched("p1", "wf_run-1", tool_use_id="toolu_wf_run-1")
+    assert question_of(nh)["run_id"] is None
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
     assert [e["turn_id"] for e in events(nh, "cell_granted")] == ["p2"]
 
 

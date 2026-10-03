@@ -1012,6 +1012,60 @@ async def test_the_writers_question_reaches_the_main_conversation_and_its_call_i
     assert again.is_error and code in text(again) and "nh: E122" not in text(again), text(again)
 
 
+QA_EARLIER_PART = "An nh:qa-cell report for an earlier message arrived"  # QA_EARLIER
+
+
+@needs_node
+@pytest.mark.parametrize("later", ["write that cell", "yes"])
+@pytest.mark.parametrize("reply_sends", [False, True], ids=["reply sends nothing", "reply sends"])
+@pytest.mark.parametrize("word", ["ok", "yes", "go"])
+async def test_a_yes_typed_during_the_run_grants_nothing_end_to_end(
+    nh: Harness, word: str, reply_sends: bool, later: str
+) -> None:
+    """End to end (design §6.4, "A yes typed during the run", C5d2): the writer's real E122 in
+    p1, a yes typed while the run works (p2), then the run's report, whose notification marks
+    the run done after p2 opened. The call built from `approval` grants nothing in the reply
+    (qa-workflow.md sends none; one sent anyway asks, as p2's own question). The user's later
+    request gets nh's question, and a yes after it is granted once."""
+    replies, call = await run_until_nh_asks(nh, "add")
+    nh.turns.prompt("p2", text=word)  # typed during the run, before the report
+    report = run_script(replies, args={"ask": "install seaborn", "notebook": NOTEBOOK})["result"]
+    assert report["outcome"] == "needs_approval"
+    approval = report["approval"]
+    assert approval["question"] == QUESTION and approval["args"] == call
+    head = nh.turns.notification("note-1")  # the report: an alias of p2
+    assert head is not None and QA_EARLIER_PART in json.dumps(head)
+    layout = Layout(nh.project)
+    record = turn_record.read(layout, "sess-1")
+    [run] = turn_record.find_runs(layout, "sess-1")
+    assert record is not None and record["turn_id"] == "p2"
+    assert run["run_id"] == RUN and run["done_ts"] > record["ts"]  # reported after p2 opened
+    before = [c["source"] for c in nh_code_cells(nh)]
+    if reply_sends:  # qa-workflow.md says not to; the gate refuses it anyway
+        early = await nh.call(approval["tool"], "note-1", **approval["args"])
+        assert early.is_error and f"Next: Ask the user, then stop: '{QUESTION}'" in text(early)
+        assert pending_question(nh)["turn_id"] == "p2" and pending_question(nh)["run_id"] is None
+    else:  # the writer's question stays as it was, ungranted
+        assert pending_question(nh)["turn_id"] == "p1" and pending_question(nh)["run_id"] == RUN
+    assert [c["source"] for c in nh_code_cells(nh)] == before
+    nh.turns.prompt("p3", text=later)
+    sent = await nh.call(approval["tool"], "p3", **approval["args"])
+    if reply_sends and later == "yes":  # the user saw nh's question in that reply
+        turn = "p3"
+    else:  # nh asks its question now, as the main conversation's own
+        assert sent.is_error and f"Next: Ask the user, then stop: '{QUESTION}'" in text(sent)
+        assert pending_question(nh)["turn_id"] == "p3"
+        assert [c["source"] for c in nh_code_cells(nh)] == before
+        nh.turns.prompt("p4", text="yes")
+        sent = await nh.call(approval["tool"], "p4", **approval["args"])
+        turn = "p4"
+    assert not sent.is_error and "nh: E" not in text(sent), text(sent)
+    assert pending_question(nh) is None
+    assert [c["source"] for c in nh_code_cells(nh)] == [LOAD["code"], INSTALL["code"], LOAD["code"]]
+    again = await nh.call(approval["tool"], turn, **approval["args"])  # granted once
+    assert again.is_error and "nh: E110" in text(again) and "nh: E122" not in text(again)
+
+
 def test_the_needs_approval_flow_is_documented_where_the_model_reads_it() -> None:
     from nh_gateway.tools import approvals
 
@@ -1032,9 +1086,11 @@ def test_the_needs_approval_flow_is_documented_where_the_model_reads_it() -> Non
         "`notes` and `changes` say whether an earlier version is in the notebook.",
         "ask `approval.question` word for word",
         "One question, then stop. Write nothing now: not the call, no other cell, no new run.",
-        "Don't ask, and don't send the call in this reply: the message the user wrote meanwhile "
-        "may count as a yes to a question they never saw. If the user then asks for the cell, "
-        "send the call in that message: nh asks its question then.",
+        # The gate refuses a yes typed during the run (C5d2), so the old reason ("may count as
+        # a yes to a question they never saw") is gone; the instruction stays.
+        "Report for an earlier message: say the cell isn't written because nh needs the user's "
+        "yes, and what it would do. Don't ask, and don't send the call in this reply. If the "
+        "user then asks for the cell, send the call in that message: nh asks its question then.",
         "call `approval.tool` yourself with `approval.args`, unchanged, before anything else, "
         "with no nh:qa-cell run.",
         "`title`, `notes` and `intent` may change; write your own if one is missing. nh writes "
@@ -1048,6 +1104,7 @@ def test_the_needs_approval_flow_is_documented_where_the_model_reads_it() -> Non
         "| E122 | nh asks the user first: `needs_approval` (above) |",
     ):
         assert phrase in qa_md, phrase
+    assert "never saw" not in qa_md and "may count as a yes" not in qa_md
     writer = flat(PLUGIN / "agents" / "cell-writer.md")
     for phrase in (
         "stop at once and return it with status `needs_approval` and the exact call in `call`",
@@ -1088,6 +1145,10 @@ def test_the_needs_approval_flow_is_documented_where_the_model_reads_it() -> Non
         "brings nh's question back, the agent asks you, and after your yes writes that exact "
         "cell itself, without a QA check."
     ) in row
+    assert (
+        "A yes you type while the workflow still runs, before its report, approves nothing: you "
+        "haven't seen nh's question yet, so nh asks it when the agent sends the cell."
+    ) in row  # C5d2
     for readme in (root / "README.md", PLUGIN / "README.md"):
         assert (
             "A cell nh asks you about first comes back to Claude, which asks you and, after your "

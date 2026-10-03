@@ -262,6 +262,8 @@ def test_a_task_stop_marks_the_run_done(sandbox: Sandbox, turns: Turns) -> None:
     turns.task_stopped("p1", TASK)
     by_id = {r["run_id"]: r for r in runs(sandbox)}
     assert by_id[RUN]["status"] == "killed" and before <= by_id[RUN]["done_ts"] <= time.time()
+    # The gateway reads this status as "stopped, no report" (design §6.4, C5d2).
+    assert by_id[RUN]["status"] == turn_record.STOPPED
     assert by_id["wf_other"]["done_ts"] is None
     assert [r["run_id"] for r in turn_record.open_runs(layout, "sess-1", "p1")] == ["wf_other"]
     assert launch(sandbox, prompt_id="p1").decision == "deny"  # the message still had its run
