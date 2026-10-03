@@ -27,6 +27,8 @@ from tests.fakes.net import serving
 from tests.fakes.turns import Turns, text
 from tests.gateway.conftest import NOTEBOOK, Harness, make_project
 
+OTHER = "notebooks/other.ipynb"
+
 SESSION = "sess-1"
 LOAD = dict(
     title="Load sales data",
@@ -1258,3 +1260,262 @@ async def test_l012s_refusal_comes_before_l013s(
     assert lines(result)[-1].startswith(
         "Next: Don't call again yet: this project refuses cells that reach the network."
     )
+
+
+# --- ultracode: the writer asks, the main conversation sends the call (design §6.4, C5d) --------
+
+WITH_INSTALL = "%pip install seaborn\n" + LOAD["code"]
+
+
+async def as_writer(h: Harness, turn: str, run: str, tool: str, args: dict[str, Any]) -> Any:
+    """``tool`` from nh:cell-writer in run ``run``, launched in ``turn`` first if it is new."""
+    if not h.turns.transcript_dir(run).exists():
+        h.turns.workflow_launched(turn, run, tool_use_id=f"toolu_{run}", task_id=f"task-{run}")
+    return await h.turns.writer_call(h.client, f"w-{run}", run, tool, args, turn)
+
+
+def reported(h: Harness, run: str) -> None:
+    """The run's report arrives: a notification, an alias of the message that launched it."""
+    h.turns.notification(f"n-{run}", tool_use_id=f"toolu_{run}", task_id=f"task-{run}")
+
+
+async def writer_asks(h: Harness, shape: str) -> tuple[str, dict[str, Any], str]:
+    """nh:cell-writer's call that nh asks about in message p1, in each shape the workflow
+    reports: (the tool, the call as the writer sent it, the pending key)."""
+    if shape in ("add", "add placed", "add with notebook"):
+        args = dict(INSTALL)
+        if shape == "add placed":  # between two cells, so the position shows
+            nh_ids = []
+            for prompt, cell in (("p0", LOAD), ("p00", dict(LOAD, title="Load more sales data"))):
+                h.turns.prompt(prompt, text="load the data")
+                nh_ids.append((await h.call("nh_add_cell", prompt, **cell)).meta["nh/cell_id"])
+            args.update(after_cell_id=nh_ids[0], notebook=NOTEBOOK)
+        if shape == "add with notebook":  # not the default notebook, so naming it shows
+            args.update(notebook=OTHER)
+        h.turns.prompt("p1", text="install seaborn")
+        assert_asked(await as_writer(h, "p1", "wf_run-1", "nh_add_cell", args), writer=True)
+        if shape == "add with notebook":
+            return "nh_add_cell", args, approvals.cell_key(OTHER, "add", INSTALL["code"])
+        return "nh_add_cell", args, install_key()
+    if shape == "launch edit":  # the launch named an earlier message's cell to change
+        h.turns.prompt("p0", text="load the data")
+        uid = (await h.call("nh_add_cell", "p0", **LOAD)).meta["nh/cell_id"]
+        h.turns.prompt("p1", text="style the plots of that cell with seaborn")
+        args = dict(cell_id=uid, code=WITH_INSTALL)
+        asked = await as_writer(h, "p1", "wf_run-1", "nh_edit_cell", args)
+        assert asked.is_error and lines(asked)[-2:] == WRITER_ASKED[-2:], text(asked)
+        return "nh_edit_cell", args, approvals.cell_key(NOTEBOOK, f"edit:{uid}", WITH_INSTALL)
+    h.turns.prompt("p1", text="load the data and style the plots with seaborn")
+    first = dict(LOAD, code="undefined_name") if shape == "edit own failed cell" else LOAD
+    added = await as_writer(h, "p1", "wf_run-1", "nh_add_cell", first)
+    assert not added.is_error, text(added)
+    uid = added.meta["nh/cell_id"]
+    # A failed run's fix (a retry), or a revision of the OK cell from QA's findings.
+    args = dict(cell_id=uid, code=WITH_INSTALL)
+    asked = await as_writer(h, "p1", "wf_run-1", "nh_edit_cell", args)
+    assert asked.is_error and lines(asked)[-2:] == WRITER_ASKED[-2:], text(asked)
+    return "nh_edit_cell", args, approvals.cell_key(NOTEBOOK, f"edit:{uid}", WITH_INSTALL)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["add", "add placed", "add with notebook", "launch edit", "edit own failed cell", "revision"],
+)
+async def test_a_writers_question_is_granted_to_the_main_conversations_exact_call(
+    nh: Harness, shape: str
+) -> None:
+    """The writer's E122 records the question for the main conversation under the run's turn
+    and the call's key; the workflow reports the call (needs_approval), and the main
+    conversation's exact call in the user's yes message is granted once."""
+    tool, args, key = await writer_asks(nh, shape)
+    asked = pending(nh)
+    assert asked is not None and asked["turn_id"] == "p1" and asked["key"] == key
+    before = [c["source"] for c in nh_code_cells(nh)]
+    reported(nh, "wf_run-1")
+    # Replying to the report is still the asking message: sending the call there writes
+    # nothing (it asks again; a revision of the message's OK cell is E112 for the main
+    # conversation) and leaves the question as it was.
+    again = await nh.call(tool, "n-wf_run-1", **args)
+    if shape == "revision":
+        assert again.is_error and "nh: E112" in text(again), text(again)
+    else:
+        assert again.is_error and "Next: Ask the user, then stop:" in text(again), text(again)
+    assert pending(nh) == asked and [c["source"] for c in nh_code_cells(nh)] == before
+    nh.turns.prompt("p2", text="yes")
+    if shape == "add with notebook":  # the active notebook is the one the writer named
+        args = {k: v for k, v in args.items() if k != "notebook"}
+    granted = await nh.call(tool, "p2", **args)
+    assert not granted.is_error and "nh: E" not in text(granted), text(granted)
+    assert pending(nh) is None
+    assert [e["turn_id"] for e in events(nh, "cell_granted")] == ["p2"]
+    if shape == "add with notebook":
+        assert f"in {OTHER}" in text(granted) and nh_code_cells(nh) == [], text(granted)
+        [placed] = [c for c in nh.backend.notebook(OTHER)["cells"] if c["cell_type"] == "code"]
+        assert placed["source"] == INSTALL["code"] and placed["metadata"]["nh"]["turn_id"] == "p2"
+        once = await nh.call(tool, "p2", **args)
+        assert once.is_error and "nh: E110" in text(once), text(once)
+        return
+    sources = [c["source"] for c in nh_code_cells(nh)]
+    if shape == "add placed":
+        assert sources == [LOAD["code"], INSTALL["code"], LOAD["code"]]
+    elif tool == "nh_add_cell":
+        assert sources == [INSTALL["code"]]
+    else:
+        assert sources == [WITH_INSTALL]
+    if tool == "nh_add_cell":  # the yes message's cell
+        placed = nh_code_cells(nh)[1 if shape == "add placed" else 0]
+        assert placed["metadata"]["nh"]["turn_id"] == "p2"
+    else:
+        [edited] = events(nh, "cell_edited")[-1:]
+        assert edited["turn_id"] == "p2" and edited["agent"] is None
+    once = await nh.call(tool, "p2", **args)  # used once: the yes message has its cell
+    code = "nh: E110" if tool == "nh_add_cell" else "nh: E112"  # E112: its OK cell, revised
+    assert once.is_error and code in text(once) and "nh: E122" not in text(once), text(once)
+
+
+async def test_the_writers_call_and_the_main_conversations_share_a_key_with_or_without_notebook(
+    nh: Harness,
+) -> None:
+    """The writer named no notebook (the active one); the main conversation names it."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    reported(nh, "wf_run-1")
+    nh.turns.prompt("p2", text="go")
+    assert_written(await nh.call("nh_add_cell", "p2", **dict(INSTALL, notebook=NOTEBOOK)))
+
+
+@pytest.mark.parametrize("run_reported", [False, True])
+async def test_the_asking_runs_writer_gets_e107_and_leaves_the_grant(
+    nh: Harness, run_reported: bool
+) -> None:
+    """A run of the asking message never reaches the gate in the yes message (E107, unchanged):
+    it neither uses nor drops the grant, so the main conversation's call is still granted."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    asked = pending(nh)
+    if run_reported:
+        reported(nh, "wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    for prompt in ("p1", "p2"):  # whichever prompt id its calls carry
+        late = await nh.turns.writer_call(
+            nh.client, "w-wf_run-1", "wf_run-1", "nh_add_cell", INSTALL, prompt
+        )
+        assert late.is_error and "nh: E107" in text(late), text(late)
+    assert pending(nh) == asked and not nh_code_cells(nh)
+    assert not events(nh, "cell_granted")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert pending(nh) is None
+
+
+async def test_a_writer_of_the_yes_messages_run_may_send_the_approved_call_once(
+    nh: Harness,
+) -> None:
+    """Decided in C5d (design §6.4, "Which thread may send the approved call"): the grant
+    covers the call, not the thread, so a run launched in the yes message, working for it,
+    may send the identical call once; qa-workflow.md still has the main conversation send it."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    reported(nh, "wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await as_writer(nh, "p2", "wf_run-2", "nh_add_cell", INSTALL))
+    assert pending(nh) is None
+    [cell] = nh_code_cells(nh)
+    assert cell["metadata"]["nh"]["turn_id"] == "p2"
+    again = await as_writer(nh, "p2", "wf_run-2", "nh_add_cell", INSTALL)
+    assert again.is_error and "nh: E110" in text(again) and "nh: E122" not in text(again)
+
+
+async def test_a_writers_different_no_ask_cell_in_the_yes_message_loses_the_yes(
+    nh: Harness,
+) -> None:
+    """A run launched in the yes message whose writer drops what nh asked about writes that
+    cell as the yes message's one cell; the approved call then gets E110 (design §6.4, Which
+    thread may send the approved call): nothing unasked, but the yes is lost."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    reported(nh, "wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await as_writer(nh, "p2", "wf_run-2", "nh_add_cell", LOAD))
+    assert pending(nh) is not None and pending(nh)["turn_id"] == "p1"  # not this message's
+    reported(nh, "wf_run-2")
+    lost = await nh.call("nh_add_cell", "n-wf_run-2", **INSTALL)
+    assert lost.is_error and "nh: E110" in text(lost), text(lost)
+    assert [c["source"] for c in nh_code_cells(nh)] == [LOAD["code"]]
+    assert not events(nh, "cell_granted")
+
+
+# --- the reply turn: still the asking message (design §6.4, "The reply turn") ----------------
+
+
+async def test_another_asked_for_cell_in_the_reply_turn_waits(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    asked = pending(nh)
+    reported(nh, "wf_run-1")
+    waiting = await nh.call("nh_add_cell", "n-wf_run-1", **PLOTLY)
+    assert waiting.is_error and lines(waiting)[-2:] == [
+        approvals.WAITING_LINE,
+        f"Next: {approvals.WAITING_NEXT}",
+    ], text(waiting)
+    assert pending(nh) == asked and not nh_code_cells(nh)
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))  # the writer's question won
+
+
+async def test_another_cell_written_in_the_reply_turn_clears_the_question(nh: Harness) -> None:
+    """A cell that asks nothing is written as the asking message's cell (QA_REPORT's "unless
+    its writer wrote none" is no leave to write here) and supersedes the writer's question, so
+    the user's later yes grants nothing: the approved call asks again (fails closed)."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    head = nh.turns.notification(
+        "n-wf_run-1", tool_use_id="toolu_wf_run-1", task_id="task-wf_run-1"
+    )
+    assert head is not None and "unless its writer wrote none" in json.dumps(head)
+    assert_written(await nh.call("nh_add_cell", "n-wf_run-1", **LOAD))
+    assert pending(nh) is None
+    nh.turns.prompt("p2", text="yes")
+    assert_asked(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert pending(nh)["turn_id"] == "p2" and not events(nh, "cell_granted")
+    assert [c["source"] for c in nh_code_cells(nh)] == [LOAD["code"]]
+
+
+# --- a yes typed during the run (design §6.4, A report for an earlier message; Known gaps) ---
+
+
+@pytest.mark.parametrize("word", ["ok", "yes", "go"])
+async def test_a_yes_typed_during_the_run_counts_for_the_writers_question(
+    nh: Harness, word: str
+) -> None:
+    """Pinned as it is: the user's message typed after the writer's E122 and before the report
+    is the next message after the asking one, so 6.0 b grants the exact call in it and in the
+    report's turn (an alias of it), though nh's question never reached the user. QA_EARLIER and
+    qa-workflow.md ("don't send the call in this reply") are the guard."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    nh.turns.prompt("p2", text=word)  # typed while the run works in the background
+    head = nh.turns.notification(
+        "n-wf_run-1", tool_use_id="toolu_wf_run-1", task_id="task-wf_run-1"
+    )
+    assert head is not None and "change no cell for it" in json.dumps(head)  # QA_EARLIER
+    assert_written(await nh.call("nh_add_cell", "n-wf_run-1", **INSTALL))
+    assert [e["turn_id"] for e in events(nh, "cell_granted")] == ["p2"]
+
+
+@pytest.mark.parametrize("meanwhile", ["what does the data look like?", "ok"])
+@pytest.mark.parametrize("later", ["yes", "ok, write that cell"])
+async def test_after_an_earlier_messages_report_the_call_asks_anew(
+    nh: Harness, meanwhile: str, later: str
+) -> None:
+    """qa-workflow.md: neither ask nor send the call in the reply to a report for an earlier
+    message; if the user then asks for the cell, the call sent in that message finds the
+    question two messages old (6.1 drops it), so nh asks its own question there."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    nh.turns.prompt("p2", text=meanwhile)
+    reported(nh, "wf_run-1")  # QA_EARLIER: reported, nothing sent
+    nh.turns.prompt("p3", text=later)
+    assert_asked(await nh.call("nh_add_cell", "p3", **INSTALL))
+    assert pending(nh)["turn_id"] == "p3" and not nh_code_cells(nh)
+    nh.turns.prompt("p4", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p4", **INSTALL))

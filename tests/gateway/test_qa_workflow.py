@@ -22,6 +22,7 @@ from nh_gateway.policy import stamps
 from nh_gateway.policy.errors import RETURN_TO_WORKFLOW, WRITER_LINE, NhError
 from tests.fakes.turns import text
 from tests.gateway.conftest import NOTEBOOK, Harness
+from tests.unit.test_qa_cell_workflow import finding, needs_node, qa, run_script
 
 LOAD = dict(
     title="Load sales data",
@@ -872,3 +873,227 @@ async def test_a_second_run_of_the_message_may_not_touch_its_cell(nh: Harness) -
         assert body.splitlines()[-1] == NEXT_RETURN
     [cell] = nh_code_cells(nh)
     assert cell["source"] == LOAD["code"]
+
+
+# --- needs_approval: the writer's question reaches the main conversation (design §6.4, C5d) ---
+
+PLUGIN = Path(__file__).resolve().parents[2] / "plugins" / "nh"
+INSTALL = dict(
+    title="Install seaborn for the plots",
+    notes=["Installs seaborn into the kernel.", "The next plots use its styles."],
+    intent="install seaborn",
+    code="%pip install seaborn\nsorted(['b', 'a'])",
+)
+WITH_INSTALL = "%pip install seaborn\n" + LOAD["code"]
+QUESTION = (
+    "This cell installs `seaborn` into the kernel only, and the next env sync removes it "
+    "(`uv add seaborn` keeps it). Run it as it is?"
+)
+
+
+def pending_question(h: Harness) -> dict | None:
+    path = Layout(h.project).ledger_file("sess-1")
+    return json.loads(path.read_text()).get("pending") if path.exists() else None
+
+
+def written_answer(result: object, uid: str) -> dict:
+    """The writer's answer for a cell it wrote that ran OK, from the gateway's real result."""
+    return {
+        "status": "ok",
+        "wrote": True,
+        "result": text(result),
+        "changes": "Wrote the load cell.",
+        "cell_title": LOAD["title"],
+        "cell_id": uid,
+        "exec_count": 1,
+        "notebook": NOTEBOOK,
+        "lead_lines": [],
+    }
+
+
+def asked_answer(refusal: object, call: dict, **extra: object) -> dict:
+    """The writer's answer after nh's E122: the real refusal and the exact call it sent."""
+    answer = {
+        "status": "needs_approval",
+        "wrote": False,
+        "result": text(refusal),
+        "changes": "nh asked for the user's yes before writing the cell (E122).",
+        "lead_lines": [],
+        "call": call,
+    }
+    answer.update(extra)
+    return answer
+
+
+async def run_until_nh_asks(h: Harness, shape: str) -> tuple[list, dict]:
+    """The workflow's writer in message p1, ending on nh's question: (the fake agents' replies,
+    the call the writer sent)."""
+    if shape == "add":  # between two cells, so the position shows
+        anchors = []
+        for prompt, cell in (("p0", LOAD), ("p00", dict(LOAD, title="Load more sales data"))):
+            h.turns.prompt(prompt, text="load the data")
+            anchors.append((await h.call("nh_add_cell", prompt, **cell)).meta["nh/cell_id"])
+        anchor = anchors[0]
+        h.turns.prompt("p1", text="install seaborn")
+        h.turns.workflow_launched("p1")
+        call = dict(INSTALL, after_cell_id=anchor, notebook=NOTEBOOK)
+        refusal = await h.turns.writer_call(h.client, "w-1", RUN, "nh_add_cell", call, "p1")
+        assert refusal.is_error and "nh: E122" in text(refusal), text(refusal)
+        return [asked_answer(refusal, {"tool": "nh_add_cell", **call})], call
+    if shape == "launch edit":  # the launch named an earlier message's cell
+        h.turns.prompt("p0", text="load the data")
+        assert not (await h.call("nh_add_cell", "p0", **LOAD)).is_error
+        h.turns.prompt("p1", text="style that cell's plots with seaborn")
+        h.turns.workflow_launched("p1")
+        call = dict(cell_id=code_uid(h), code=WITH_INSTALL)
+        refusal = await h.turns.writer_call(h.client, "w-1", RUN, "nh_edit_cell", call, "p1")
+        assert refusal.is_error and "nh: E122" in text(refusal), text(refusal)
+        return [asked_answer(refusal, {"tool": "nh_edit_cell", **call})], call
+    h.turns.prompt("p1", text="load the data, styled with seaborn")
+    h.turns.workflow_launched("p1")
+    first = dict(LOAD, code="undefined_name") if shape == "edit own failed cell" else LOAD
+    added = await h.turns.writer_call(h.client, "w-1", RUN, "nh_add_cell", first, "p1")
+    assert not added.is_error, text(added)
+    uid = code_uid(h)
+    call = dict(cell_id=uid, code=WITH_INSTALL)
+    refusal = await h.turns.writer_call(h.client, "w-1", RUN, "nh_edit_cell", call, "p1")
+    assert refusal.is_error and "nh: E122" in text(refusal), text(refusal)
+    edit = {"tool": "nh_edit_cell", **call}
+    if shape == "edit own failed cell":  # one writer: its add failed, its fix asks
+        return [
+            asked_answer(refusal, edit, wrote=True, cell_title=LOAD["title"], cell_id=uid)
+        ], call
+    # A revision: the writer's OK cell, QA's finding, then the revision nh asks about.
+    return [written_answer(added, uid), qa("revise", finding()), asked_answer(refusal, edit)], call
+
+
+@needs_node
+@pytest.mark.parametrize("answer", ["yes", "no"])
+@pytest.mark.parametrize("shape", ["add", "launch edit", "edit own failed cell", "revision"])
+async def test_the_writers_question_reaches_the_main_conversation_and_its_call_is_granted(
+    nh: Harness, shape: str, answer: str
+) -> None:
+    """End to end: the writer's real E122, qa-cell.js's report, the reply to it, and the main
+    conversation's call built from the report in the user's next message."""
+    replies, call = await run_until_nh_asks(nh, shape)
+    asked = pending_question(nh)
+    assert asked is not None and asked["turn_id"] == "p1"
+    report = run_script(replies, args={"ask": "install seaborn", "notebook": NOTEBOOK})["result"]
+    assert report["outcome"] == "needs_approval"
+    approval = report["approval"]
+    assert approval["question"] == QUESTION  # the gateway's own words, unchanged
+    assert approval["tool"] == ("nh_add_cell" if shape == "add" else "nh_edit_cell")
+    assert approval["args"] == call
+    before = [c["source"] for c in nh_code_cells(nh)]
+    # The report arrives (an alias of p1): sending the call while replying writes nothing.
+    nh.turns.notification("note-1")
+    early = await nh.call(approval["tool"], "note-1", **approval["args"])
+    if shape == "revision":  # the message's OK cell: E112 for the main conversation
+        assert early.is_error and "nh: E112" in text(early), text(early)
+    else:  # the same question again
+        assert early.is_error and f"Ask the user, then stop: '{QUESTION}'" in text(early)
+    assert pending_question(nh) == asked and [c["source"] for c in nh_code_cells(nh)] == before
+    nh.turns.prompt("p2", text=answer)
+    sent = await nh.call(approval["tool"], "p2", **approval["args"])
+    if answer == "no":  # nothing to grant: the call asks its own question
+        assert sent.is_error and f"Next: Ask the user, then stop: '{QUESTION}'" in text(sent)
+        assert [c["source"] for c in nh_code_cells(nh)] == before
+        assert pending_question(nh)["turn_id"] == "p2"
+        return
+    assert not sent.is_error and "nh: E" not in text(sent), text(sent)
+    assert pending_question(nh) is None
+    sources = [c["source"] for c in nh_code_cells(nh)]
+    if shape == "add":  # where the writer put it, not at the bottom
+        assert sources == [LOAD["code"], INSTALL["code"], LOAD["code"]]
+    else:
+        assert sources == [WITH_INSTALL]
+    again = await nh.call(approval["tool"], "p2", **approval["args"])  # granted once
+    code = "nh: E110" if approval["tool"] == "nh_add_cell" else "nh: E112"
+    assert again.is_error and code in text(again) and "nh: E122" not in text(again), text(again)
+
+
+def test_the_needs_approval_flow_is_documented_where_the_model_reads_it() -> None:
+    from nh_gateway.tools import approvals
+
+    def flat(path: Path) -> str:
+        return " ".join(path.read_text(encoding="utf-8").split())
+
+    refs = PLUGIN / "skills" / "notebook" / "reference"
+    qa_md = flat(refs / "qa-workflow.md")
+    for phrase in (
+        "`not_checked`, `needs_approval`, `not_written`",
+        "| `approval` | with `needs_approval`: nh's `question`, and the exact call it asked "
+        "about (`tool` and its `args`); else null |",
+        "| `result` | the writer's last nh result, verbatim, without nh's `--- next ---` or "
+        "`Next:` lines; after a revision nh asked about, the checked version's |",
+        "what the writer did in each write (and what a revision nh asked about would change)",
+        "Not for the user's answer to nh's question from a `needs_approval` report: send that "
+        "call yourself (below).",
+        "`notes` and `changes` say whether an earlier version is in the notebook.",
+        "ask `approval.question` word for word",
+        "One question, then stop. Write nothing now: not the call, no other cell, no new run.",
+        "Don't ask, and don't send the call in this reply: the message the user wrote meanwhile "
+        "may count as a yes to a question they never saw. If the user then asks for the cell, "
+        "send the call in that message: nh asks its question then.",
+        "call `approval.tool` yourself with `approval.args`, unchanged, before anything else, "
+        "with no nh:qa-cell run.",
+        "`title`, `notes` and `intent` may change; write your own if one is missing. nh writes "
+        "it once, as that message's cell.",
+        "say QA didn't check this cell. Anything else: drop the call ([asks.md](asks.md)).",
+        "nh asked for the user's yes (E122) but `approval` is null: `notes` say why",
+        "Don't ask nh's question: no call can follow a yes to it. Write nothing more for this "
+        "message.",
+        "If nh kept this message's yes for another cell, send that approved call first",
+        "after E122, as the bullet above says",
+        "| E122 | nh asks the user first: `needs_approval` (above) |",
+    ):
+        assert phrase in qa_md, phrase
+    writer = flat(PLUGIN / "agents" / "cell-writer.md")
+    for phrase in (
+        "stop at once and return it with status `needs_approval` and the exact call in `call`",
+        "never drop or move what nh asked about (the URL, the path) to get past its question",
+        "Never ask the user yourself",
+        'If another call got E122 "already waiting" after it anyway, return the first E122 '
+        "and its call.",
+        "`needs_approval` when your last call got E122, whether or not an earlier call wrote.",
+        "with `needs_approval`, the E122 refusal verbatim",
+        "`code` character for character",
+        "`cell_id`, `after_cell_id`, `notebook`, `title`, `notes` and `intent` you passed",
+        # the writer installs nothing (design §6.4, "The writer and installs")
+        "Install packages, write outside the project unasked, re-run earlier cells or undo. If "
+        "the ask needs a package that isn't installed, write nothing: status `no_write`",
+    ):
+        assert phrase in writer, phrase
+    qa_agent = flat(PLUGIN / "agents" / "cell-qa.md")
+    assert "You never see a cell nh hasn't written" in qa_agent
+    assert (
+        "A fix that installs a package, downloads or writes outside the project can't be "
+        "written now (the writer installs nothing; nh asks the user about the rest, E122)"
+    ) in qa_agent
+    asks = flat(refs / "asks.md")
+    assert "nh:cell-writer inside nh:qa-cell can't ask the user" in asks
+    assert "The report's outcome is then `needs_approval`" in asks
+    assert "if the report is for this message, ask the question; after the user's yes" in asks
+    assert "send that call yourself ([qa-workflow.md](qa-workflow.md))" in asks
+    errors_md = (refs / "errors.md").read_text(encoding="utf-8").splitlines()
+    e122 = next(line for line in errors_md if line.startswith("| E122 |"))
+    assert "nh:cell-writer returns it to the workflow, whose report says `needs_approval`" in e122
+    assert "if the report is for this message, ask its question; after a yes, send its" in e122
+    assert "A report for an earlier message: don't ask and don't send it" in e122
+    root = PLUGIN.parents[1]
+    trouble = (root / "docs" / "troubleshooting.md").read_text(encoding="utf-8").splitlines()
+    row = next(line for line in trouble if line.startswith("| **E122** "))
+    assert (
+        "Under ultracode or `/nh:qa-cell` the workflow's cell writer can't ask you: its report "
+        "brings nh's question back, the agent asks you, and after your yes writes that exact "
+        "cell itself, without a QA check."
+    ) in row
+    for readme in (root / "README.md", PLUGIN / "README.md"):
+        assert (
+            "A cell nh asks you about first comes back to Claude, which asks you and, after your "
+            "yes, writes it itself without a QA check."
+        ) in flat(readme), readme
+    # qa-cell.js reads the question from the gateway's own writer line, one LF line at a time.
+    assert approvals.WRITER_QUESTION == "- The main conversation asks the user: '{question}'"
+    script = (PLUGIN / "workflows" / "qa-cell.js").read_text(encoding="utf-8")
+    assert "/^- The main conversation asks the user: '([^\\n]*)'[ \\t]*$/.exec(line)" in script

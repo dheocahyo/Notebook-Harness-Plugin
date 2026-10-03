@@ -336,6 +336,8 @@ def test_a_second_launch_in_one_message_is_denied(sandbox: Sandbox, turns: Turns
     again = launch(sandbox, prompt_id="p1")
     assert again.decision == "deny"
     assert "already had its nh:qa-cell run" in again.reason
+    # no leave to write in place of nh's question (design §6.4, C5d)
+    assert "unless the report says needs_approval: then ask its question and stop" in again.reason
     turns.notification("note-1", tool_use_id="toolu_L1", task_id=TASK)  # the run reported
     assert launch(sandbox, prompt_id="note-1").decision == "deny"  # an alias of p1: still p1
     assert launch(sandbox, prompt_id="p1").decision == "deny"

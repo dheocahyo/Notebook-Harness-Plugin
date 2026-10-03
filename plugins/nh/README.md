@@ -20,6 +20,8 @@ works in the same notebook you are looking at.
   code, real output and kernel variables without running anything. The
   writer may fix the cell from QA's findings (twice by default) before
   Claude replies. It is still one cell per message, and one undo removes it.
+  A cell nh asks you about first comes back to Claude, which asks you and,
+  after your yes, writes it itself without a QA check.
 - **Guardrails.** No raw edits to `.ipynb` files, no cells that print an env
   var's value, no writes from subagents except nh's own cell writer inside
   `/nh:qa-cell`, and a cell that installs packages, reaches a host your

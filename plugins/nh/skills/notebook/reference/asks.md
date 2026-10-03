@@ -83,4 +83,7 @@ You can't write the file, and nh has no command for it.
   answers): the refusal stands. Tell the user the cell needs their yes in an
   interactive session, and write nothing.
 - nh:cell-writer inside nh:qa-cell can't ask the user: its `E122` goes back
-  to the workflow with the question in it.
+  to the workflow with the question in it. The report's outcome is then
+  `needs_approval`, with nh's question and the exact call: if the report is
+  for this message, ask the question; after the user's yes, send that call
+  yourself ([qa-workflow.md](qa-workflow.md)).

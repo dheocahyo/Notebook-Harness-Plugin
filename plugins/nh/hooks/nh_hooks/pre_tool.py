@@ -96,7 +96,8 @@ WORKFLOW_MODE_REASON = (
 )
 WORKFLOW_AGAIN_REASON = (
     "nh: this user message already had its nh:qa-cell run (one per message). Reply from its "
-    "report when it arrives; if its writer wrote no cell, write the cell yourself."
+    "report when it arrives; if its writer wrote no cell, write the cell yourself, unless the "
+    "report says needs_approval: then ask its question and stop."
 )
 FOREIGN_DENY_REASON = (
     "nh project: notebook edits and runs go through the mcp__plugin_nh_nh__* tools, so each "

@@ -584,3 +584,486 @@ def test_a_gateway_refusal_reaches_the_report_without_its_instructions(writer_li
     report = run_script([answer], args="drop rows")["result"]
     assert report["outcome"] == "refused"
     assert report["result"] == "\n".join(refusal.splitlines()[:2])
+
+
+# ---------------------------------------------------------------------------- needs_approval
+
+QUESTION = "This cell connects to `data.example.org` over the network. Run it as it is?"
+TRIPS = (
+    'import pandas as pd\n\nTRIPS_URL = "https://data.example.org/trips-2023.csv"\n'
+    "trips = pd.read_csv(TRIPS_URL)\ntrips.dtypes"
+)
+NOTES = ["Reads the 2023 trips straight from the data host.", "Shows each column's type."]
+ASKS_LINE = "- The main conversation asks the user: '{question}'"
+NO_CALL = (
+    "nh asked for the user's yes (E122), but the writer didn't return the exact call, so there "
+    "is no call to send after a yes."
+)
+NO_QUESTION = (
+    "The writer said nh asked for the user's yes, but its nh result holds no question from nh, "
+    "so there is nothing to ask."
+)
+NOT_CHECKED = "nh asked for the user's yes before writing the writer's last call (E122), so QA checked nothing."
+EARLIER = (
+    "The cell the writer wrote before nh's E122 is in the notebook, not QA-checked; one undo "
+    "removes it."
+)
+# E122's other writer lines, as the gateway words them (tied to approvals' constants below).
+WAITING_LINE = (
+    "- nh is already waiting for the user's answer to this message's first question; it asks "
+    "one at a time."
+)
+HELD_LINE = (
+    "- The user's yes in this message is for the other cell nh asked about, and it covers only "
+    "that exact call."
+)
+HEADLESS_LINE = (
+    "- No one can answer here (NH_HEADLESS=1); the cell needs the user's yes in an interactive "
+    "session: '{question}'"
+)
+WAITING = (
+    "nh was already waiting for the user's answer to an earlier question of this message, which "
+    "the writer didn't return, so there is nothing to ask."
+)
+HELD = (
+    "nh keeps this message's yes for the other cell the user approved, so it didn't write the "
+    "writer's cell."
+)
+HEADLESS = (
+    "No one can answer here (NH_HEADLESS=1): the cell needs the user's yes in an interactive "
+    "session."
+)
+
+
+def e122(
+    question: str = QUESTION,
+    *,
+    line: str | None = None,
+    lead: tuple[str, ...] = (),
+    newline: str = "\n",
+) -> str:
+    """A writer's E122 as the gateway words it (``approvals.WRITER_QUESTION``)."""
+    return newline.join(
+        [
+            *lead,
+            "Not written: this needs the user's yes first.",
+            "nh: E122",
+            "- L012: The cell connects to `data.example.org` over the network (`pd.read_csv`).",
+            ASKS_LINE.format(question=question) if line is None else line,
+            "Next: Return this refusal to the workflow as your final answer; don't retry or "
+            "reply to the user.",
+        ]
+    )
+
+
+def add_call(**extra: Any) -> dict[str, Any]:
+    return {
+        "tool": "nh_add_cell",
+        "code": TRIPS,
+        "title": "Load the 2023 trips",
+        "notes": NOTES,
+        "intent": "load the trips CSV",
+        **extra,
+    }
+
+
+def asking(call: dict[str, Any] | None = None, **answer: Any) -> dict[str, Any]:
+    """The writer's answer after an E122: status needs_approval and the exact call."""
+    reply: dict[str, Any] = {
+        "status": "needs_approval",
+        "wrote": False,
+        "result": e122(),
+        "changes": "nh asked before writing the trips cell (E122).",
+        "lead_lines": [],
+        "call": add_call() if call is None else call,
+    }
+    reply.update(answer)
+    return reply
+
+
+@needs_node
+def test_a_writers_e122_reports_needs_approval_with_no_qa_round():
+    out = run_script([asking()], args={"ask": "load the trips csv from data.example.org"})
+    report = out["result"]
+    assert agent_types(out) == [WRITER] and out["phases"] == ["Write"]
+    assert report["outcome"] == "needs_approval" and report["status"] == "needs_approval"
+    assert report["approval"] == {
+        "question": QUESTION,
+        "tool": "nh_add_cell",
+        "args": {
+            "code": TRIPS,
+            "title": "Load the 2023 trips",
+            "notes": NOTES,
+            "intent": "load the trips CSV",
+        },
+    }
+    # The refusal stays as data, its question line with it; its instructions are dropped.
+    assert report["result"] == "\n".join(e122().splitlines()[:4])
+    assert ASKS_LINE.format(question=QUESTION) in report["result"]
+    assert report["qa"]["final_version_checked"] is False and report["qa"]["rounds"] == []
+    assert report["qa"]["verdict"] == "unchecked" and report["revisions"] == 0
+    assert report["changes"] == ["nh asked before writing the trips cell (E122)."]
+    assert report["notes"] == [NOT_CHECKED]
+    assert any("qa-cell: needs_approval" in line for line in out["logs"])
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "question",
+    [
+        QUESTION,
+        'This cell writes to `"/home/o\'neil/trips.csv"` outside the project. Run it as it is?',
+        "This cell installs `git+https://[redacted:url-userinfo]@github.com/org/lib.git` into "
+        "the kernel only, and the next env sync removes it. Run it as it is?",
+        "This cell connects to `a.example.org` and `b.example.org` over the network; it also "
+        "writes to `~/x 'y'.csv` outside the project. Run it as it is?",
+        # L013 escapes C0 controls and DEL in a path, not these: only LF ends nh's line
+        "This cell writes to `/home/me/a\u2028b.csv` outside the project. Run it as it is?",
+        "This cell writes to `/home/me/a\u2029b.csv` outside the project. Run it as it is?",
+        "This cell writes to `/home/me/a\x85b.csv` outside the project. Run it as it is?",
+    ],
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_the_question_passes_through_unchanged(question: str, newline: str):
+    lead = (NEW_KERNEL,)
+    answer = asking(result=e122(question, lead=lead, newline=newline), lead_lines=list(lead))
+    report = run_script([answer], args="load the trips")["result"]
+    assert report["outcome"] == "needs_approval"
+    assert report["approval"]["question"] == question
+    assert report["lead_lines"] == [NEW_KERNEL]
+
+
+@needs_node
+def test_the_last_question_line_counts_and_trailing_space_is_dropped():
+    text = e122("This cell installs `x`. Run it as it is?").replace(
+        "\nNext:", "\n" + ASKS_LINE.format(question=QUESTION) + "  \nNext:"
+    )
+    report = run_script([asking(result=text)], args="load the trips")["result"]
+    assert report["approval"]["question"] == QUESTION
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("call", "args"),
+    [
+        # the code is sent verbatim, never trimmed: indentation counts in nh's key
+        (
+            add_call(code="\n  x = 1  \n", after_cell_id=" nh-1a2b3c4d5e ", notebook="nb.ipynb"),
+            {
+                "code": "\n  x = 1  \n",
+                "title": "Load the 2023 trips",
+                "notes": NOTES,
+                "intent": "load the trips CSV",
+                "after_cell_id": "nh-1a2b3c4d5e",
+                "notebook": "nb.ipynb",
+            },
+        ),
+        # an add takes no cell_id; unknown fields and base_sha are dropped; blank notes go
+        (
+            add_call(
+                cell_id=CELL_ID, base_sha="abc", extra="x", notes=[" one ", "", 3], title=" T "
+            ),
+            {"code": TRIPS, "title": "T", "notes": ["one", "3"], "intent": "load the trips CSV"},
+        ),
+        # notes as one string; missing title and intent stay missing
+        (
+            {"tool": "nh_add_cell", "code": TRIPS, "notes": "Reads the trips."},
+            {"code": TRIPS, "notes": "Reads the trips."},
+        ),
+        # an edit: cell_id, no after_cell_id
+        (
+            {"tool": "nh_edit_cell", "code": TRIPS, "cell_id": CELL_ID, "after_cell_id": "nh-x"},
+            {"code": TRIPS, "cell_id": CELL_ID},
+        ),
+    ],
+)
+def test_the_call_carries_only_what_its_tool_takes(call: dict[str, Any], args: dict[str, Any]):
+    report = run_script([asking(call)], args="load the trips")["result"]
+    assert report["outcome"] == "needs_approval"
+    assert report["approval"]["tool"] == call["tool"] and report["approval"]["args"] == args
+
+
+@needs_node
+def test_the_writers_fix_of_its_own_failed_cell_asks():
+    """The writer's cell ran with an error; its fix reads the data from a URL, which nh asks
+    about (the writer installs nothing: cell-writer.md, design §6.4)."""
+    call = {"tool": "nh_edit_cell", "cell_id": CELL_ID, "code": TRIPS}
+    answer = asking(
+        call,
+        wrote=True,
+        cell_title=TITLE,
+        cell_id=CELL_ID,
+        exec_count=2,
+        notebook="notebooks/eda.ipynb",
+        changes=f"Wrote {TITLE}; it failed with FileNotFoundError on data/raw/trips.csv; the "
+        "fix reads it from data.example.org.",
+    )
+    out = run_script([answer], args="drop rows with missing price")
+    report = out["result"]
+    assert agent_types(out) == [WRITER]  # no QA round on a cell waiting for the yes
+    assert report["outcome"] == "needs_approval"
+    assert report["approval"]["tool"] == "nh_edit_cell"
+    assert report["approval"]["args"] == {"code": call["code"], "cell_id": CELL_ID}
+    assert report["cell"] == {"title": TITLE, "exec": 2, "notebook": "notebooks/eda.ipynb"}
+    assert report["qa"]["verdict"] == "unchecked" and report["notes"] == [NOT_CHECKED, EARLIER]
+    assert report["changes"] == [answer["changes"]]  # how the earlier version failed
+
+
+@needs_node
+def test_a_revision_that_asks_keeps_the_checked_version():
+    call = {"tool": "nh_edit_cell", "cell_id": CELL_ID, "code": TRIPS}
+    replies = [writer(), qa("revise", finding()), asking(call)]
+    out = run_script(replies, args="drop rows")
+    report = out["result"]
+    assert agent_types(out) == [WRITER, QA, WRITER]  # no QA round on the unwritten revision
+    assert report["outcome"] == "needs_approval" and report["status"] == "ok"
+    args = {"code": TRIPS, "cell_id": CELL_ID}
+    assert report["approval"] == {"question": QUESTION, "tool": "nh_edit_cell", "args": args}
+    assert report["revisions"] == 0 and report["cell"]["exec"] == 2
+    assert report["result"].startswith(f'Added "{TITLE}" [2]')  # the checked version's
+    assert report["qa"]["final_version_checked"] is True
+    assert report["qa"]["verdict"] == "revise" and report["qa"]["open_findings"] == [finding()]
+    # the revision nh asked about: what it would change
+    assert report["changes"] == [f"Wrote {TITLE} (exec 2).", replies[2]["changes"]]
+    assert report["notes"] == [
+        "nh asked for the user's yes before writing revision 1 (E122), so the cell is still the "
+        "version QA checked."
+    ]
+
+
+@needs_node
+def test_a_revisions_fix_that_asks_leaves_the_revision_unchecked():
+    """The revision was written and failed; the writer's fix of it asks."""
+    call = {"tool": "nh_edit_cell", "cell_id": CELL_ID, "code": TRIPS}
+    fix = asking(call, wrote=True, cell_title=TITLE, cell_id=CELL_ID, exec_count=3)
+    replies = [writer(), qa("revise", finding()), fix]
+    out = run_script(replies, args="drop rows")
+    report = out["result"]
+    assert agent_types(out) == [WRITER, QA, WRITER]
+    assert report["outcome"] == "needs_approval" and report["status"] == "needs_approval"
+    assert report["revisions"] == 1
+    assert report["approval"]["args"] == {"code": TRIPS, "cell_id": CELL_ID}
+    assert report["qa"]["final_version_checked"] is False
+    assert report["qa"]["earlier_findings"] == [finding()]
+    assert (
+        "nh asked for the user's yes before writing the writer's fix of revision 1 (E122), so "
+        "QA didn't check it." in report["notes"]
+    )
+    assert any("one undo restores" in note for note in report["notes"])
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("answer", "note"),
+    [
+        # no question line in the refusal: nothing to ask
+        (asking(result=e122(line="- nothing to ask here")), NO_QUESTION),
+        # E122's other writer lines carry no question for this run, each with its own note
+        (asking(result=e122(line=WAITING_LINE)), WAITING),
+        (asking(result=e122(line=HELD_LINE)), HELD),
+        (asking(result=e122(line=HEADLESS_LINE.format(question=QUESTION))), HEADLESS),
+        (asking(result=e122(line=WAITING_LINE), status="refused"), WAITING),
+        (asking(result=e122(line=HEADLESS_LINE.format(question=QUESTION)), status="ok"), HEADLESS),
+        # a question line outside an E122
+        (asking(result=e122().replace("nh: E122", "nh: E110")), NO_QUESTION),
+        (asking(result=e122(line=WAITING_LINE).replace("nh: E122", "nh: E110")), NO_QUESTION),
+        # a question, but no usable call
+        ({**asking(), "call": None}, NO_CALL),
+        (asking({"tool": "nh_run", "code": TRIPS}), NO_CALL),
+        (asking(add_call(code="  \n ")), NO_CALL),
+        (asking(add_call(code=None)), NO_CALL),
+        (asking({"tool": "nh_edit_cell", "code": TRIPS}), NO_CALL),
+        (asking({"tool": "nh_edit_cell", "code": TRIPS, "cell_id": "  "}), NO_CALL),
+        (asking(["nh_add_cell", TRIPS]), NO_CALL),  # type: ignore[arg-type]
+        # nh's question with no call, and the writer calls the cell ok: still no QA round
+        ({**asking(), "call": None, "status": "ok"}, NO_CALL),
+        # the writer kept the old status: no note for the missing question, as before C5d
+        (asking(result=refused("E107")["result"], status="refused"), None),
+    ],
+)
+@pytest.mark.parametrize("wrote", [False, True])
+def test_no_needs_approval_without_the_question_and_the_call(
+    answer: dict[str, Any], note: str | None, wrote: bool
+):
+    answer = {**answer, "wrote": wrote}
+    out = run_script([answer], args="load the trips")
+    report = out["result"]
+    assert agent_types(out) == [WRITER]  # no QA round on an E122, whatever the status says
+    assert report["approval"] is None
+    refusal = "refused" if answer["status"] in ("refused", "needs_approval") else "not_written"
+    assert report["outcome"] == ("not_checked" if wrote else refusal)
+    assert report["qa"]["rounds"] == [] and report["qa"]["verdict"] == "unchecked"
+    earlier = [EARLIER] if wrote and "\nnh: E122\n" in answer["result"] else []
+    assert report["notes"] == ([note] if note else []) + earlier
+
+
+def test_the_stub_e122_lines_are_the_gateways():
+    """The stubs above are the gateway's own texts, so a rewording there fails here."""
+    from nh_gateway.policy.errors import RETURN_TO_WORKFLOW, NhError
+    from nh_gateway.tools import approvals
+
+    assert approvals.WRITER_QUESTION == ASKS_LINE
+    assert approvals.WAITING_LINE == WAITING_LINE
+    assert approvals.HELD_LINE == HELD_LINE
+    assert approvals.WRITER_HEADLESS == HEADLESS_LINE
+    finding = "- L012: The cell connects to `data.example.org` over the network (`pd.read_csv`)."
+    headless = HEADLESS_LINE.format(question=QUESTION)
+    for line in (ASKS_LINE.format(question=QUESTION), WAITING_LINE, HELD_LINE, headless):
+        refusal = NhError("E122", f"{finding}\n{line}", next_step=RETURN_TO_WORKFLOW)
+        assert str(refusal) == e122(line=line)
+
+
+@needs_node
+@pytest.mark.parametrize("call", [True, False])
+@pytest.mark.parametrize("line", [None, WAITING_LINE])
+def test_no_qa_round_on_a_revisions_fix_that_got_e122(call: bool, line: str | None):
+    """The revision was written and failed; the writer's fix got E122, though the writer says
+    ok: QA doesn't check the revision against nh's refusal."""
+    fix = asking(
+        {"tool": "nh_edit_cell", "cell_id": CELL_ID, "code": TRIPS} if call else None,
+        result=e122(line=line),
+        status="ok",
+        wrote=True,
+        cell_title=TITLE,
+        cell_id=CELL_ID,
+        exec_count=3,
+    )
+    if not call:
+        fix["call"] = None
+    out = run_script([writer(), qa("revise", finding()), fix], args="drop rows")
+    report = out["result"]
+    assert agent_types(out) == [WRITER, QA, WRITER]
+    assert report["revisions"] == 1 and report["qa"]["final_version_checked"] is False
+    if call and line is None:
+        assert report["outcome"] == "needs_approval"
+        assert (
+            "nh asked for the user's yes before writing the writer's fix of revision 1 (E122), "
+            "so QA didn't check it." in report["notes"]
+        )
+    else:
+        assert report["outcome"] == "not_checked" and report["approval"] is None
+        assert report["notes"] == [
+            NO_CALL if line is None else WAITING,
+            "nh's E122 ended the writer's fix of revision 1, so QA didn't check it.",
+        ]
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "replies",
+    [
+        [writer(), qa("pass")],
+        [writer(), qa("revise", finding()), writer(revisions=(1, 2), exec_count=3), qa("pass")],
+        [writer(), qa("revise", finding()), refused("E112")],
+        [refused("E107")],
+        [{**refused("E103"), "status": "no_write", "result": ""}],
+        [None],
+        [writer("error")],
+    ],
+)
+def test_every_other_outcome_has_no_approval(replies: list[Any]):
+    report = run_script(replies, args="drop rows")["result"]
+    assert report["outcome"] != "needs_approval" and report["approval"] is None
+    assert run_script([], args="")["result"]["approval"] is None  # no_ask
+
+
+def schema_of(name: str) -> dict[str, Any]:
+    """The script's literal schema ``name``, evaluated by node."""
+    text = script_text()
+    start = text.index(f"const {name} = ")
+    end = text.index("\n}\n", start) + 2
+    code = text[start:end] + f"\nprocess.stdout.write(JSON.stringify({name}))"
+    proc = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@needs_node
+def test_the_writer_schema_has_needs_approval_and_the_call():
+    schema = schema_of("WRITER_SCHEMA")
+    assert schema["required"] == ["status", "wrote", "result", "changes"]  # call is optional
+    assert schema["properties"]["status"]["enum"][-3:] == ["refused", "no_write", "needs_approval"]
+    call = schema["properties"]["call"]
+    assert call["required"] == ["tool", "code"]
+    assert call["properties"]["tool"]["enum"] == ["nh_add_cell", "nh_edit_cell"]
+    assert set(call["properties"]) == {
+        "tool",
+        "code",
+        "cell_id",
+        "after_cell_id",
+        "notebook",
+        "title",
+        "notes",
+        "intent",
+    }
+
+
+def test_the_outcome_comment_names_every_outcome():
+    text = script_text()
+    comment = text.split("// outcome: ", 1)[1].split("function report(", 1)[0]
+    body = text.split("function report(", 1)[1].split("return {", 1)[0]
+    picks = [
+        line
+        for line in body.splitlines()
+        if re.match(r"\s*const (written|refusal|outcome) =", line)
+    ]
+    returned = set(re.findall(r"'(\w+)'", "\n".join(picks)))
+    returned |= set(re.findall(r"report\(null, '(\w+)'\)", text))
+    assert returned == {
+        "needs_approval",
+        "refused",
+        "not_written",
+        "checked",
+        "not_checked",
+        "no_ask",
+        "writer_failed",
+    }
+    for outcome in returned:
+        assert re.search(rf"\b{outcome}\b", comment), outcome
+
+
+@needs_node
+@pytest.mark.parametrize("path", ["/home/o'neil/x.csv", "/srv/exports/a\u2028b.csv"])
+def test_the_gateways_own_writer_question_is_parsed(tmp_path: Path, path: str):
+    from nh_gateway.config import load
+    from nh_gateway.lint.lint import lint_cell
+    from nh_gateway.policy.errors import RETURN_TO_WORKFLOW, NhError
+    from nh_gateway.tools import approvals
+
+    report = lint_cell(
+        f"import pandas as pd\n\npd.DataFrame().to_csv({path!r})",
+        title="Save the trips",
+        notes=["Writes the trips table to a CSV file.", "Keeps the index out."],
+        intent="save the trips",
+        cfg=load(None),
+        require_note=True,
+        require_intent=True,
+        kernel_python=None,
+        names_above=None,
+        project_root=str(tmp_path / "proj"),
+    )
+    [issue] = report.asks
+    assert issue.rule == "L013"
+    question = approvals.question([issue])
+    refusal = str(
+        NhError(
+            "E122",
+            f"- L013: {issue.message}\n" + approvals.WRITER_QUESTION.format(question=question),
+            next_step=RETURN_TO_WORKFLOW,
+        )
+    )
+    report = run_script([asking(result=refusal)], args="save the trips")["result"]
+    assert report["outcome"] == "needs_approval"
+    assert report["approval"]["question"] == question
+    assert question.startswith("This cell writes to") and question.endswith("Run it as it is?")
+    assert path.replace("'", "") in question.replace("\\", "").replace("'", "")
+
+
+@needs_node
+def test_qa_never_runs_on_a_call_nh_asked_about_whatever_status_the_writer_says():
+    """QA checks only a cell nh wrote: an answer whose last result is nh's question gets no QA
+    round, even when the writer calls it ok (design §6.4)."""
+    answer = asking(status="ok", wrote=True, cell_title=TITLE, cell_id=CELL_ID, exec_count=2)
+    out = run_script([answer], args="load the trips")
+    assert agent_types(out) == [WRITER] and out["phases"] == ["Write"]
+    assert out["result"]["outcome"] == "needs_approval"

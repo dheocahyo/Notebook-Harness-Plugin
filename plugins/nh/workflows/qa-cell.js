@@ -22,7 +22,21 @@ const WRITER_SCHEMA = {
   properties: {
     status: {
       type: 'string',
-      enum: ['ok', 'error', 'running', 'queued', 'aborted', 'timeout', 'interrupted', 'deleted', 'lost', 'conflict', 'refused', 'no_write'],
+      enum: [
+        'ok',
+        'error',
+        'running',
+        'queued',
+        'aborted',
+        'timeout',
+        'interrupted',
+        'deleted',
+        'lost',
+        'conflict',
+        'refused',
+        'no_write',
+        'needs_approval',
+      ],
     },
     wrote: { type: 'boolean' },
     result: { type: 'string' },
@@ -32,6 +46,21 @@ const WRITER_SCHEMA = {
     exec_count: { type: 'integer' },
     notebook: { type: 'string' },
     lead_lines: { type: 'array', items: { type: 'string' } },
+    // With needs_approval: the call nh refused with E122, exactly as the writer sent it.
+    call: {
+      type: 'object',
+      properties: {
+        tool: { type: 'string', enum: ['nh_add_cell', 'nh_edit_cell'] },
+        code: { type: 'string' },
+        cell_id: { type: 'string' },
+        after_cell_id: { type: 'string' },
+        notebook: { type: 'string' },
+        title: { type: 'string' },
+        notes: { type: 'array', items: { type: 'string' } },
+        intent: { type: 'string' },
+      },
+      required: ['tool', 'code'],
+    },
   },
   required: ['status', 'wrote', 'result', 'changes'],
 }
@@ -86,6 +115,81 @@ function revisionsLeft(done) {
   while ((match = machine.exec(text)) !== null) last = match
   return last ? Number(last[2]) - Number(last[1]) : null
 }
+// A result's lines. Only LF ends one (CR LF and a lone CR read as LF): JavaScript's `.` and
+// multiline `$` also stop at U+2028 and U+2029, which a path in nh's question may hold.
+function linesOf(answer) {
+  return clean(answer.result).replace(/\r\n?/g, '\n').split('\n')
+}
+// Whether the writer's last nh result is an E122: nh asked, or would ask, for the user's yes.
+function isE122(answer) {
+  return linesOf(answer).some((line) => /^nh: E122\b/.test(line))
+}
+// nh's question for the user in a writer's E122 (design §6.4): the gateway words it, and the
+// workflow only carries it, unchanged. '' when the result holds none.
+function questionOf(answer) {
+  if (!isE122(answer)) return ''
+  let question = ''
+  for (const line of linesOf(answer)) {
+    const asks = /^- The main conversation asks the user: '([^\n]*)'[ \t]*$/.exec(line)
+    if (asks) question = asks[1]
+  }
+  return question
+}
+// The call nh asked about, as the main conversation sends it after the user's yes: the code
+// verbatim (the approval key reads it as sent), and only the arguments the tool takes.
+const CALL_ARGS = {
+  nh_add_cell: ['title', 'notes', 'intent', 'after_cell_id', 'notebook'],
+  nh_edit_cell: ['cell_id', 'title', 'notes', 'intent', 'notebook'],
+}
+function callOf(answer) {
+  const call = answer.call
+  if (!call || typeof call !== 'object' || Array.isArray(call)) return null
+  const keys = Object.prototype.hasOwnProperty.call(CALL_ARGS, call.tool) ? CALL_ARGS[call.tool] : null
+  if (!keys || typeof call.code !== 'string' || !call.code.trim()) return null
+  const args = { code: call.code }
+  for (const key of keys) {
+    if (key === 'notes' && Array.isArray(call.notes)) {
+      const notes = call.notes.map(clean).filter(Boolean)
+      if (notes.length) args.notes = notes
+    } else if (clean(call[key])) {
+      args[key] = clean(call[key])
+    }
+  }
+  if (call.tool === 'nh_edit_cell' && !args.cell_id) return null
+  return { tool: call.tool, args }
+}
+// E122's other writer lines (design §6.4): no question for this run's call, so nothing to ask.
+const E122_LINES = [
+  [
+    "- nh is already waiting for the user's answer",
+    "nh was already waiting for the user's answer to an earlier question of this message, which the writer didn't return, so there is nothing to ask.",
+  ],
+  [
+    "- The user's yes in this message is for the other cell nh asked about",
+    "nh keeps this message's yes for the other cell the user approved, so it didn't write the writer's cell.",
+  ],
+  [
+    '- No one can answer here (NH_HEADLESS=1)',
+    "No one can answer here (NH_HEADLESS=1): the cell needs the user's yes in an interactive session.",
+  ],
+]
+// The approval a writer answer carries: nh's question and the exact call, or null. Its notes
+// say what was missing when the writer said nh asked but the report can't carry it.
+function approvalOf(answer) {
+  const question = questionOf(answer)
+  const call = callOf(answer)
+  if (question && call) return { question, tool: call.tool, args: call.args }
+  const lines = isE122(answer) ? linesOf(answer) : []
+  const other = E122_LINES.find(([start]) => lines.some((line) => line.startsWith(start)))
+  if (question) {
+    notes.push("nh asked for the user's yes (E122), but the writer didn't return the exact call, so there is no call to send after a yes.")
+  } else if (other) {
+    notes.push(other[1])
+  } else if (answer.status === 'needs_approval') {
+    notes.push("The writer said nh asked for the user's yes, but its nh result holds no question from nh, so there is nothing to ask.")
+  }
+  return null
+}
 // The first line of a result that is not one of its lead lines ("NEW kernel: …").
 function headline(answer) {
   const lead = list(answer.lead_lines).map(clean)
@@ -127,6 +231,7 @@ let revisions = 0
 let checked = -1 // index in writes of the version the last QA round saw
 let uncertain = false // a revision may have changed the cell without saying so
 let asked = [] // the findings the last revision was asked to fix
+let approval = null // nh's question and the exact call, when nh asked before writing (E122)
 
 async function spawn(prompt, opts) {
   let answer = null
@@ -205,14 +310,17 @@ function leadLines() {
   return lines
 }
 
-// outcome: no_ask | writer_failed (the writer returned nothing) | refused | not_written (no cell
-// changed) | checked (QA checked the last version written) | not_checked (it did not).
+// outcome: no_ask | writer_failed (the writer returned nothing) | needs_approval (nh asked for
+// the user's yes before writing the writer's last call: approval holds nh's question and that
+// exact call) | refused | not_written (no cell changed) | checked (QA checked the last version
+// written) | not_checked (it did not).
 function report(done, fixed) {
   const last = rounds.length ? rounds[rounds.length - 1] : null
   const sawFinal = Boolean(done && last && !uncertain && writes.length && checked === writes.length - 1)
   const finalChecked = sawFinal && last.verdict !== 'unchecked'
   const written = done && writes.length ? (finalChecked ? 'checked' : 'not_checked') : null
-  const outcome = fixed || written || (done.status === 'refused' ? 'refused' : 'not_written')
+  const refusal = done && ['refused', 'needs_approval'].includes(done.status) ? 'refused' : 'not_written'
+  const outcome = fixed || (approval ? 'needs_approval' : null) || written || refusal
   return {
     outcome,
     status: done ? done.status : null,
@@ -235,6 +343,7 @@ function report(done, fixed) {
       numbers_checked: sawFinal ? list(last.numbers_checked) : [],
       rounds: rounds.map((qa, i) => ({ round: i + 1, verdict: qa.verdict, summary: clean(qa.summary) })),
     },
+    approval,
     lead_lines: leadLines(),
     notes,
   }
@@ -253,8 +362,15 @@ if (!done) {
 }
 if (done.wrote) writes.push(done)
 changes.push(clean(done.changes))
+approval = approvalOf(done)
+if (approval) notes.push("nh asked for the user's yes before writing the writer's last call (E122), so QA checked nothing.")
+if (done.wrote && isE122(done)) {
+  notes.push("The cell the writer wrote before nh's E122 is in the notebook, not QA-checked; one undo removes it.")
+}
 
-while (done.status === 'ok' && writes.length) {
+// QA checks only a cell nh wrote: never when the writer's last call got E122 (waiting for the
+// user's yes, or refused one), whatever status the writer gives.
+while (!isE122(done) && done.status === 'ok' && writes.length) {
   const round = rounds.length + 1
   phase('QA')
   const qa = await spawn(qaPrompt(done, round, asked), { label: `cell-qa ${round}`, phase: 'QA', agentType: QA, schema: QA_SCHEMA })
@@ -292,6 +408,12 @@ while (done.status === 'ok' && writes.length) {
     notes.push('A revision returned nothing; the cell may have changed after QA checked it.')
     break
   }
+  approval = approvalOf(revised)
+  if (approval && !revised.wrote) {
+    changes.push(clean(revised.changes)) // what the revision nh asked about would change
+    notes.push(`nh asked for the user's yes before writing revision ${revisions + 1} (E122), so the cell is still the version QA checked.`)
+    break
+  }
   if (!revised.wrote) {
     notes.push(`The revision changed nothing: ${headline(revised)}`)
     break
@@ -301,6 +423,14 @@ while (done.status === 'ok' && writes.length) {
   revisions += 1
   changes.push(clean(revised.changes))
   done = revised
+  if (approval) {
+    notes.push(`nh asked for the user's yes before writing the writer's fix of revision ${revisions} (E122), so QA didn't check it.`)
+    break
+  }
+  if (isE122(revised)) {
+    notes.push(`nh's E122 ended the writer's fix of revision ${revisions}, so QA didn't check it.`)
+    break
+  }
 }
 
 if (done.status !== 'ok' && revisions > 0) {
