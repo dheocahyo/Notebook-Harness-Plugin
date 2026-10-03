@@ -435,6 +435,8 @@ RETRY_SETTLE_S = 0.1  # the same for a connection that replaces an unanswered on
 CHECK_TIMEOUT_S = 0.5  # an idle kernel's first answer to the check came within ~5-50 ms here
 CHECK_POLL_S = 0.002  # how often the check reads the queues of the connections it waits on
 CONNECT_ATTEMPTS = 3
+STARTING_WAIT_S = 10.0  # how long a new kernel's "starting" is waited out before the check
+STARTING_POLL_S = 0.05
 _unanswered_logged = False
 
 
@@ -462,13 +464,23 @@ def _connect(server: ServerInfo, kernel_id: str, timeout: float) -> JupyterKerne
 
 
 def _idle(server: ServerInfo, kernel_id: str) -> bool:
-    """nh's own GET of the kernel model says ``idle``. Any other state, a 404 or an error is no."""
-    try:
-        model = rest.Rest(server).kernel(kernel_id)
-    except Exception as exc:  # RestError, ServerGone, a body that isn't JSON: the state is unknown
-        log.debug("kernel %s: no state for the connection check (%s)", kernel_id, exc)
-        return False
-    return bool(model) and model.get("execution_state") == "idle"
+    """nh's own GET of the kernel model says ``idle``. Any other state, a 404 or an error is no.
+
+    A new kernel reads ``starting`` until its first other status, which the server's nudge of
+    each new connection brings about once the kernel is up: that is waited out, polling every
+    ``STARTING_POLL_S`` for at most ``STARTING_WAIT_S`` (design §6.13: connections to a kernel
+    just started were dead as often as others, and went unchecked)."""
+    until = time.monotonic() + STARTING_WAIT_S
+    while True:
+        try:
+            model = rest.Rest(server).kernel(kernel_id)
+        except Exception as exc:  # RestError, ServerGone, a body that isn't JSON: unknown
+            log.debug("kernel %s: no state for the connection check (%s)", kernel_id, exc)
+            return False
+        state = model.get("execution_state") if model else None
+        if state != "starting" or time.monotonic() >= until:
+            return state == "idle"
+        time.sleep(STARTING_POLL_S)
 
 
 def ask(client: Any) -> str | None:
@@ -529,8 +541,9 @@ def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> Ju
     keeps listening on the unanswered ones: the first to answer is used (a stuck one answers
     once the next connection opens; a slow kernel's, when it gets to it), and the others are
     closed in a thread (a stuck one's close can take ~10 s), never the kernel. If none answers,
-    the last one is used, as before the check. A kernel that isn't idle is not checked: a busy
-    one would answer only after its running cell.
+    the last one is used, as before the check. A new kernel's ``starting`` is waited out first
+    (``_idle``); a kernel that isn't idle then is not checked: a busy one would answer only
+    after its running cell.
     """
     global _unanswered_logged
     note_utf8_check()

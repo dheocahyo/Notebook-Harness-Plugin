@@ -262,6 +262,8 @@ def fake(monkeypatch) -> Kernel:
     monkeypatch.setattr(kernel, "JupyterKernelClient", lambda **kw: FakeKernelClient(kernel_, **kw))
     monkeypatch.setattr(rest.Rest, "kernel", lambda self, kernel_id: kernel_.model())
     monkeypatch.setattr(kernel, "CHECK_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(kernel, "STARTING_WAIT_S", 0.3)
+    monkeypatch.setattr(kernel, "STARTING_POLL_S", 0.01)
     monkeypatch.setattr(kernel, "_unanswered_logged", False)
     return kernel_
 
@@ -451,11 +453,34 @@ def test_a_reconnect_that_fails_raises_e134_after_closing_the_first(
     ids=["busy", "starting", "restarting", "unknown", "404", "rest-error", "server-gone"],
 )
 def test_a_kernel_that_is_not_idle_is_not_checked(fake: Kernel, state: Any, caplog) -> None:
+    """``starting`` here never ends: it is waited out for STARTING_WAIT_S, then not checked."""
     caplog.set_level(logging.INFO, logger="nh_gateway")
     fake.state, fake.dead = state, 1  # a check would fail and replace it
     kc = kernel.open_client(SERVER, KID)
     assert fake.clients == [kc] and sent(kc) == [] and kc.stops == []
     assert records(caplog, logging.INFO, REPLACED) == []
+
+
+def test_a_new_kernels_starting_is_waited_out_then_checked(fake: Kernel, caplog) -> None:
+    """A kernel just started reads ``starting`` until its first other status (CI met a dead
+    connection to one, which went unchecked): nh polls until it reads idle, then checks, and a
+    dead connection is replaced as for any idle kernel."""
+    caplog.set_level(logging.INFO, logger="nh_gateway")
+    fake.states, fake.dead = ["starting", "starting", "starting"], 1
+    kc = kernel.open_client(SERVER, KID)
+    first, second = fake.clients
+    assert kc is second and sent(first) == sent(second) == ["kernel_info_request"]
+    assert closed(first) == [False] and fake.shutdowns == 0
+    assert len(records(caplog, logging.INFO, REPLACED)) == 1
+
+
+def test_a_starting_that_never_ends_is_waited_out_for_a_bounded_time(fake: Kernel) -> None:
+    fake.state = "starting"
+    began = time.monotonic()
+    kc = kernel.open_client(SERVER, KID)
+    took = time.monotonic() - began
+    assert fake.clients == [kc] and sent(kc) == []
+    assert kernel.STARTING_WAIT_S <= took < kernel.STARTING_WAIT_S + 2.0
 
 
 @pytest.mark.parametrize("state", ["idle", "busy"])
