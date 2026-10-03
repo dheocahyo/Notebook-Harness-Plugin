@@ -468,9 +468,11 @@ async def test_large_outputs_are_capped_in_the_room_and_cut_for_claude(
     overhead: dict[str, list[float]] = {case: [] for case in CASES}
     receive: dict[str, list[float]] = {case: [] for case in CASES}
     uids: dict[str, str] = {}
-    times = tmp_path / "kernel-times.jsonl"
     base = Path(os.path.realpath(tmp_path / "lab"))
     async with unlimited_lab(helpers, base, monkeypatch) as (lab, project):
+        # inside the project: a write outside it asks first (L013), unless it is in a temp
+        # folder, and CI's basetemp isn't one
+        times = project / "kernel-times.jsonl"
         turns = Turns(project, tmp_path / "data")
         api_path = (project / NB).relative_to(lab.root).as_posix()
         backend = RtcBackend(Layout(project), ConfigCache(project))
