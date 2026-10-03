@@ -458,6 +458,20 @@ def test_mark_done_by_tool_use_id_or_task_id(layout: Layout) -> None:
     assert done == {"wf_1": 2000.0, "wf_2": 2001.0, "wf_3": None}
 
 
+def test_mark_done_keeps_the_turn_the_report_reached(layout: Layout) -> None:
+    """``done_turn``: the human turn the notification is an alias of (design §6.4, C5d3); the
+    first mark wins, as for ``done_ts``."""
+    for run_id in ("wf_1", "wf_2"):
+        tr.record_run(layout, SESSION, run(run_id))
+    tr.mark_done(layout, SESSION, "toolu-wf_1", status="completed", now=2000.0, turn_id="p1")
+    tr.mark_done(layout, SESSION, "toolu-wf_1", status="completed", now=3000.0, turn_id="p2")
+    tr.mark_done(layout, SESSION, "toolu-wf_2", status="killed", now=2001.0)  # TaskStop
+    # a later notification doesn't fill in a first mark that kept no turn
+    tr.mark_done(layout, SESSION, "toolu-wf_2", status="completed", now=3001.0, turn_id="p1")
+    done = {r["run_id"]: r.get("done_turn", "missing") for r in tr.find_runs(layout, SESSION)}
+    assert done == {"wf_1": "p1", "wf_2": None}
+
+
 def test_open_runs_are_this_turns_own_unreported_runs_for_an_hour(layout: Layout) -> None:
     tr.record_run(layout, SESSION, run("wf_open"))
     tr.record_run(layout, SESSION, run("wf_done", done_ts=1500.0))

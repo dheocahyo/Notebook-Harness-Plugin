@@ -357,9 +357,13 @@ def mark_done(
     task_id: str | None = None,
     status: str | None = None,
     now: float | None = None,
+    turn_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Mark the runs a task notification names (by launching tool_use_id or task id) as
-    reported. Returns them, including runs an earlier notification already marked."""
+    reported. ``turn_id`` is the human turn the notification is an alias of (None: an orphan,
+    or TaskStop), kept as ``done_turn``: the message whose reply the report reached, which
+    ``policy.turn.reported_runs`` compares without clocks (design §6.4, C5d3). Returns them,
+    including runs an earlier notification already marked."""
     now = time.time() if now is None else now
     runs = find_runs(layout, session_id)
     named = [
@@ -373,6 +377,7 @@ def mark_done(
         if run.get("done_ts") is None:
             run["done_ts"] = now
             run["status"] = status
+            run["done_turn"] = turn_id
             changed = True
     if changed:
         _save_runs(layout, session_id, runs)

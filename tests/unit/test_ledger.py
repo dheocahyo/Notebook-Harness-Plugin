@@ -414,27 +414,39 @@ def test_grant_of_a_writers_question(
 
 def runs_file(layout: Layout, *runs: dict[str, Any]) -> None:
     for run in runs:
-        tr.record_run(layout, SESSION, dict({"ts": 0.5, "done_ts": None, "status": None}, **run))
+        tr.record_run(
+            layout,
+            SESSION,
+            # no done_turn key unless a row sets one: a run marked done before C5d3 has none
+            dict({"ts": 0.5, "done_ts": None, "status": None}, **run),
+        )
 
 
 def test_reported_runs_reads_the_runs_only_for_a_writers_question(
     layout: Layout, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    asking = {"done_turn": "p1"}  # the report reached the asking message's reply
     runs_file(
         layout,
-        {"run_id": "wf_1", "done_ts": 1.5, "status": "completed"},
-        {"run_id": "wf_2", "done_ts": 1.25, "status": "failed"},  # a report, of a failure
-        {"run_id": "wf_3", "done_ts": 1.5, "status": tr.STOPPED},  # TaskStop: no report
+        {"run_id": "wf_1", "done_ts": 1.5, "status": "completed", **asking},
+        {"run_id": "wf_2", "done_ts": 1.25, "status": "failed", **asking},  # a failure's report
+        {"run_id": "wf_3", "done_ts": 1.5, "status": tr.STOPPED, **asking},  # stopped: no report
         {"run_id": "wf_4"},  # not reported
-        {"run_id": "wf_5", "done_ts": True, "status": "completed"},
-        {"run_id": "wf_6", "done_ts": "1.5", "status": "completed"},
-        {"run_id": "wf_7", "done_ts": 1, "status": None},
+        {"run_id": "wf_5", "done_ts": True, "status": "completed", **asking},
+        {"run_id": "wf_6", "done_ts": "1.5", "status": "completed", **asking},
+        {"run_id": "wf_7", "done_ts": 1, "status": None, **asking},
+        # the report reached a later message's reply (a yes typed during the run), whatever
+        # its time says; and a run marked done before C5d3, with no done_turn
+        {"run_id": "wf_8", "done_ts": 1.5, "status": "completed", "done_turn": "p2"},
+        {"run_id": "wf_10", "done_ts": 1.5, "status": "completed"},
     )
     assert reported_runs(layout, SESSION, pending(run_id="wf_9")) == {
         "wf_1": 1.5,
         "wf_2": 1.25,
         "wf_7": 1.0,
     }
+    # the same runs for a question the later message asked: only wf_8 reached its reply
+    assert reported_runs(layout, SESSION, pending(turn_id="p2", run_id="wf_9")) == {"wf_8": 1.5}
     assert reported_runs(layout, "sess-2", pending(run_id="wf_1")) == {}  # no runs file
     monkeypatch.setattr(tr, "find_runs", lambda *a: pytest.fail("read the runs"))
     assert reported_runs(layout, SESSION, pending()) == {}
@@ -442,19 +454,36 @@ def test_reported_runs_reads_the_runs_only_for_a_writers_question(
 
 
 @pytest.mark.parametrize(
-    ("done_ts", "status", "granted"),
-    [(1.5, "completed", True), (None, None, False), (2.5, "completed", False)]
-    + [(1.5, tr.STOPPED, False)],
-    ids=["reported before", "not reported", "reported after", "stopped"],
+    ("done_ts", "status", "done_turn", "granted"),
+    [(1.5, "completed", "p1", True), (None, None, "p1", False), (2.5, "completed", "p1", False)]
+    + [(1.5, tr.STOPPED, "p1", False), (1.5, tr.STOPPED, None, False)]
+    + [(1.5, "completed", "p2", False), (2.5, "completed", "p2", False)]
+    + [(1.5, "completed", None, False)],
+    ids=[
+        "reported before",
+        "not reported",
+        # in the asking message's reply, but its time reads at or after the yes (a clock
+        # stepped back between the report and the yes): the time check, a second condition
+        "reported after",
+        "stopped",  # a killed notification in the asking message's reply: the status check
+        "stopped by TaskStop",
+        # a clock stepped back: the time reads before the yes, but the report reached the
+        # yes message's reply (C5d3)
+        "reported in the yes message",
+        "reported in the yes message, after it opened",  # a yes typed during the run
+        "reported as an orphan",
+    ],
 )
 def test_use_grant_reads_the_sessions_runs(
-    layout: Layout, done_ts: Any, status: Any, granted: bool
+    layout: Layout, done_ts: Any, status: Any, done_turn: Any, granted: bool
 ) -> None:
     ledger = TurnLedger(layout)
     ledger.set_pending(SESSION, "cell", KEY, "p1", now=1.0, run_id=RUN)
     runs_file(layout, {"run_id": RUN, "task_id": "task-1"})
     if done_ts is not None:
-        tr.mark_done(layout, SESSION, None, task_id="task-1", status=status, now=done_ts)
+        tr.mark_done(
+            layout, SESSION, None, task_id="task-1", status=status, now=done_ts, turn_id=done_turn
+        )
     assert ledger.use_grant(SESSION, record(), "p2", "cell", KEY) is granted
     assert ledger.pending(SESSION) == (None if granted else WRITER)
     assert TurnLedger(layout).pending(SESSION) == (None if granted else WRITER)
@@ -475,7 +504,9 @@ def test_asked_directly_makes_a_writers_unreported_question_the_main_conversatio
     ledger.set_pending(SESSION, "cell", KEY, "p1", now=1.0, run_id=RUN)
     runs_file(layout, {"run_id": RUN, "task_id": "task-1"})
     if done_ts is not None:
-        tr.mark_done(layout, SESSION, None, task_id="task-1", status=status, now=done_ts)
+        tr.mark_done(
+            layout, SESSION, None, task_id="task-1", status=status, now=done_ts, turn_id="p1"
+        )
     assert ledger.asked_directly(SESSION, "p2") is False  # another turn's question: kept
     assert ledger.pending(SESSION) == WRITER
     assert ledger.asked_directly(SESSION, "p1") is changed

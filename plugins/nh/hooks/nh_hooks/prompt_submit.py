@@ -163,6 +163,7 @@ def notification(
     if not session_id:
         return [BACKGROUND]
     current = turn_record.read(layout, session_id)
+    turn_id = current["turn_id"] if current else None
     runs: list[dict[str, Any]] = []
     for block in blocks:
         runs += turn_record.mark_done(
@@ -172,8 +173,8 @@ def notification(
             task_id=block["task_id"],
             status=block["status"],
             now=now,
+            turn_id=turn_id,  # the message whose reply the report reaches (design §6.4, C5d3)
         )
-    turn_id = current["turn_id"] if current else None
     if prompt_id:
         if current:
             record = turn_record.aliased(current, prompt_id, now)

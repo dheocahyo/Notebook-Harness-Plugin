@@ -282,6 +282,7 @@ def test_this_messages_qa_report_is_marked_done(sandbox: Sandbox) -> None:
     assert run.context == QA_REPORT
     runs = read_runs(sandbox)
     assert runs["wf_1"]["status"] == "completed" and before <= runs["wf_1"]["done_ts"]
+    assert runs["wf_1"]["done_turn"] == "p1"  # the reply it reached (design §6.4, C5d3)
     assert runs["wf_0"]["done_ts"] is None
 
 
@@ -298,7 +299,17 @@ def test_an_earlier_messages_qa_report(sandbox: Sandbox) -> None:
     run = notify(sandbox, "note-1", tool_use_id="toolu_launch", status="killed")
     assert run.context == QA_EARLIER
     assert read_runs(sandbox)["wf_1"]["status"] == "killed"
+    assert read_runs(sandbox)["wf_1"]["done_turn"] == "p2"  # the later message's reply
     assert turn(sandbox)["turn_id"] == "p2"
+
+
+def test_a_report_with_no_human_message_open_reached_no_reply(sandbox: Sandbox) -> None:
+    """An orphan notification (session start, after /clear): no message's reply, so no
+    ``done_turn`` (a writer's question it carries is never granted, design §6.4)."""
+    write_runs(sandbox, qa_run("wf_1", "p1", "toolu_launch"))
+    notify(sandbox, "note-1", tool_use_id="toolu_launch", status="completed")
+    runs = read_runs(sandbox)
+    assert runs["wf_1"]["done_ts"] is not None and runs["wf_1"]["done_turn"] is None
 
 
 def test_other_background_tasks_and_the_last_cell(sandbox: Sandbox) -> None:

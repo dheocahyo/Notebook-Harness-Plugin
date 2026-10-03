@@ -1573,6 +1573,65 @@ async def test_a_yes_typed_during_the_run_grants_nothing(
     assert pending(nh) is None
 
 
+async def test_a_clock_stepped_back_doesnt_turn_a_yes_typed_during_the_run_into_an_answer(
+    nh: Harness,
+) -> None:
+    """The report's time can read before the yes message's (a system clock stepped back between
+    them), but the report still reached that message's reply, not the asking one's: the hook
+    keeps the turn it aliased (``done_turn``), so nothing is granted (design §6.4, C5d3)."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    nh.turns.prompt("p2", text="yes")  # typed while the run works in the background
+    nh.turns.notification("n-wf_run-1", tool_use_id="toolu_wf_run-1", task_id="task-wf_run-1")
+    layout = Layout(nh.project)
+    record = turn_record.read(layout, SESSION)
+    assert record is not None and record["turn_id"] == "p2"
+    data = json.loads(layout.workflow_file(SESSION).read_text())
+    [entry] = [e for e in data["runs"] if e["run_id"] == "wf_run-1"]
+    assert entry["done_turn"] == "p2"
+    entry["done_ts"] = record["ts"] - 5.0  # what a clock stepped back leaves behind
+    atomic_write_json(layout.workflow_file(SESSION), data)
+    for prompt_id in ("p2", "n-wf_run-1"):  # the yes message and the report's turn
+        assert_asked(await nh.call("nh_add_cell", prompt_id, **INSTALL))
+    assert not events(nh, "cell_granted") and not nh_code_cells(nh)
+    assert question_of(nh) == {
+        "kind": "cell",
+        "key": install_key(),
+        "turn_id": "p2",
+        "run_id": None,
+    }
+
+
+async def test_a_report_whose_time_reads_after_the_yes_grants_and_holds_nothing(
+    nh: Harness,
+) -> None:
+    """The report reached the asking message's reply (``done_turn`` p1), but its time reads
+    after the yes message opened (a system clock stepped back between the report and the
+    yes): the time check, the rule's second condition, fails closed. The exact call asks anew,
+    neither granted nor "held" (design §6.4 Fails closed, C5d3)."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await as_writer(nh, "p1", "wf_run-1", "nh_add_cell", INSTALL), writer=True)
+    reported(nh, "wf_run-1")
+    nh.turns.prompt("p2", text="yes")
+    layout = Layout(nh.project)
+    record = turn_record.read(layout, SESSION)
+    assert record is not None and record["turn_id"] == "p2"
+    data = json.loads(layout.workflow_file(SESSION).read_text())
+    [entry] = [e for e in data["runs"] if e["run_id"] == "wf_run-1"]
+    assert entry["done_turn"] == "p1"
+    entry["done_ts"] = record["ts"] + 5.0  # what a clock stepped back leaves behind
+    atomic_write_json(layout.workflow_file(SESSION), data)
+    assert_asked(await nh.call("nh_add_cell", "p2", **INSTALL))
+    assert [e["outcome"] for e in events(nh, "cell_asked")] == ["asked", "asked"]  # no "held"
+    assert not events(nh, "cell_granted") and not nh_code_cells(nh)
+    assert question_of(nh) == {
+        "kind": "cell",
+        "key": install_key(),
+        "turn_id": "p2",
+        "run_id": None,
+    }
+
+
 @pytest.mark.parametrize("yes_typed", ["after the report", "during the run"])
 async def test_another_asked_for_cell_is_held_only_by_a_yes_to_a_question_the_user_saw(
     nh: Harness, yes_typed: str

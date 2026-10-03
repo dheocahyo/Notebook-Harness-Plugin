@@ -99,13 +99,18 @@ def reported_runs(
 ) -> dict[str, float]:
     """When each nh:qa-cell run's report reached the main conversation (run id -> ``done_ts``),
     for ``grant()``. Only a writer's question needs it: for any other the runs aren't read.
-    A run TaskStop stopped is marked done too, but sent no report: it doesn't count."""
+    A run TaskStop stopped is marked done too, but sent no report: it doesn't count. Nor does a
+    report that reached another message's reply than the asking one (``done_turn``, C5d3): a
+    yes typed during the run makes the report an alias of the yes message, whatever the clocks
+    say; a run marked done before C5d3 has no ``done_turn`` and fails closed."""
     if pending is None or pending.get("run_id") is None:
         return {}
     return {
         run["run_id"]: float(run["done_ts"])
         for run in turn_record.find_runs(layout, session_id)
-        if _number(run.get("done_ts")) and run.get("status") != turn_record.STOPPED
+        if _number(run.get("done_ts"))
+        and run.get("status") != turn_record.STOPPED
+        and run.get("done_turn") == pending["turn_id"]
     }
 
 
