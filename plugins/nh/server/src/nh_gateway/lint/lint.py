@@ -22,7 +22,7 @@ from nh_gateway._shared.patterns import CELL_NOTEBOOK_WRITES, CELL_PACKAGE_INSTA
 from nh_gateway._shared.text import count_words, normalize_bullet, normalize_title, split_notes
 from nh_gateway.config import ASK_RULES, Config
 from nh_gateway.dataflow import EVERYTHING, Flow, base_name, flow_of
-from nh_gateway.lint import network, secret_scan
+from nh_gateway.lint import network, secret_scan, writes
 from nh_gateway.lint.magics import Masked, lines_of, mask
 
 Severity = Literal["error", "hint", "ask"]
@@ -199,7 +199,9 @@ class _Cell:
     bullets: list[str]
     names_above: set[str] | None
     approved_hosts: frozenset[str]  # host keys; L012 skips a site whose hosts are all here
-    code_above: tuple[str, ...]  # the code cells above, in order: L012 reads their names
+    code_above: tuple[str, ...]  # the code cells above, in order: L012 and L013 read their names
+    project_root: str | None  # the project's folder; L013 needs it to tell inside from outside
+    notebook_dir: str  # the notebook's folder, relative to the project root (the kernel's)
 
     @classmethod
     def build(
@@ -213,6 +215,8 @@ class _Cell:
         names_above: set[str] | None,
         approved_hosts: Collection[str] = (),
         code_above: Sequence[str] = (),
+        project_root: str | None = None,
+        notebook_dir: str = "",
     ) -> _Cell:
         source = "\n".join(lines_of(code or ""))
         masked = mask(source)
@@ -249,6 +253,8 @@ class _Cell:
             names_above=names_above,
             approved_hosts=frozenset(filter(None, map(hosts.normalize_entry, approved_hosts))),
             code_above=tuple(code_above),
+            project_root=project_root,
+            notebook_dir=notebook_dir,
         )
 
     @property
@@ -264,6 +270,11 @@ class _Cell:
     def network(self) -> list[network.Site]:
         """Where the cell reaches the network (L012)."""
         return network.scan(self.masked, self.lines, self.tree, network.bindings(self.code_above))
+
+    @functools.cached_property
+    def written(self) -> list[writes.Write]:
+        """Where the cell writes or removes files (L013)."""
+        return writes.scan(self.masked, self.lines, self.tree, writes.bindings(self.code_above))
 
     @property
     def empty(self) -> bool:
@@ -289,10 +300,14 @@ def lint_cell(
     names_above: set[str] | None,
     approved_hosts: Collection[str] = frozenset(),
     code_above: Sequence[str] = (),
+    project_root: str | None = None,
+    notebook_dir: str = "",
 ) -> LintReport:
     """Lint one cell. ``approved_hosts``: the project's approved host keys (the gateway reads
     ``.nh/state/approved_hosts.json`` per call), which L012 lets through; ``code_above``: the
-    code cells above it, whose names L012 reads (design §6.4)."""
+    code cells above it, whose names L012 and L013 read; ``project_root`` and ``notebook_dir``
+    (the notebook's folder, relative to the root): where the project is and where the kernel
+    runs, for L013, which finds nothing without a root (design §6.4)."""
     clean_title = normalize_title(title) if title and title.strip() else None
     bullets = [re.sub(r"\s*\n\s*", " ", bullet) for bullet in split_notes(notes)]
     cell = _Cell.build(
@@ -304,6 +319,8 @@ def lint_cell(
         names_above=names_above,
         approved_hosts=approved_hosts,
         code_above=code_above,
+        project_root=project_root,
+        notebook_dir=notebook_dir,
     )
     issues: list[Issue] = []
     if cell.empty:
@@ -869,6 +886,56 @@ def _network(cell: _Cell) -> Finding | None:
         "the project (for example `data/raw/`), then read it from there.",
         clause,
     )
+
+
+_OUTSIDE_FIX = (
+    "Keep the cell's files inside the project (for example under `data/processed/` or "
+    "`reports/`); ask the user before writing anywhere else."
+)
+
+
+def _outside_write(cell: _Cell) -> Finding | None:
+    """L013, an ask by default (design §6.4): the files and folders the cell writes or removes
+    outside the project, each named once as it resolves."""
+    if not cell.project_root:
+        return None
+    left: list[tuple[writes.Write, str]] = []
+    for write in cell.written:
+        shown = writes.outside(write.path, cell.project_root, cell.notebook_dir)
+        if shown is not None:
+            left.append((write, shown))
+    if not left:
+        return None
+    parts = []
+    written = list(dict.fromkeys(shown for write, shown in left if not write.removes))
+    removed = list(dict.fromkeys(shown for write, shown in left if write.removes))
+    if written:
+        parts.append(f"writes to {_listed(written)}")
+    if removed:
+        parts.append(f"removes {_listed(removed)}")
+    clause = f"{' and '.join(parts)}, outside the project"
+    return (f"The cell {clause} (`{left[0][0].where}`{_more(len(left))}).", _OUTSIDE_FIX, clause)
+
+
+def _listed(items: list[str]) -> str:
+    """`a`, `b`, `c` and N more."""
+    parts = [_path_span(item) for item in items[:3]]
+    if len(items) > 3:
+        parts.append(f"{len(items) - 3} more")
+    return _and(parts)
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _path_span(path: str) -> str:
+    """A path as a code span on one line: control characters as their escapes; double-quoted
+    with ``\\`` and ``"`` escaped when it holds a ``'`` (L013's question sits inside E122's
+    single quotes, as L009's does); a double-backtick span when it holds a backtick."""
+    text = _CONTROL.sub(lambda found: found.group().encode("unicode_escape").decode(), path)
+    if "'" in text:
+        text = '"' + re.sub(r'([\\"])', r"\\\1", text) + '"'
+    return f"`` {text} ``" if "`" in text else f"`{text}`"
 
 
 def _markdown_output(cell: _Cell) -> Finding | None:
@@ -1511,6 +1578,7 @@ _CHECKS: list[tuple[str, str, Callable[[_Cell], Finding | None]]] = [
     ("L008", "notebook_write", _notebook_write),
     ("L009", "package_install", _package_install),
     ("L012", "network", _network),
+    ("L013", "outside_write", _outside_write),
     ("L010", "markdown_output", _markdown_output),
     ("L011", "secret_print", _secret_print),
     ("L014", "secret_name", _secret_name),

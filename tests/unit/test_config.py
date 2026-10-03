@@ -21,14 +21,16 @@ OTHER_KEYS = [key for key in RULE_KEYS if key not in config.ASK_RULES]
 
 def test_the_levels() -> None:
     assert config.RULE_LEVELS == ("off", "hint", "error", "ask")
-    assert {"package_install", "network"} == config.ASK_RULES  # C5c adds outside_write
+    assert {"package_install", "network", "outside_write"} == config.ASK_RULES
     assert set(RULE_KEYS) >= config.ASK_RULES
     assert config.DEFAULTS["lint"]["rules"]["package_install"] == "ask"
     assert config.DEFAULTS["lint"]["rules"]["network"] == "ask"
+    assert config.DEFAULTS["lint"]["rules"]["outside_write"] == "ask"
     for key, level in config.DEFAULTS["lint"]["rules"].items():
         assert level in config.rule_levels(key), key
     assert config.rule_levels("package_install") == ("off", "hint", "error", "ask")
     assert config.rule_levels("network") == ("off", "hint", "error", "ask")
+    assert config.rule_levels("outside_write") == ("off", "hint", "error", "ask")
     assert config.rule_levels("long_line") == ("off", "hint", "error")
 
 
@@ -60,6 +62,7 @@ def test_any_other_rule_refuses_ask_and_keeps_its_default(tmp_path: Path, key: s
     [
         ("package_install", "off|hint|error|ask"),
         ("network", "off|hint|error|ask"),
+        ("outside_write", "off|hint|error|ask"),
         ("long_line", "off|hint|error"),
     ],
 )

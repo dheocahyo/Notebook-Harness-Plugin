@@ -62,6 +62,7 @@ max_chain = 4
 [lint.rules]                    # per rule: off | hint | error | ask
 package_install = "ask"
 network = "ask"
+outside_write = "ask"           # a cell that writes or removes files outside the project (L013)
 notebook_write = "error"
 markdown_output = "error"
 secret_print = "error"

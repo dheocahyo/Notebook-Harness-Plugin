@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import posixpath
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -167,6 +168,12 @@ def _lint_failure(
             "Don't call again yet: this project refuses cells that reach the network. Ask the user "
             "to download what the cell needs into the project (for example data/raw/), then write "
             "the cell to read it from there."
+        )
+    elif "L013" in rules:
+        next_step = (
+            "Don't call again yet: this project refuses cells that write outside it. Write the "
+            "files inside the project instead (for example data/processed/ or reports/), or tell "
+            "the user where the cell would write and let them change it themselves."
         )
     elif "L002" in rules:
         next_step = (
@@ -722,6 +729,8 @@ async def add_cell(
             names_above=names_above,
             approved_hosts=hosts.read_approved(svc.layout.approved_hosts),
             code_above=code_above,
+            project_root=str(svc.project),
+            notebook_dir=posixpath.dirname(ref.rel_path),
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)
@@ -964,6 +973,8 @@ async def edit_cell(
             names_above=names_above,
             approved_hosts=hosts.read_approved(svc.layout.approved_hosts),
             code_above=code_above,
+            project_root=str(svc.project),
+            notebook_dir=posixpath.dirname(ref.rel_path),
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)

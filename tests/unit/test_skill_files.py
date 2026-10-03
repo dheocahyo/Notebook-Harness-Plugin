@@ -2494,8 +2494,8 @@ R_IUD_NOTE = (
     'bullets: "E120 note".'
 )
 R_IUD_ASK = (
-    "Else, if the code installs a package or reaches the network anywhere but `data.example.org` "
-    '(see "What nh asks about"): "E122".'
+    "Else, if the code installs a package, reaches the network anywhere but `data.example.org`, "
+    'or writes outside the project (see "What nh asks about"): "E122".'
 )
 R_IUD_RUN = 'Else run the code (see "Running code"): "add ok" or "add failed".'
 IUD_SCENARIOS: dict[str, list[tuple[str, list[Call]]]] = {
@@ -2586,12 +2586,38 @@ IUD_SCENARIOS: dict[str, list[tuple[str, list[Call]]]] = {
                 )
             ],
         ),
+        # an outside write (L013): a `~` path, an absolute one, a download, a removal, and all
+        # three kinds in one cell
+        (R_IUD_ASK, [_iud_add(IUD_READ + 'trips.to_csv("~/trips.csv", index=False)')]),
+        (R_IUD_ASK, [_iud_add(f"!curl -sSo ~/Downloads/trips.csv {TRIPS_URL}")]),
+        (R_IUD_ASK, [_iud_add('import shutil\n\nshutil.rmtree("/data/old")')]),
+        (
+            R_IUD_ASK,
+            [
+                _iud_add(
+                    IUD_READ + 'trips.to_parquet("/data/trips.parquet")\n'
+                    'trips.to_csv("/data/trips.csv")\n!rm -f /data/old.csv'
+                )
+            ],
+        ),
+        (
+            R_IUD_ASK,
+            [
+                _iud_add(
+                    "%pip install pyarrow\n"
+                    + IUD_READ
+                    + 'stations = pd.read_csv("https://api.example.org/s.csv")\n'
+                    + 'stations.to_csv("~/stations.csv")'
+                )
+            ],
+        ),
     ],
 }
 IUD_CASES = [(name, i) for name, cases in IUD_SCENARIOS.items() for i in range(len(cases))]
 _SITE_LINE = {
     "L009": "- L009: The cell installs <packages> into the kernel only (`<the install line>`).",
     "L012": "- L012: The cell connects to <hosts> over the network (`<where>`<more>).",
+    "L013": "- L013: The cell writes to <paths>, outside the project (`<where>`<more>).",
 }
 
 
@@ -2694,12 +2720,33 @@ async def test_init_url_data_template_matches_the_real_gateway(name: str, index:
     if name == "E122":
         fences = re.findall(r"```text\n(.*?)\n  ```", _iud_section("What nh asks about"), re.S)
         forms = [_prose(line) for line in fences[0].splitlines()]
-        assert forms == [_prose(_SITE_LINE["L009"]), _prose(_SITE_LINE["L012"])]
+        assert forms == [_prose(_SITE_LINE[rule]) for rule in ("L009", "L012", "L013")]
         clauses = []
         for line in values["finding lines"].splitlines():
             rule_name = line[2:6]
             found = match_template(_SITE_LINE[rule_name], line)
-            if rule_name == "L012" and found is None:
+            if rule_name == "L013":
+                both = match_template(
+                    "- L013: The cell writes to <paths> and removes <removed>, outside the "
+                    "project (`<where>`<more>).",
+                    line,
+                )
+                if both is not None:
+                    found = None
+                    clause = f"writes to {both['paths']} and removes {both['removed']}"
+                elif found is not None:
+                    clause = f"writes to {found['paths']}"
+                else:
+                    found = match_template(
+                        "- L013: The cell removes <paths>, outside the project (`<where>`<more>).",
+                        line,
+                    )
+                    assert found is not None, line
+                    clause = f"removes {found['paths']}"
+                shown = re.findall(r"`([^`]+)`", clause)
+                assert shown and all(path.startswith(("~", "/")) for path in shown), line
+                clauses.append(f"{clause}, outside the project")
+            elif rule_name == "L012" and found is None:
                 found = match_template(
                     "- L012: The cell connects to the network (`<where>`<more>).", line
                 )
@@ -3703,6 +3750,16 @@ def test_the_ask_flow_is_documented_where_the_model_reads_it():
         "You can't write the file, and nh has no command for it.",
         "the user downloads the file into the project (for example `data/raw/`)",
         "Never fetch it yourself: no `curl` or `wget` with Bash, no WebFetch, no other cell.",
+        # L013 (C5c): what asks, where a relative path starts, and the fallback
+        "a cell that writes, creates or removes a file or folder outside the project (rule L013)",
+        '`open("../../x.txt", "w")`, `shutil.copy`, `!cp`, `>`, `%%writefile`',
+        "The question names the paths.",
+        "A relative path starts from the notebook's folder: from `notebooks/`, "
+        "`../data/processed/` is inside.",
+        "unless the user named the place",
+        "For a write outside the project: write the file inside the project instead",
+        "don't drop the install, the download or the write into Bash on your own",
+        "re-running one that downloads or writes outside the project",
     ):
         assert phrase in asks, phrase
     assert "is for the other cell nh asked about" in approvals.HELD_LINE
@@ -3726,6 +3783,8 @@ def test_the_ask_flow_is_documented_where_the_model_reads_it():
         "L009",
         "L012",
         "reaches a host the project hasn't approved",
+        "L013",
+        "writes outside the project",
         "send the exact same call again",
         "already waiting for the user's answer",
         "NH_HEADLESS=1",
@@ -3739,15 +3798,25 @@ def test_the_ask_flow_is_documented_where_the_model_reads_it():
     assert 'network = "error"' in l012 and "`E122`" in l012
     assert '`"hint"` under `[lint] mode = "strict"`' in l012
     assert "download what the cell needs into the project" in l012
-    assert "except for L009 and L012 (see their rows)" in errors_md
+    l013 = next(line for line in errors_md.splitlines() if line.startswith("| L013 |"))
+    assert 'outside_write = "error"' in l013 and "`E122`" in l013
+    assert '`"hint"` under `[lint] mode = "strict"`' in l013
+    assert "A relative path starts from the notebook's folder" in l013
+    assert "Write the files inside the project instead" in l013
+    assert "except for L009, L012 and L013 (see their rows)" in errors_md
     assert "is for the other cell" in e122
     tools_md = flat(NOTEBOOK_REFS / "tools.md")
     assert "nh asks the user first (`E122`" in tools_md and "([asks.md](asks.md))" in tools_md
     assert "- `L012` (the network), when `harness.toml` makes it an error" in tools_md
+    assert (
+        "- `L013` (a write outside the project), when `harness.toml` makes it an error" in tools_md
+    )
+    assert "Four rules differ:" in tools_md
     assert "a cell that reaches a host the project hasn't approved, is no rejection" in tools_md
+    assert "a cell that writes outside the project, or a cell that reaches" in tools_md
     harness = flat(REPO / "docs" / "harness-toml.md")
     assert 'Each rule is `"off"`, `"hint"`, `"error"` or `"ask"`.' in harness
-    assert 'Only `package_install` and `network` can be `"ask"`' in harness
+    assert 'Only `package_install`, `network` and `outside_write` can be `"ask"`' in harness
     assert "`.nh/state/approved_hosts.json`, a JSON list of host names" in harness
     assert "a subdomain needs its own entry" in harness
     assert "and of buckets as `s3://<bucket>`" in harness and "local to your clone" in harness
@@ -3757,6 +3826,28 @@ def test_the_ask_flow_is_documented_where_the_model_reads_it():
     assert config.DEFAULTS["lint"]["rules"]["package_install"] == "ask"
     assert _documented_keys()["lint.rules"]["network"] == '"ask"'
     assert config.DEFAULTS["lint"]["rules"]["network"] == "ask"
+    assert _documented_keys()["lint.rules"]["outside_write"] == '"ask"'
+    assert config.DEFAULTS["lint"]["rules"]["outside_write"] == "ask"
+    outside_row = next(
+        r
+        for r in _read(REPO / "docs" / "harness-toml.md").splitlines()
+        if r.startswith("| `outside_write` ")
+    )
+    for phrase in (
+        "| L013 |",
+        "(not `.to_sql`)",
+        "counted from the notebook's folder",
+        "`/dev` (`/dev/null`) and the system temp folders `/tmp` and `/var/tmp`"
+        " (`/private/tmp` and `/private/var/tmp` on macOS) never ask",
+        "nh asks you first, naming the paths",
+        "an earlier cell's `%cd`",
+        "a function the cell or an earlier cell defines",
+        "`with contextlib.chdir(…)`",
+        "each `{…}` read as part of one folder or file name",
+        "Every `~` path asks, also one that leads back into the project",
+        "a path given to a method",
+    ):
+        assert phrase in outside_row, phrase
     troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
     assert "An install (L009) is no rejection: nh asks you first (**E122**)" in troubleshooting
     l012_row = next(r for r in troubleshooting.splitlines() if r.startswith("| **L012** "))
@@ -3771,8 +3862,29 @@ def test_the_ask_flow_is_documented_where_the_model_reads_it():
         "`!python fetch.py`",
     ):
         assert phrase in l012_row, phrase
+    l013_row = next(r for r in troubleshooting.splitlines() if r.startswith("| **L013** "))
+    for phrase in (
+        "a path starting with `~`",
+        "counted from the notebook's folder",
+        "The question names the paths.",
+        "the system temp folders (`/tmp`, `/var/tmp`, and on macOS `/private/tmp`,"
+        " `/private/var/tmp`) never ask",
+        "Every `~` path asks, also one that leads back into your project",
+        "also inside a function the cell or an earlier cell defines",
+        "a path given to a method",
+        "It misses a path nh can't read in the code",
+        "a `%cd` in an earlier cell",
+        'set `[lint.rules] outside_write = "hint"` (or `"off"`)',
+        '`"error"` to refuse such cells outright',
+    ):
+        assert phrase in l013_row, phrase
     e122_row = next(r for r in troubleshooting.splitlines() if r.startswith("| **E122** "))
     assert "(L012)" in e122_row
+    assert "writing outside the project (L013)" in e122_row
+    hard_row = next(
+        r for r in troubleshooting.splitlines() if r.startswith("| A cell was rejected ")
+    )
+    assert "or writes outside the project (L013)" in hard_row
     init_skill = " ".join(_read(PLUGIN / "skills" / "init" / "SKILL.md").split())
     assert (
         "When the report's `data.approved_host` is set (an http(s), s3 or similar data URL; never "

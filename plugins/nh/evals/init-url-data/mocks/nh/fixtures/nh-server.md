@@ -40,14 +40,15 @@ nh_add_cell:
 - The message's cell exists and its run was ok: "E110". Nothing runs.
 - Else, if the title has more than 8 words, or the notes have fewer than 2 or more than 5
   bullets: "E120 note". Nothing runs and nothing is used up.
-- Else, if the code installs a package or reaches the network anywhere but `data.example.org`
-  (see "What nh asks about"): "E122". Nothing runs and nothing is used up.
+- Else, if the code installs a package, reaches the network anywhere but `data.example.org`, or
+  writes outside the project (see "What nh asks about"): "E122". Nothing runs and nothing is used
+  up.
 - Else run the code (see "Running code"): "add ok" or "add failed".
 
 ## What nh asks about
 
-nh reads the code, never runs it, to find where it reaches another machine. A place that does is
-a site, and it reaches the hosts its URLs name.
+nh reads the code, never runs it, to find where it reaches another machine and where it writes
+files. A place that reaches another machine is a site, and it reaches the hosts its URLs name.
 
 - A site: a network URL (`http`, `https`, `ftp`, `s3`, `gs`, `hf` and the like, with a host)
   given to a call that may fetch it (`pd.read_csv`, `pd.read_parquet`, `pd.read_json`, any
@@ -62,16 +63,30 @@ a site, and it reaches the hosts its URLs name.
 - A site whose every host is `data.example.org` asks nothing: it is approved. Any other host
   asks, a subdomain such as `api.data.example.org` too, and so does a network library call or
   shell download whose host is not written in the code (from the environment, a parameter).
-- `<finding lines>`: one line for each of the two kinds the code has, in this order: an install
-  (`%pip install`, `!pip install`, `!uv pip install`), then the sites that ask:
+- An outside write: a file or folder the code writes, creates or removes at a path that starts
+  with `~` (`trips.to_csv("~/trips.csv")`, `!curl -o ~/trips.csv <url>`), or at an absolute path
+  outside the project folder and not under `/tmp` or `/dev` (`/data/trips.csv`), directly,
+  through a name, a join or an f-string. A relative path never asks here: the code runs in the
+  project's `notebooks/` folder, and this project is under `/tmp`. Writers: a frame's `.to_csv`
+  and the other `.to_*` file writers (not `.to_sql`), `savefig`, `open(…, "w")` (also `"a"`,
+  `"x"`, `"+"`), a path's `.write_text`, `.mkdir` and `.touch`, `shutil.copy`, `os.makedirs`,
+  `%%writefile`, and in `!` lines `>`, `>>`, `tee`, `cp`, `mkdir`, `touch`, `curl -o`, `wget -O`.
+  Removing a file or folder (`!rm`, `os.remove`, `shutil.rmtree`, `.unlink`, a move's source)
+  counts too.
+- `<finding lines>`: one line for each of the three kinds the code has, in this order: an install
+  (`%pip install`, `!pip install`, `!uv pip install`), then the sites that ask, then the outside
+  writes:
 
   ```text
   - L009: The cell installs <packages> into the kernel only (`<the install line>`).
   - L012: The cell connects to <hosts> over the network (`<where>`<more>).
+  - L013: The cell writes to <paths>, outside the project (`<where>`<more>).
   ```
 
   When no site that asks names a host nh can read, the L012 line says `connects to the network`
-  in place of `connects to <hosts> over the network`.
+  in place of `connects to <hosts> over the network`. When the code only removes outside the
+  project, the L013 line says `removes <paths>` in place of `writes to <paths>`; when it writes
+  and removes, `writes to <paths> and removes <paths>`, each list with its own paths.
 - Lists: parts joined as "a", "a and b", "a, b and c" (" and " before the last part, ", "
   between the others).
 - `<packages>`: the package names, each in backticks, as a list. `<names>`: the same names
@@ -83,7 +98,11 @@ a site, and it reaches the hosts its URLs name.
   `b.example.org`, `c.example.org`, 1 more and other hosts".
 - `<where>`: the first site that asks, as its call's name without arguments (`pd.read_csv`,
   `requests.get`, `!curl`, `os.system`). `<more>`: ` (+<count> more)` for the other sites that
-  ask, else nothing.
+  ask, else nothing. In the L013 line they count the outside writes the same way (`trips.to_csv`,
+  `open`, `!curl`, `!cp`, or `!echo >` for a `>` redirection).
+- `<paths>`: the outside paths, in the order the code names them, each once and in backticks
+  (after three, the first three and then `<count> more`), as the code writes them
+  (`~/trips.csv`).
 - `<question>`: "This cell ", then the clauses below that apply, in this order, joined by
   "; it also ", then ". Run it as it is?". The install's clause has "them" for "it", both
   times, when there are several packages:
@@ -91,9 +110,12 @@ a site, and it reaches the hosts its URLs name.
   ```text
   installs <packages> into the kernel only, and the next env sync removes it (`uv add <names>` keeps it)
   connects to <hosts> over the network
+  writes to <paths>, outside the project
   ```
 
-  The network clause is `connects to the network` when the L012 line says so.
+  The network clause is `connects to the network` when the L012 line says so, and the last
+  clause says `removes <paths>` (or `writes to <paths> and removes <paths>`) as the L013 line
+  does.
 
 ## Running code
 

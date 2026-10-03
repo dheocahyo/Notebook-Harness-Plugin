@@ -928,12 +928,7 @@ class _Scanner:
     ) -> None:
         """One shell command: a site when it downloads, clones, copies to or logs in to another
         machine, or is given a network URL."""
-        raws, words = list(raws), list(words)
-        while words and words[0].rsplit("/", 1)[-1] == "env":  # env [-i] [-u N] [K=v] cmd
-            raws, words = raws[1:], words[1:]
-            while words and (words[0].startswith("-") or "=" in words[0]):
-                skip = 2 if words[0] in _ENV_VALUE_OPTIONS else 1
-                raws, words = raws[skip:], words[skip:]
+        raws, words = _without_env(raws, words)
         if not words:
             return
         command = words[0].rsplit("/", 1)[-1].lower()
@@ -1076,6 +1071,17 @@ def _magic_starts(masked: Masked, lines: list[str]) -> dict[int, str]:
         if not text.lstrip().startswith("%%"):
             starts[number] = text
     return starts
+
+
+def _without_env(raws: list[str], words: list[str]) -> tuple[list[str], list[str]]:
+    """A command's words without an ``env [-i] [-u N] [K=v]`` prefix (L012 and L013)."""
+    raws, words = list(raws), list(words)
+    while words and words[0].rsplit("/", 1)[-1] == "env":  # env [-i] [-u N] [K=v] cmd
+        raws, words = raws[1:], words[1:]
+        while words and (words[0].startswith("-") or "=" in words[0]):
+            skip = 2 if words[0] in _ENV_VALUE_OPTIONS else 1
+            raws, words = raws[skip:], words[skip:]
+    return raws, words
 
 
 def _parse(text: str) -> ast.Module | None:

@@ -1,4 +1,4 @@
-"""Hard lint rules (L001–L012): what rejects a cell, or holds it for the user's yes, before anything
+"""Hard lint rules (L001–L013): what rejects a cell, or holds it for the user's yes, before anything
 is written."""
 
 from __future__ import annotations
@@ -669,10 +669,11 @@ def test_l009_text_scan_is_linear() -> None:
     assert issue.rule == "L009" and "`x`" in issue.question
 
 
-# One cell per rule that can ask (config.ASK_RULES): C5c adds its own here.
+# One cell per rule that can ask (config.ASK_RULES).
 ASK_SAMPLES = {
     "package_install": ("L009", "!pip install seaborn"),
     "network": ("L012", 'trips = pd.read_csv("https://data.example.org/trips-2023.csv")'),
+    "outside_write": ("L013", 'trips.to_csv("~/exports/trips.csv")'),
 }
 
 
@@ -680,7 +681,7 @@ ASK_SAMPLES = {
 def test_every_ask_rule_has_a_question(level: str) -> None:
     assert set(ASK_SAMPLES) == set(ASK_RULES)
     for key, (rule, code) in ASK_SAMPLES.items():
-        report = lint(code, cfg=config(**{key: level}))
+        report = lint(code, cfg=config(**{key: level}), project_root="/home/me/proj")
         [issue] = [i for i in report.errors + report.hints + report.asks if i.rule == rule]
         assert issue.question and not issue.question.endswith("."), key
 
@@ -1923,6 +1924,1435 @@ def test_l012_first_cell_with_a_url_asks_unless_its_host_is_approved() -> None:
     assert issue.question == "connects to `data.example.org` over the network"
     credentials = _first_cell_blocks()[1]  # the URL comes from .env: not network (default 12)
     assert network_issues(credentials) == []
+
+
+# L013 -------------------------------------------------------------------------------------------
+# Design §6.4 "L013 `outside_write`": its Sinks, "A path nh reads", Shell commands, Outside and
+# Exempt tables. Every entry of writes.py's hand-written tables has a row here that fails when
+# the entry is taken out (L013_EACH_ENTRY: a form only that entry decides); L013_QUIET holds what
+# never asks. The project is at ROOT and the notebook in its `notebooks/` folder unless a test says
+# otherwise.
+ROOT = "/home/me/proj"
+L013_FIX = (
+    "Keep the cell's files inside the project (for example under `data/processed/` or "
+    "`reports/`); ask the user before writing anywhere else."
+)
+
+
+def outside_issues(code: str, notebook_dir: str = "notebooks", **overrides: Any) -> list[Issue]:
+    overrides.setdefault("project_root", ROOT)
+    report = lint(code, notebook_dir=notebook_dir, **overrides)
+    return [i for i in report.errors + report.hints + report.asks if i.rule == "L013"]
+
+
+def outside_message(code: str, notebook_dir: str = "notebooks", **overrides: Any) -> str | None:
+    found = outside_issues(code, notebook_dir, **overrides)
+    return found[0].message if found else None
+
+
+def wrote(paths: str, where: str, more: int = 0) -> str:
+    """The message for writes only: ``paths`` as the clause names them."""
+    return f"The cell writes to {paths}, outside the project (`{where}`{_plus(more)})."
+
+
+def removed(paths: str, where: str, more: int = 0) -> str:
+    return f"The cell removes {paths}, outside the project (`{where}`{_plus(more)})."
+
+
+def moved(to: str, away: str, where: str, more: int = 1) -> str:
+    """A write and a removal: a move's destination and its source."""
+    return (
+        f"The cell writes to {to} and removes {away}, outside the project (`{where}`{_plus(more)})."
+    )
+
+
+def _plus(more: int) -> str:
+    return f" (+{more} more)" if more else ""
+
+
+OUT = "`/data/out.csv`"
+L013_FIRES = [
+    # the three ways out: `~`, an absolute path, `..` climbing above the root from notebooks/
+    ('trips.to_csv("~/exports/trips.csv")', wrote("`~/exports/trips.csv`", "trips.to_csv")),
+    ('trips.to_csv("~analyst/trips.csv")', wrote("`~analyst/trips.csv`", "trips.to_csv")),
+    ('trips.to_csv("~")', wrote("`~`", "trips.to_csv")),
+    ('trips.to_csv("/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("../../trips.csv")', wrote("`/home/me/trips.csv`", "trips.to_csv")),
+    ('trips.to_csv("../../../../../x.csv")', wrote("`/x.csv`", "trips.to_csv")),
+    ('trips.to_csv("./../.././trips.csv")', wrote("`/home/me/trips.csv`", "trips.to_csv")),
+    ('trips.to_csv("../data/../../trips.csv")', wrote("`/home/me/trips.csv`", "trips.to_csv")),
+    # an absolute path is resolved before it is compared; a sibling sharing the root's prefix is
+    # outside, and so are folders whose names start like an exempt one
+    (
+        'trips.to_csv("/home/me/proj/../other/x.csv")',
+        wrote("`/home/me/other/x.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv("/home/me/proj2/x.csv")', wrote("`/home/me/proj2/x.csv`", "trips.to_csv")),
+    ('trips.to_csv("/home/me/projx.csv")', wrote("`/home/me/projx.csv`", "trips.to_csv")),
+    ('trips.to_csv("/home/me")', wrote("`/home/me`", "trips.to_csv")),
+    ('trips.to_csv("/tmpdata/x.csv")', wrote("`/tmpdata/x.csv`", "trips.to_csv")),
+    ('trips.to_csv("/devices/x.csv")', wrote("`/devices/x.csv`", "trips.to_csv")),
+    ('trips.to_csv("/var/x.csv")', wrote("`/var/x.csv`", "trips.to_csv")),
+    ('trips.to_csv("/private/x.csv")', wrote("`/private/x.csv`", "trips.to_csv")),
+    # a leading `//`, which posixpath.normpath keeps, reads `/`
+    ('trips.to_csv("//data//out.csv")', wrote(OUT, "trips.to_csv")),
+    # file:// is its path
+    ('trips.to_csv("file:///data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("FILE:///data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("file://localhost/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    # through a name, in the cell: assigned, annotated, a default, a walrus, rebound last
+    ('OUT = "/data/out.csv"\ntrips.to_csv(OUT)', wrote(OUT, "trips.to_csv")),
+    ('OUT: str = "/data/out.csv"\ntrips.to_csv(OUT)', wrote(OUT, "trips.to_csv")),
+    ('def save(path="/data/out.csv"):\n    trips.to_csv(path)', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv(out := "/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('OUT = "x.csv"\nOUT = "/data/out.csv"\ntrips.to_csv(OUT)', wrote(OUT, "trips.to_csv")),
+    (
+        'EXPORTS = Path("/data/exports")\nOUT = EXPORTS / "trips.csv"\ntrips.to_csv(OUT)',
+        wrote("`/data/exports/trips.csv`", "trips.to_csv"),
+    ),
+    # Path joins and the string forms L012 renders
+    ('trips.to_csv(Path("/data") / "out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("/data" / Path("out.csv"))', wrote(OUT, "trips.to_csv")),
+    (
+        'trips.to_csv(Path("/data", "exports", "out.csv"))',
+        wrote("`/data/exports/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(Path("data") / "/abs/out.csv")', wrote("`/abs/out.csv`", "trips.to_csv")),
+    ('trips.to_csv(Path("..") / ".." / "out.csv")', wrote("`/home/me/out.csv`", "trips.to_csv")),
+    (
+        'trips.to_csv(Path("/data/").joinpath("a", "out.csv"))',
+        wrote("`/data/a/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(os.path.join("/data", "out.csv"))', wrote(OUT, "trips.to_csv")),
+    (
+        'trips.to_csv(os.path.join("..", "..", "out.csv"))',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(os.path.join("data", "/data/out.csv"))', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("/data" + "/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("%s/out.csv" % "/data")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("{}/out.csv".format("/data"))', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv("/".join(["", "data", "out.csv"]))', wrote(OUT, "trips.to_csv")),
+    ("trips.to_csv(f\"{'/data'}/out.csv\")", wrote(OUT, "trips.to_csv")),
+    ('D = "/data"\ntrips.to_csv(f"{D}/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv(str(Path("/data") / "out.csv"))', wrote(OUT, "trips.to_csv")),
+    # a path with unknown parts: the folder before the first one, shown with "/…"
+    ('trips.to_csv(f"/data/exports/{name}.csv")', wrote("`/data/exports/…`", "trips.to_csv")),
+    ('trips.to_csv(f"/data/{year}/{name}.csv")', wrote("`/data/…`", "trips.to_csv")),
+    ('trips.to_csv(f"~/{name}.csv")', wrote("`~/…`", "trips.to_csv")),
+    ('trips.to_csv(f"~{user}/x.csv")', wrote("`~…`", "trips.to_csv")),
+    ('trips.to_csv(f"../../exports/{name}.csv")', wrote("`/home/me/exports/…`", "trips.to_csv")),
+    ('trips.to_csv(Path("/data") / name)', wrote("`/data/…`", "trips.to_csv")),
+    ('trips.to_csv(os.path.join("/data", name, "x.csv"))', wrote("`/data/…`", "trips.to_csv")),
+    ('trips.to_csv("/data/" + name + ".csv")', wrote("`/data/…`", "trips.to_csv")),
+    # an unknown part stands for text within one folder name: these can't be in the project
+    ('trips.to_csv(f"/home/me/{name}.csv")', wrote("`/home/me/…`", "trips.to_csv")),
+    ('trips.to_csv(f"/home/{user}/x.csv")', wrote("`/home/…`", "trips.to_csv")),
+    ('trips.to_csv(f"/{name}.csv")', wrote("`/…`", "trips.to_csv")),
+    ('trips.to_csv(f"../../{name}.csv")', wrote("`/home/me/…`", "trips.to_csv")),
+    (
+        'for trip_id, group in trips.groupby("trip_id"):\n'
+        '    group.to_csv(f"../../trip_{trip_id}.csv")',
+        wrote("`/home/me/…`", "group.to_csv"),
+    ),
+    ('fig.savefig(f"../../{title}.png")', wrote("`/home/me/…`", "fig.savefig")),
+    (
+        'trips.to_csv(os.path.join("..", "..", f"{name}.csv"))',
+        wrote("`/home/me/…`", "trips.to_csv"),
+    ),
+    # the folder the cell is in
+    (
+        'trips.to_csv(Path.cwd().parent.parent / "out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    (
+        'trips.to_csv(Path(os.getcwd()).parent.parent / "out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(f"{os.getcwd()}/../../out.csv")', wrote("`/home/me/out.csv`", "trips.to_csv")),
+    (
+        'trips.to_csv(os.path.join("data", os.getcwd(), "../../out.csv"))',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(os.path.abspath("../../out.csv"))', wrote("`/home/me/out.csv`", "trips.to_csv")),
+    (
+        'trips.to_csv(Path("x.csv").resolve().parent.parent.parent / "out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(Path.home() / "out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    ('trips.to_csv(Path.home().parent / "out.csv")', wrote("`~/../out.csv`", "trips.to_csv")),
+    ('%cd /data\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    ('%cd /data/exports\n%cd ..\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    ('%cd ..\n%cd ..\ntrips.to_csv("out.csv")', wrote("`/home/me/out.csv`", "trips.to_csv")),
+    ('%cd ~\ntrips.to_csv("out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    ('%cd\ntrips.to_csv("out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    ('%cd -q /data\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    ('%pushd /data\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    # a `~` path doesn't start from the folder the cell moved to, and `~` is a folder to move to
+    ('%cd /data\ntrips.to_csv("~/out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    (
+        '%cd /data\n%cd ~/exports\ntrips.to_csv("out.csv")',
+        wrote("`~/exports/out.csv`", "trips.to_csv"),
+    ),
+    ('%cd\ntrips.to_csv(Path.cwd() / "out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    ("!cd /data && touch ~/out.csv", wrote("`~/out.csv`", "!touch")),
+    ('os.chdir("/data")\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    ('os.chdir(path="/data")\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    (
+        'os.chdir(Path.cwd().parent.parent)\ntrips.to_csv("out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    ('%cd /data\ntrips.to_csv(Path.cwd() / "out.csv")', wrote(OUT, "trips.to_csv")),
+    ('%cd /data/exports\ntrips.to_csv(Path.cwd().parent / "out.csv")', wrote(OUT, "trips.to_csv")),
+    (
+        '%cd sub\ntrips.to_csv(Path.cwd().parent.parent.parent / "out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    (
+        'trips.to_csv(Path.cwd().parent.parent.parent / "out.csv")',
+        wrote("`/home/out.csv`", "trips.to_csv"),
+    ),
+    # `/` is its own parent; a trailing `/` is no folder of its own
+    ('trips.to_csv(Path("/").parent / "data" / "out.csv")', wrote(OUT, "trips.to_csv")),
+    (
+        'trips.to_csv(Path("data/").parent / "../../x.csv")',
+        wrote("`/home/me/x.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(os.path.abspath("~/x.csv"))', wrote("`~/x.csv`", "trips.to_csv")),
+    ('DEST = "/data"\n%cd $DEST\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    ('DEST = "/data"\n%cd {DEST}\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    # defining a function runs nothing: a chdir in its body moves only the rest of that body
+    (
+        'def enter_sub():\n    os.chdir("sub/deeper")\n\ntrips.to_csv("../../x.csv")',
+        wrote("`/home/me/x.csv`", "trips.to_csv"),
+    ),
+    (
+        'go = lambda: os.chdir("sub/deeper")\ntrips.to_csv("../../x.csv")',
+        wrote("`/home/me/x.csv`", "trips.to_csv"),
+    ),
+    ('def go():\n    os.chdir("/data")\n    trips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+    # `with contextlib.chdir(…):` moves the folder for its body only
+    (
+        'from contextlib import chdir\nwith chdir("/data"):\n    trips.to_csv("out.csv")',
+        wrote(OUT, "trips.to_csv"),
+    ),
+    (
+        'with contextlib.chdir("../.."):\n    trips.to_csv("x.csv")',
+        wrote("`/home/me/x.csv`", "trips.to_csv"),
+    ),
+    (
+        'with contextlib.chdir(path="/data") as here, open("out.csv", "w") as f:\n    f.write("1")',
+        wrote(OUT, "open"),
+    ),
+    (
+        'with contextlib.chdir("sub/deeper"):\n    pass\ntrips.to_csv("../../x.csv")',
+        wrote("`/home/me/x.csv`", "trips.to_csv"),
+    ),
+    (
+        'HERE = Path.cwd()\n%cd /x\ntrips.to_csv(HERE / "../../out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    # Python run elsewhere in the cell
+    ('%timeit open("/data/out.csv", "w")', wrote(OUT, "open")),
+    ('%%time\ntrips.to_csv("/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('with open("/data/out.csv", "w") as f:\n    f.write("x")', wrote(OUT, "open")),
+    ('if ok:\n    trips.to_csv("/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('def save():\n    trips.to_csv("/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    (
+        'class Saver:\n    def save(self):\n        trips.to_csv("/data/out.csv")',
+        wrote(OUT, "trips.to_csv"),
+    ),
+    ('save = lambda: trips.to_csv("/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    ('for t in tables:\n    t.to_csv("/data/out.csv")', wrote(OUT, "t.to_csv")),
+    ('trips.dropna().to_csv("/data/out.csv")', wrote(OUT, "trips.dropna().to_csv")),
+    ('pickle.dump(obj, open("/data/out.csv", "wb"))', wrote(OUT, "open")),
+    (
+        'get_ipython().run_cell_magic("time", "", "x = 1\\ntrips.to_csv(\'/data/out.csv\')")',
+        wrote(OUT, "get_ipython().run_cell_magic"),
+    ),
+    # a function the cell defines: a call writes what its body writes, with its arguments
+    (
+        'def export(frame, path):\n    frame.to_csv(path, index=False)\nexport(trips, "~/trips.csv")',
+        wrote("`~/trips.csv`", "export"),
+    ),
+    (
+        'def export(frame, path):\n    frame.to_csv(path)\nexport(trips, path="/data/out.csv")',
+        wrote(OUT, "export"),
+    ),
+    ('save = lambda frame, p: frame.to_csv(p)\nsave(trips, "/data/out.csv")', wrote(OUT, "save")),
+    (
+        'def export(frame, name):\n    frame.to_csv(os.path.join("/data", name))\n'
+        'export(trips, "out.csv")',
+        wrote(OUT, "export"),
+    ),
+    (  # a join restarts at an absolute argument
+        'def export(frame, name):\n    frame.to_csv(os.path.join("../data", name))\n'
+        'export(trips, "/data/out.csv")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, folder):\n    frame.to_csv(Path(folder) / "out.csv")\n'
+        'export(trips, "/data")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, folder):\n    frame.to_csv(f"{folder}/out.csv")\nexport(trips, "/data")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, folder):\n    folder = Path(folder)\n    path = folder / "out.csv"\n'
+        '    frame.to_csv(path)\nexport(trips, "/data")',
+        wrote(OUT, "export"),
+    ),
+    (
+        "def export(frame, path):\n    frame.to_csv(path)\ndef publish(frame, path):\n"
+        '    export(frame, path)\npublish(trips, "/data/out.csv")',
+        wrote(OUT, "publish"),
+    ),
+    (
+        "def publish(frame, path):\n    def export():\n        frame.to_csv(path)\n    export()\n"
+        'publish(trips, "/data/out.csv")',
+        wrote(OUT, "publish"),
+    ),
+    (  # the default, where it is defined and at a call that leaves it out
+        'def export(frame, path="/data/out.csv"):\n    frame.to_csv(path)\nexport(trips)',
+        wrote(OUT, "frame.to_csv", 1),
+    ),
+    (
+        'def export(frame, path="../data/x.csv"):\n    frame.to_csv(path)\n'
+        'export(trips, "/data/out.csv")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, *, path):\n    frame.to_csv(path)\nexport(trips, path="/data/out.csv")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, path, /):\n    frame.to_csv(path)\nexport(trips, "/data/out.csv")',
+        wrote(OUT, "export"),
+    ),
+    ('def save(path, mode="w"):\n    open(path, mode)\nsave("/data/out.csv")', wrote(OUT, "save")),
+    ('def copy(path):\n    !cp a.csv {path}\ncopy("/data/out.csv")', wrote(OUT, "copy")),
+    ('def drop(path):\n    shutil.rmtree(path)\ndrop("/data/old")', removed("`/data/old`", "drop")),
+    (  # the body's own move, then the call's folder
+        'def export(frame, name):\n    os.chdir("/data")\n    frame.to_csv(name)\n'
+        'export(trips, "out.csv")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, name):\n    frame.to_csv(name)\n%cd /data\nexport(trips, "out.csv")',
+        wrote(OUT, "export"),
+    ),
+    (
+        'def export(frame, folder, name="x.csv"):\n    frame.to_csv(f"{folder}/{name}")\n'
+        'export(trips, "/data", *names)',
+        wrote("`/data/…`", "export"),
+    ),
+    (  # one path a body writes twice is one site; the first sink names it
+        'def export(frame, path="/data/out.csv"):\n    frame.to_csv(path)\n'
+        "    frame.to_parquet(path)",
+        wrote(OUT, "frame.to_csv"),
+    ),
+    ('def bench(path):\n    %timeit open(path, "w")\nbench("/data/out.csv")', wrote(OUT, "bench")),
+    (  # a parameter is the body's own: the cell's name of the same name holds after it
+        'OUT = "/data/out.csv"\ndef export(OUT):\n    pass\ntrips.to_csv(OUT)',
+        wrote(OUT, "trips.to_csv"),
+    ),
+    (
+        'def export(frame, folder, name="x.csv"):\n    frame.to_csv(f"{folder}/{name}")\n'
+        'export(trips, "/data", **options)',
+        wrote("`/data/…`", "export"),
+    ),
+    # a scan that would raise on one line still reads the rest
+    ('f = open("/data/a.csv", mode)\ntrips.to_csv("/data/out.csv")', wrote(OUT, "trips.to_csv")),
+    (
+        '!curl https://h.org/x.csv --output\ntrips.to_csv("/data/out.csv")',
+        wrote(OUT, "trips.to_csv"),
+    ),
+    # shell lines in every form L012 reads
+    ("!touch /data/out.csv", wrote(OUT, "!touch")),
+    ("!!touch /data/out.csv", wrote(OUT, "!touch")),
+    ("files = !touch /data/out.csv && ls", wrote(OUT, "!touch")),
+    ("%sx touch /data/out.csv", wrote(OUT, "%sx touch")),
+    ("%system touch /data/out.csv", wrote(OUT, "%system touch")),
+    ("%%bash\ntouch /data/out.csv", wrote(OUT, "touch")),
+    ("%%sh\necho x > /data/out.csv", wrote(OUT, "echo >")),
+    ("%%script bash\ntouch /data/out.csv", wrote(OUT, "touch")),
+    ('os.system("touch /data/out.csv")', wrote(OUT, "os.system")),
+    ('os.popen("cp a.csv /data/out.csv")', wrote(OUT, "os.popen")),
+    ('subprocess.run(["touch", "/data/out.csv"])', wrote(OUT, "subprocess.run")),
+    ('subprocess.run("touch /data/out.csv", shell=True)', wrote(OUT, "subprocess.run")),
+    ('get_ipython().system("touch /data/out.csv")', wrote(OUT, "get_ipython().system")),
+    ("!bash -c 'touch /data/out.csv'", wrote(OUT, "!touch")),
+    ("!echo $(touch /data/out.csv)", wrote(OUT, "!touch")),
+    ("!sudo rm -rf /data/old", removed("`/data/old`", "!rm")),
+    ("!env -i HOME=/x touch /data/out.csv", wrote(OUT, "!touch")),
+    ("!A=1 touch /data/out.csv", wrote(OUT, "!touch")),
+    ("!/usr/bin/touch /data/out.csv", wrote(OUT, "!touch")),
+    ("!TOUCH /data/out.csv", wrote(OUT, "!touch")),
+    ('!touch "/data/my file.csv"', wrote("`/data/my file.csv`", "!touch")),
+    ("!touch '~/x.csv'", wrote("`~/x.csv`", "!touch")),
+    # the folder a shell line is in: a `cd` holds for the rest of its line, or of a shell cell
+    ("!cd /data && touch out.csv", wrote(OUT, "!touch")),
+    ("!cd /data; touch out.csv", wrote(OUT, "!touch")),
+    ("!cd ~ && touch out.csv", wrote("`~/out.csv`", "!touch")),
+    ("!cd && touch out.csv", wrote("`~/out.csv`", "!touch")),
+    ("!cd .. && cd .. && touch out.csv", wrote("`/home/me/out.csv`", "!touch")),
+    ("!pushd /data && touch out.csv", wrote(OUT, "!touch")),
+    ("%%bash\ncd /data\ntouch out.csv", wrote(OUT, "touch")),
+    ("%%bash\ncd $HOME\ntouch out.csv", wrote("`~/out.csv`", "touch")),
+    ("%%sh\necho x > ../../out.csv", wrote("`/home/me/out.csv`", "echo >")),
+    ("%cd /data\n!touch out.csv", wrote(OUT, "!touch")),
+    ('os.chdir("/data")\nos.system("touch out.csv")', wrote(OUT, "os.system")),
+    ("!cd /data && python -c \"open('out.csv', 'w')\"", wrote(OUT, "!python -c")),
+    # a subshell's glued `(` and `)` come off; its `cd` holds until its `)`
+    ("!(cd /data && touch out.csv)", wrote(OUT, "!touch")),
+    ("!(cd ~/Desktop && touch out.csv)", wrote("`~/Desktop/out.csv`", "!touch")),
+    ("!(cp a.csv /data/out.csv)", wrote(OUT, "!cp")),
+    ("!(mkdir -p /data/out.csv)", wrote(OUT, "!mkdir")),
+    ("%%bash\n(cd /data && echo a > out.csv)", wrote(OUT, "echo >")),
+    ("!(cd /data && make) && cd /data && touch out.csv", wrote(OUT, "!touch")),
+    ('!(cd /data && touch "a(b") && touch x.csv', wrote("`/data/a(b`", "!touch")),
+    (
+        'os.chdir("/data")\nget_ipython().run_cell_magic("bash", "", "touch out.csv")',
+        wrote(OUT, "get_ipython().run_cell_magic"),
+    ),
+    # IPython fills a `!` line's {name} and $name from Python names holding a path
+    ('DEST = "/data"\n!cp a.csv {DEST}/out.csv', wrote(OUT, "!cp")),
+    ('DEST = "/data"\n!cp a.csv $DEST/out.csv', wrote(OUT, "!cp")),
+    ("!touch $HOME/out.csv", wrote("`~/out.csv`", "!touch")),
+    ("!touch ${HOME}/out.csv", wrote("`~/out.csv`", "!touch")),
+    ("!touch $HOME/$NAME.csv", wrote("`~/…`", "!touch")),
+    ("%%bash\ntouch $HOME/out.csv", wrote("`~/out.csv`", "touch")),
+    ("HERE = os.getcwd()\n!touch {HERE}/../../out.csv", wrote("`/home/me/out.csv`", "!touch")),
+    # %%writefile and its call form
+    ("%%writefile /data/out.py\nx = 1", wrote("`/data/out.py`", "%%writefile")),
+    ("%%writefile -a ~/notes.py\nx = 1", wrote("`~/notes.py`", "%%writefile")),
+    ("%%file /data/out.py\nx = 1", wrote("`/data/out.py`", "%%file")),
+    ("%%writefile ../../out.py\nx = 1", wrote("`/home/me/out.py`", "%%writefile")),
+    ('%%writefile "/data/my file.py"\nx = 1', wrote("`/data/my file.py`", "%%writefile")),
+    ("%%writefile $HOME/notes.py\nx = 1", wrote("`~/notes.py`", "%%writefile")),
+    (
+        'get_ipython().run_cell_magic("writefile", "/data/out.py", "x = 1")',
+        wrote("`/data/out.py`", "get_ipython().run_cell_magic"),
+    ),
+    (
+        'get_ipython().run_cell_magic("file", "-a /data/out.py", "x = 1")',
+        wrote("`/data/out.py`", "get_ipython().run_cell_magic"),
+    ),
+    (
+        'get_ipython().run_cell_magic("bash", "", "touch /data/out.csv")',
+        wrote(OUT, "get_ipython().run_cell_magic"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("code", "message"), L013_FIRES)
+def test_l013_fires(code: str, message: str) -> None:
+    assert outside_message(code) == message
+
+
+# Each sink, value form and shell command writes.py lists, in a form only its entry makes fire.
+L013_EACH_ENTRY = [
+    # frame and series writers, each, then each path keyword
+    *[
+        (f'trips.{method}("/data/out.csv")', wrote(OUT, f"trips.{method}"))
+        for method in [
+            "to_csv",
+            "to_parquet",
+            "to_excel",
+            "to_pickle",
+            "to_json",
+            "to_feather",
+            "to_hdf",
+            "to_stata",
+            "to_html",
+            "to_latex",
+            "to_markdown",
+            "to_xml",
+            "to_orc",
+            "to_netcdf",
+            "to_zarr",
+            "to_file",
+        ]
+    ],
+    ('writer = pd.ExcelWriter("/data/out.csv")', wrote(OUT, "pd.ExcelWriter")),
+    (
+        'from pandas import ExcelWriter\nwriter = ExcelWriter("/data/out.csv")',
+        wrote(OUT, "ExcelWriter"),
+    ),
+    *[
+        (f'trips.to_csv({keyword}="/data/out.csv")', wrote(OUT, "trips.to_csv"))
+        for keyword in [
+            "path",
+            "path_or_buf",
+            "path_or_buffer",
+            "buf",
+            "excel_writer",
+            "fname",
+            "filename",
+            "store",
+            "file",
+        ]
+    ],
+    # polars' writers and sinks, plotly's write_image; each keyword
+    ('pl_trips.write_parquet("/data/out.csv")', wrote(OUT, "pl_trips.write_parquet")),
+    ('fig.write_image("/data/out.csv")', wrote(OUT, "fig.write_image")),
+    ('lazy.sink_csv("/data/out.csv")', wrote(OUT, "lazy.sink_csv")),
+    ('from helpers import write_text\nwrite_text("/data/out.csv", "x")', wrote(OUT, "write_text")),
+    *[
+        (f'pl_trips.write_csv({keyword}="/data/out.csv")', wrote(OUT, "pl_trips.write_csv"))
+        for keyword in ["file", "path", "target", "workbook", "fname", "filename"]
+    ],
+    # saves, each, then each keyword; a function imported by name
+    *[
+        (f'thing.{method}("/data/out.csv")', wrote(OUT, f"thing.{method}"))
+        for method in [
+            "savefig",
+            "save",
+            "save_model",
+            "save_weights",
+            "save_pretrained",
+            "save_to_disk",
+            "to_disk",
+            "tofile",
+        ]
+    ],
+    *[
+        (f'fig.savefig({keyword}="/data/out.csv")', wrote(OUT, "fig.savefig"))
+        for keyword in [
+            "fname",
+            "fp",
+            "filepath",
+            "filename",
+            "file",
+            "path",
+            "save_directory",
+            "dataset_path",
+        ]
+    ],
+    ('from matplotlib.pyplot import savefig\nsavefig("/data/out.csv")', wrote(OUT, "savefig")),
+    # a Spark frame's writer: each method, each setting before it, the keyword
+    *[
+        (f'sdf.write.{method}("/data/out.csv")', wrote(OUT, f"sdf.write.{method}"))
+        for method in ["csv", "parquet", "json", "orc", "text"]
+    ],
+    *[
+        (f'sdf.write.{step}(x).csv("/data/out.csv")', wrote(OUT, f"sdf.write.{step}().csv"))
+        for step in ["mode", "option", "options", "format", "partitionBy", "bucketBy", "sortBy"]
+    ],
+    ('sdf.write.csv(path="/data/out.csv")', wrote(OUT, "sdf.write.csv")),
+    # functions by name: each, and each keyword
+    ('np.savez("/data/out.csv", a=a)', wrote(OUT, "np.savez")),
+    ('np.savez(file="/data/out.csv", a=a)', wrote(OUT, "np.savez")),
+    ('np.savez_compressed("/data/out.csv", a=a)', wrote(OUT, "np.savez_compressed")),
+    ('np.savez_compressed(file="/data/out.csv", a=a)', wrote(OUT, "np.savez_compressed")),
+    ('np.savetxt("/data/out.csv", a)', wrote(OUT, "np.savetxt")),
+    ('np.savetxt(fname="/data/out.csv", X=a)', wrote(OUT, "np.savetxt")),
+    ('np.save("/data/out.csv", a)', wrote(OUT, "np.save")),
+    # images, sound, matrices and log files: the first argument, or its keyword
+    ('import matplotlib.pyplot as mpl\nmpl.imsave("/data/out.csv", a)', wrote(OUT, "mpl.imsave")),
+    ('plt.imsave(fname="/data/out.csv", arr=a)', wrote(OUT, "plt.imsave")),
+    ('from matplotlib import image\nimage.imsave("/data/out.csv", a)', wrote(OUT, "image.imsave")),
+    (
+        'from matplotlib import image\nimage.imsave(fname="/data/out.csv", arr=a)',
+        wrote(OUT, "image.imsave"),
+    ),
+    ('cv2.imwrite("/data/out.csv", img)', wrote(OUT, "cv2.imwrite")),
+    ('cv2.imwrite(filename="/data/out.csv", img=img)', wrote(OUT, "cv2.imwrite")),
+    ('imageio.imwrite("/data/out.csv", img)', wrote(OUT, "imageio.imwrite")),
+    ('import imageio.v2 as iio\niio.imwrite("/data/out.csv", img)', wrote(OUT, "iio.imwrite")),
+    (
+        'import imageio.v3 as iio\niio.imwrite(uri="/data/out.csv", image=img)',
+        wrote(OUT, "iio.imwrite"),
+    ),
+    ('from skimage import io\nio.imsave("/data/out.csv", img)', wrote(OUT, "io.imsave")),
+    ('from skimage import io\nio.imsave(fname="/data/out.csv", arr=img)', wrote(OUT, "io.imsave")),
+    ('import scipy.io\nscipy.io.savemat("/data/out.csv", d)', wrote(OUT, "scipy.io.savemat")),
+    (
+        'import scipy.io\nscipy.io.savemat(file_name="/data/out.csv", mdict=d)',
+        wrote(OUT, "scipy.io.savemat"),
+    ),
+    (
+        'from scipy.io import wavfile\nwavfile.write("/data/out.csv", 44100, data)',
+        wrote(OUT, "wavfile.write"),
+    ),
+    (
+        'from scipy.io import wavfile\nwavfile.write(filename="/data/out.csv", rate=1, data=d)',
+        wrote(OUT, "wavfile.write"),
+    ),
+    ('import soundfile as sf\nsf.write("/data/out.csv", data, 44100)', wrote(OUT, "sf.write")),
+    (
+        'import soundfile as sf\nsf.write(file="/data/out.csv", data=d, samplerate=1)',
+        wrote(OUT, "sf.write"),
+    ),
+    *[
+        (
+            f'import logging.handlers\nh = logging.{handler}("/data/out.csv")',
+            wrote(OUT, f"logging.{handler}"),
+        )
+        for handler in [
+            "FileHandler",
+            "handlers.RotatingFileHandler",
+            "handlers.TimedRotatingFileHandler",
+            "handlers.WatchedFileHandler",
+        ]
+    ],
+    ('h = logging.FileHandler(filename="/data/out.csv")', wrote(OUT, "logging.FileHandler")),
+    ('logging.basicConfig(filename="/data/out.csv")', wrote(OUT, "logging.basicConfig")),
+    ('joblib.dump(model, "/data/out.csv")', wrote(OUT, "joblib.dump")),
+    ('joblib.dump(model, filename="/data/out.csv")', wrote(OUT, "joblib.dump")),
+    ('pickle.dump(obj, "/data/out.csv")', wrote(OUT, "pickle.dump")),
+    ('pickle.dump(obj, file="/data/out.csv")', wrote(OUT, "pickle.dump")),
+    ('torch.save(state, "/data/out.csv")', wrote(OUT, "torch.save")),
+    ('torch.save(state, f="/data/out.csv")', wrote(OUT, "torch.save")),
+    ('pd.to_pickle(trips, "/data/out.csv")', wrote(OUT, "pd.to_pickle")),
+    (
+        'import pandas\npandas.to_pickle(trips, filepath_or_buffer="/data/out.csv")',
+        wrote(OUT, "pandas.to_pickle"),
+    ),
+    ('tf.saved_model.save(model, "/data/out.csv")', wrote(OUT, "tf.saved_model.save")),
+    (
+        'import tensorflow\ntensorflow.saved_model.save(model, export_dir="/data/out.csv")',
+        wrote(OUT, "tensorflow.saved_model.save"),
+    ),
+    ('torch.onnx.export(model, x, "/data/out.csv")', wrote(OUT, "torch.onnx.export")),
+    ('torch.onnx.export(model, x, f="/data/out.csv")', wrote(OUT, "torch.onnx.export")),
+    (
+        'import pyarrow.parquet as pq\npq.write_table(table, "/data/out.csv")',
+        wrote(OUT, "pq.write_table"),
+    ),
+    (
+        'import pyarrow.parquet as pq\npq.write_table(table, where="/data/out.csv")',
+        wrote(OUT, "pq.write_table"),
+    ),
+    (
+        'from pyarrow import feather\nfeather.write_feather(table, "/data/out.csv")',
+        wrote(OUT, "feather.write_feather"),
+    ),
+    (
+        'from pyarrow import feather\nfeather.write_feather(table, dest="/data/out.csv")',
+        wrote(OUT, "feather.write_feather"),
+    ),
+    ('from pyarrow import csv\ncsv.write_csv(table, "/data/out.csv")', wrote(OUT, "csv.write_csv")),
+    (
+        'from pyarrow import csv\ncsv.write_csv(table, output_file="/data/out.csv")',
+        wrote(OUT, "csv.write_csv"),
+    ),
+    ('urllib.request.urlretrieve(URL, "/data/out.csv")', wrote(OUT, "urllib.request.urlretrieve")),
+    (
+        'from urllib.request import urlretrieve\nurlretrieve(URL, filename="/data/out.csv")',
+        wrote(OUT, "urlretrieve"),
+    ),
+    *[
+        (f'{function}("a.csv", "/data/out.csv")', wrote(OUT, function))
+        for function in [
+            "shutil.copy",
+            "shutil.copy2",
+            "shutil.copyfile",
+            "shutil.copytree",
+            "os.symlink",
+            "os.link",
+        ]
+    ],
+    *[
+        (f'{function}("a.csv", dst="/data/out.csv")', wrote(OUT, function))
+        for function in [
+            "shutil.copy",
+            "shutil.copy2",
+            "shutil.copyfile",
+            "shutil.copytree",
+            "os.symlink",
+            "os.link",
+        ]
+    ],
+    *[
+        (f'{function}("/data/a.csv", "/data/out.csv")', moved(OUT, "`/data/a.csv`", function))
+        for function in ["shutil.move", "os.rename", "os.replace", "os.renames"]
+    ],
+    *[
+        (
+            f'{function}(src="/data/a.csv", dst="/data/out.csv")',
+            moved(OUT, "`/data/a.csv`", function),
+        )
+        for function in ["shutil.move", "os.rename", "os.replace"]
+    ],
+    (
+        'os.renames(old="/data/a.csv", new="/data/out.csv")',
+        moved(OUT, "`/data/a.csv`", "os.renames"),
+    ),
+    ('os.rename("/data/a.csv", "b.csv")', removed("`/data/a.csv`", "os.rename")),
+    ('os.mkdir("/data/out.csv")', wrote(OUT, "os.mkdir")),
+    ('os.mkdir(path="/data/out.csv")', wrote(OUT, "os.mkdir")),
+    ('os.makedirs("/data/out.csv", exist_ok=True)', wrote(OUT, "os.makedirs")),
+    ('os.makedirs(name="/data/out.csv")', wrote(OUT, "os.makedirs")),
+    ('shutil.make_archive("/data/out.csv", "zip", ".")', wrote(OUT, "shutil.make_archive")),
+    (
+        'shutil.make_archive(base_name="/data/out.csv", format="zip")',
+        wrote(OUT, "shutil.make_archive"),
+    ),
+    *[
+        (f'{function}("/data/old")', removed("`/data/old`", function))
+        for function in ["os.remove", "os.unlink", "os.rmdir", "os.removedirs", "shutil.rmtree"]
+    ],
+    *[
+        (f'{function}(path="/data/old")', removed("`/data/old`", function))
+        for function in ["os.remove", "os.unlink", "os.rmdir", "shutil.rmtree"]
+    ],
+    ('os.removedirs(name="/data/old")', removed("`/data/old`", "os.removedirs")),
+    ('import shutil as sh\nsh.rmtree("/data/old")', removed("`/data/old`", "sh.rmtree")),
+    # opens with a mode: each opener, each keyword, each mode letter
+    *[
+        (f'f = {opener}("/data/out.csv", "w")', wrote(OUT, opener))
+        for opener in [
+            "open",
+            "io.open",
+            "builtins.open",
+            "codecs.open",
+            "gzip.open",
+            "bz2.open",
+            "lzma.open",
+            "tarfile.open",
+            "zipfile.ZipFile",
+        ]
+    ],
+    ('f = open(file="/data/out.csv", mode="w")', wrote(OUT, "open")),
+    ('f = gzip.open(filename="/data/out.csv", mode="wt")', wrote(OUT, "gzip.open")),
+    ('f = tarfile.open(name="/data/out.csv", mode="w:gz")', wrote(OUT, "tarfile.open")),
+    ('f = tarfile.open("/data/out.csv", "x:xz")', wrote(OUT, "tarfile.open")),
+    ('f = tarfile.open("/data/out.csv", "a|")', wrote(OUT, "tarfile.open")),
+    *[
+        (f'f = open("/data/out.csv", "{mode}")', wrote(OUT, "open"))
+        for mode in ["w", "a", "x", "r+", "wb", "ab", "xt", "rb+"]
+    ],
+    ('f = open("/data/out.csv", mode="a")', wrote(OUT, "open")),
+    ('MODE = "w"\nf = open("/data/out.csv", MODE)', wrote(OUT, "open")),
+    ('f = open("/data/out.csv", f"{kind}w")', wrote(OUT, "open")),
+    # a path's own methods
+    *[
+        (f'Path("/data/out.csv").{method}(x)', wrote(OUT, f"Path().{method}"))
+        for method in ["write_text", "write_bytes", "symlink_to", "hardlink_to"]
+    ],
+    *[
+        (f'Path("/data/out.csv").{method}()', wrote(OUT, f"Path().{method}"))
+        for method in ["touch", "mkdir"]
+    ],
+    *[
+        (f'Path("/data/old").{method}()', removed("`/data/old`", f"Path().{method}"))
+        for method in ["unlink", "rmdir"]
+    ],
+    *[
+        (
+            f'Path("/data/a.csv").{method}("/data/out.csv")',
+            moved(OUT, "`/data/a.csv`", f"Path().{method}"),
+        )
+        for method in ["rename", "replace"]
+    ],
+    ('Path("a.csv").rename(target="/data/out.csv")', wrote(OUT, "Path().rename")),
+    ('Path("/data/out.csv").open("w")', wrote(OUT, "Path().open")),
+    ('Path("/data/out.csv").open(mode="a")', wrote(OUT, "Path().open")),
+    ('p = Path("/data/out.csv")\nwith p.open("x") as f:\n    f.write("1")', wrote(OUT, "p.open")),
+    # each value form
+    *[
+        (f'trips.to_csv(pathlib.{kind}("/data", "out.csv"))', wrote(OUT, "trips.to_csv"))
+        for kind in ["Path", "PurePath", "PosixPath", "PurePosixPath"]
+    ],
+    ('%cd /data\ntrips.to_csv(Path() / "out.csv")', wrote(OUT, "trips.to_csv")),
+    *[
+        (f'trips.to_csv({join}("/data", "out.csv"))', wrote(OUT, "trips.to_csv"))
+        for join in ["os.path.join", "posixpath.join"]
+    ],
+    *[
+        (f'trips.to_csv({same}("/data/out.csv"))', wrote(OUT, "trips.to_csv"))
+        for same in [
+            "os.path.expanduser",
+            "os.path.normpath",
+            "posixpath.expanduser",
+            "posixpath.normpath",
+            "os.fspath",
+        ]
+    ],
+    ('trips.to_csv(str(Path("/data/out.csv")))', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv(Path("/data/out.csv").expanduser())', wrote(OUT, "trips.to_csv")),
+    *[
+        (f'trips.to_csv({absolute}("../../out.csv"))', wrote("`/home/me/out.csv`", "trips.to_csv"))
+        for absolute in [
+            "os.path.abspath",
+            "os.path.realpath",
+            "posixpath.abspath",
+            "posixpath.realpath",
+        ]
+    ],
+    *[
+        (
+            f'trips.to_csv(Path("x.csv").{method}().parent.parent.parent / "out.csv")',
+            wrote("`/home/me/out.csv`", "trips.to_csv"),
+        )
+        for method in ["resolve", "absolute"]
+    ],
+    *[
+        (
+            f'trips.to_csv({dirname}("/data/sub/x.csv") + "/out.csv")',
+            wrote("`/data/sub/out.csv`", "trips.to_csv"),
+        )
+        for dirname in ["os.path.dirname", "posixpath.dirname"]
+    ],
+    (
+        'trips.to_csv(os.path.join(os.path.dirname(os.getcwd()), "..", "out.csv"))',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    ('trips.to_csv(Path("/data/exports").parent / "out.csv")', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv(Path("/data/x.csv").with_name("out.csv"))', wrote(OUT, "trips.to_csv")),
+    ('trips.to_csv(Path("/data/out.tsv").with_suffix(".csv"))', wrote(OUT, "trips.to_csv")),
+    *[
+        (f'trips.to_csv({home}() / "out.csv")', wrote("`~/out.csv`", "trips.to_csv"))
+        for home in ["pathlib.Path.home", "pathlib.PosixPath.home"]
+    ],
+    *[
+        (
+            f'trips.to_csv({cwd}().parent.parent / "out.csv")',
+            wrote("`/home/me/out.csv`", "trips.to_csv"),
+        )
+        for cwd in ["pathlib.Path.cwd", "pathlib.PosixPath.cwd"]
+    ],
+    (
+        'trips.to_csv(Path(os.getcwd()).parent.parent / "out.csv")',
+        wrote("`/home/me/out.csv`", "trips.to_csv"),
+    ),
+    *[
+        (f'trips.to_csv({read}("HOME") + "/out.csv")', wrote("`~/out.csv`", "trips.to_csv"))
+        for read in ["os.getenv", "os.environ.get"]
+    ],
+    ('trips.to_csv(os.environ["HOME"] + "/out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    ('trips.to_csv(os.path.expanduser("~") + "/out.csv")', wrote("`~/out.csv`", "trips.to_csv")),
+    # shell commands: each, and each option nh reads
+    ("!echo x | tee /data/out.csv", wrote(OUT, "!tee")),
+    (
+        "!echo x | tee -a /data/a.csv /data/out.csv",
+        wrote("`/data/a.csv` and `/data/out.csv`", "!tee", 1),
+    ),
+    ("!mkdir -p /data/out.csv", wrote(OUT, "!mkdir")),
+    ("!touch /data/out.csv", wrote(OUT, "!touch")),
+    ("!rm -rf /data/old", removed("`/data/old`", "!rm")),
+    ("!rmdir /data/old", removed("`/data/old`", "!rmdir")),
+    ("!unlink /data/old", removed("`/data/old`", "!unlink")),
+    ("!cp a.csv /data/out.csv", wrote(OUT, "!cp")),
+    ("!cp -r a b /data/out.csv", wrote(OUT, "!cp")),
+    ("!cp -t /data/out.csv a.csv b.csv", wrote(OUT, "!cp")),
+    ("!cp --target-directory=/data/out.csv a.csv", wrote(OUT, "!cp")),
+    ("!cp --target-directory /data/out.csv a.csv", wrote(OUT, "!cp")),
+    ("!cp -- a.csv /data/out.csv", wrote(OUT, "!cp")),
+    ("!cp -- -S /data/out.csv", wrote(OUT, "!cp")),  # after `--`, `-S` is a file, not an option
+    ("!mv /data/a.csv /data/out.csv", moved(OUT, "`/data/a.csv`", "!mv")),
+    ("!mv -S .bak a.csv /data/out.csv", wrote(OUT, "!mv")),
+    ("!mv -bS /x/.bak a.csv /data/out.csv", wrote(OUT, "!mv")),
+    ("!mv --suffix /x/.bak a.csv /data/out.csv", wrote(OUT, "!mv")),
+    ("!mv --suffix=/x/.bak a.csv /data/out.csv", wrote(OUT, "!mv")),
+    ("!mv /data/a.csv b.csv", removed("`/data/a.csv`", "!mv")),
+    ("!ln -s a.csv /data/out.csv", wrote(OUT, "!ln")),
+    ("!rsync -av a.csv /data/out.csv", wrote(OUT, "!rsync")),
+    ("!curl -o /data/out.csv https://h.org/x.csv", wrote(OUT, "!curl")),
+    ("!curl -sLo /data/out.csv https://h.org/x.csv", wrote(OUT, "!curl")),
+    ("!curl -o/data/out.csv https://h.org/x.csv", wrote(OUT, "!curl")),
+    ("!curl --output /data/out.csv https://h.org/x.csv", wrote(OUT, "!curl")),
+    ("!curl --output=/data/out.csv https://h.org/x.csv", wrote(OUT, "!curl")),
+    ("!curl --output-dir /data/out.csv -O https://h.org/x.csv", wrote(OUT, "!curl")),
+    ("!wget -O /data/out.csv https://h.org/x.csv", wrote(OUT, "!wget")),
+    ("!wget -qO/data/out.csv https://h.org/x.csv", wrote(OUT, "!wget")),
+    ("!wget --output-document=/data/out.csv https://h.org/x.csv", wrote(OUT, "!wget")),
+    ("!wget -P /data/out.csv https://h.org/x.csv", wrote(OUT, "!wget")),
+    ("!wget --directory-prefix /data/out.csv https://h.org/x.csv", wrote(OUT, "!wget")),
+    ("!dd if=/dev/zero of=/data/out.csv bs=1k count=1", wrote(OUT, "!dd")),
+    ("!zip -r /data/out.csv data", wrote(OUT, "!zip")),
+    ("!zip ../data/a.zip more.csv -O /data/out.csv", wrote(OUT, "!zip")),
+    ("!zip --output-file=/data/out.csv data.zip more.csv", wrote(OUT, "!zip")),
+    ("!jupyter nbconvert --to html a.ipynb --output-dir /data/out.csv", wrote(OUT, "!jupyter")),
+    ("!jupyter-nbconvert --output-dir=/data/out.csv a.ipynb", wrote(OUT, "!jupyter-nbconvert")),
+    *[
+        (f"!ls {op} /data/out.csv", wrote(OUT, "!ls >"))
+        for op in [">", ">>", ">|", "&>", "&>>", "2>", "2>>", "1>", ">&"]
+    ],
+    ("!ls >/data/out.csv", wrote(OUT, "!ls >")),
+    ("!> /data/out.csv", wrote(OUT, "!>")),
+    ("!ls 2>&1 > /data/out.csv", wrote(OUT, "!ls >")),
+    ("!python -c \"open('/data/out.csv', 'w')\"", wrote(OUT, "!python -c")),
+    (
+        "!python3 -uc \"import shutil; shutil.rmtree('/data/old')\"",
+        removed("`/data/old`", "!python3 -c"),
+    ),
+    ("!cd /data && touch out.csv", wrote(OUT, "!touch")),
+    ("!pushd /data && touch out.csv", wrote(OUT, "!touch")),
+]
+
+
+@pytest.mark.parametrize(("code", "message"), L013_EACH_ENTRY)
+def test_l013_each_entry(code: str, message: str | None) -> None:
+    assert outside_message(code) == message
+
+
+L013_QUIET = [
+    # inside the project: from notebooks/, from the root, absolute, climbing back in
+    'trips.to_csv("trips.csv")',
+    'trips.to_csv("../data/processed/trips.csv")',
+    'trips.to_csv("../reports/../data/x.csv")',
+    'trips.to_csv("/home/me/proj/data/x.csv")',
+    'trips.to_csv("/home/me/proj/notebooks/../data/x.csv")',
+    'trips.to_csv("/home/me/proj")',
+    'trips.to_csv("/home/me/proj/")',
+    'trips.to_csv("../../proj/data/x.csv")',
+    'trips.to_csv(Path("..") / "data" / "x.csv")',
+    'trips.to_csv(Path.cwd().parent / "data" / "x.csv")',
+    'trips.to_csv(os.path.abspath("../data/x.csv"))',
+    'trips.to_csv(Path("..").parent / "x.csv")',
+    "!cp a.csv ../data/raw/",
+    "!cd .. && touch data/x.csv",
+    "!cd /data\n!touch x.csv",
+    "!(cd /data && make) && touch x.csv",
+    "!((cd /data) && cd /x) && touch x.csv",
+    "!(cd /data; touch ../../../home/me/proj/x.csv)",
+    '!echo "$(date)" > ../data/x.txt',
+    'get_ipython().run_cell_magic("bash", "", "cd /data")\n'
+    'get_ipython().run_cell_magic("bash", "", "touch x.csv")',
+    "%%writefile ../src/helpers.py\nx = 1",
+    # exempt: device files and the system temp folders
+    'trips.to_csv("/tmp/trips.csv")',
+    'trips.to_csv("/tmp")',
+    'trips.to_csv("/var/tmp/trips.csv")',
+    'trips.to_csv("/private/tmp/trips.csv")',
+    'trips.to_csv("/private/var/tmp/trips.csv")',
+    'trips.to_csv("/dev/null")',
+    'trips.to_csv("/dev/stdout")',
+    'open("/dev/stderr", "w").write("x")',
+    "!run > /dev/null 2>&1",
+    "!run &> /dev/null",
+    "!run 2>/dev/null | tee /dev/stderr",
+    'trips.to_csv(f"/{name}/x.csv")',  # may be /tmp/x.csv
+    "!curl -o /dev/null https://h.org/x",
+    'trips.to_csv(f"/tmp/{name}.csv")',
+    # reads, and writes nh doesn't list
+    'trips = pd.read_csv("/data/trips.csv")',
+    'f = open("/data/trips.csv")',
+    'f = open("/data/trips.csv", "r")',
+    'f = open("/data/trips.csv", "rb")',
+    'f = open("/data/trips.csv", mode="rt")',
+    'f = open("/data/trips.csv", mode)',
+    'with tarfile.open("/data/a.tar.xz", "r:xz") as t:\n    names = t.getnames()',
+    't = tarfile.open("/data/a.tar.xz", mode="r|xz")',
+    'f = open("/data/trips.csv", encoding="utf-8")',
+    'text = Path("/data/trips.csv").read_text()',
+    'f = Path("/data/trips.csv").open()',
+    'f = Path("/data/trips.csv").open("r")',
+    'a = np.load("/data/a.npy")',
+    'shutil.copy("/data/trips.csv", "trips.csv")',
+    "!cp /data/trips.csv .",
+    "!cat /data/trips.csv",
+    "!ls /data > files.txt",
+    "!wc -l < /data/trips.csv",
+    "!curl -o - https://h.org/x.csv",
+    "!wget -O - https://h.org/x.csv",
+    "!run >&2",
+    "!run 2>&1",
+    "!run >&-",
+    "!ln -s /data/big.csv big.csv",
+    "%cd /data\n!rsync -av data/ backup.example.org:/backup/",
+    "%cd /data\n!rsync -av data/ rsync://backup.example.org/backup/",
+    "%cd /data\n!rsync -av data/ analyst@backup.example.org:/backup/",
+    # not a local file
+    'trips.to_sql("trips", "sqlite:////data/trips.db")',
+    'pl_trips.write_database("trips", "sqlite:////data/trips.db")',
+    'pl_trips.write_database("/data/trips", "sqlite:///trips.db")',  # a table's name
+    'pl_trips.write_clipboard("/data/out.csv")',
+    '%cd /data\ntrips.to_csv("s3://bucket/trips.csv")',
+    'trips.to_csv("sqlite:////data/trips.db")',
+    '%cd /data\ntrips.to_csv("https://h.org/upload.csv")',
+    'sdf.write.saveAsTable("/data/trips")',  # a table's name
+    'sdf.read.csv("/data/trips.csv")',
+    'frame.csv("/data/out.csv")',
+    'logging.basicConfig("/data/out.csv")',  # takes keywords only
+    'pd = load_module()\npd.to_pickle(trips, "/data/out.csv")',
+    'import mylib as pd\npd.to_pickle(trips, "/data/out.csv")',
+    "!jupyter nbconvert --to html a.ipynb --output ../reports/a",
+    "!jupyter kernelspec install --output-dir /data/out.csv k",
+    *[f"!zip -{letter} /data/tmp data.zip data" for letter in "bnPtZ"],
+    "!zip --temp-path /data/tmp data.zip data",
+    # not a path
+    'trips = trips.rename(columns={"a": "/b"})',
+    'name = name.replace("/a", "/b")',
+    's = s.rename("/abs/name")',
+    "text = trips.to_csv()",
+    "trips.to_csv(buffer)",
+    "fig.savefig(io.BytesIO())",
+    "trips.to_csv(12)",
+    'df = df.write_text("/data/x.csv")',
+    # a path nh can't read: unknown start, a folder above the project before an unknown part,
+    # an attribute, a container, a loop, one of two, an unknown folder
+    "trips.to_csv(out_path)",
+    'trips.to_csv(f"{out_dir}/x.csv")',
+    'trips.to_csv(os.environ["OUT"])',
+    'trips.to_csv(Path(os.environ["OUT"]).parent / "x.csv")',
+    'trips.to_csv(f"/home/me/{name}/x.csv")',
+    'trips.to_csv(f"/home/{user}/proj/x.csv")',
+    'trips.to_csv(f"/home/me/proj{suffix}/x.csv")',
+    'trips.to_csv(f"../../{name}/x.csv")',
+    'trips.to_csv(Path(name).parent / "../../x.csv")',
+    'trips.to_csv(os.path.dirname(name) + "/../../x.csv")',
+    'trips.to_csv(f"x{name}.csv")',
+    "trips.to_csv(cfg.out_dir)",
+    'trips.to_csv(paths["out"])',
+    'for p in ["/a.csv", "/b.csv"]:\n    trips.to_csv(p)',
+    'OUT = "/data/a" if fast else "/data/b"\ntrips.to_csv(OUT)',
+    "!cp a.csv $DEST/",
+    "%%writefile {OUT}\nx = 1",
+    "trips.to_csv(Path(*parts))",
+    '%cd /data\n%popd\ntrips.to_csv("x.csv")',
+    '%cd -2\ntrips.to_csv("x.csv")',
+    '%cd -b data\ntrips.to_csv("../../../x.csv")',
+    '%cd -\ntrips.to_csv("../../../x.csv")',
+    'os.chdir(somewhere)\ntrips.to_csv("x.csv")',
+    '%cd /data\n%cd $DIR\ntrips.to_csv("x.csv")',
+    "!cd /data && cd $DIR && touch x.csv",
+    "!cd /data && cd - && touch x.csv",
+    "!cd /data && popd && touch x.csv",
+    # a function's parameter: its writes wait for a call, and a call gives its own path
+    'def export(frame, name):\n    frame.to_csv(os.path.join("/data", name))',
+    'def export(frame, path):\n    frame.to_csv(path)\nexport(trips, "../data/x.csv")',
+    "def export(frame, path):\n    frame.to_csv(path)\nexport(trips, out_path)",
+    'def export(frame, path):\n    frame.to_csv(path)\nsaver.export(trips, "/data/out.csv")',
+    'def export(frame, path):\n    frame.to_csv(path)\nexport = print\nexport(trips, "/data/out.csv")',
+    'class Saver:\n    def export(self, path):\n        trips.to_csv(path)\nexport(1, "/data/out.csv")',
+    'def save(path, mode="r"):\n    open(path, mode)\nsave("/data/out.csv")',
+    # a function's names are its own
+    'def setup():\n    OUT = "/data/out.csv"\ntrips.to_csv(OUT)',
+    'paths = "/data/out.csv"\ndef export(*paths):\n    trips.to_csv(paths)',
+    'options = "/data/out.csv"\ndef export(**options):\n    trips.to_csv(options)',
+    "def outer():\n    def export(frame, path):\n        frame.to_csv(path)\n"
+    'export(trips, "/data/out.csv")',
+    "def export(frame, path):\n    frame.to_csv(path)\nprint(path)\ntrips.to_csv(path)",
+    "!touch {Path.cwd()}/../../x.csv",
+    # IPython fills `{HOME}` only from a Python name (else the shell gets `{HOME}` as written),
+    # and `${DEST}` keeps its `$`: `$/data/x.csv` is a relative path
+    "!touch {HOME}/x.csv",
+    'DEST = "/data"\n!cp a.csv ${DEST}/x.csv',
+    # comments, strings and markdown don't write
+    '# trips.to_csv("/data/out.csv")',
+    "help_text = \"trips.to_csv('/data/out.csv')\"",
+    "%%markdown\nRun `!touch /data/out.csv`.",
+]
+
+
+@pytest.mark.parametrize("code", L013_QUIET)
+def test_l013_quiet(code: str) -> None:
+    assert outside_issues(code) == []
+
+
+@pytest.mark.parametrize(
+    ("notebook_dir", "path", "shown"),
+    [
+        ("", "x.csv", None),
+        ("", "data/x.csv", None),
+        ("", "../x.csv", "/home/me/x.csv"),
+        ("", "../proj/x.csv", None),
+        ("notebooks", "../x.csv", None),
+        ("notebooks", "../../x.csv", "/home/me/x.csv"),
+        ("notebooks/eda", "../../x.csv", None),
+        ("notebooks/eda", "../../../x.csv", "/home/me/x.csv"),
+        ("notebooks/eda", "/home/me/proj/x.csv", None),
+        ("notebooks/eda", "~/x.csv", "~/x.csv"),
+    ],
+)
+def test_l013_relative_paths_start_from_the_notebooks_folder(
+    notebook_dir: str, path: str, shown: str | None
+) -> None:
+    """The kernel runs in the notebook's folder (first-cell.md "Paths"), so `../` is the project
+    root from notebooks/ and outside it from a notebook at the root."""
+    expected = None if shown is None else wrote(f"`{shown}`", "trips.to_csv")
+    assert outside_message(f'trips.to_csv("{path}")', notebook_dir) == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "root", "notebook_dir", "shown"),
+    [
+        ("/data/x.csv", "/home/me/proj", "", "/data/x.csv"),
+        ("/data/x.csv", "/home/me/proj/", "notebooks", "/data/x.csv"),
+        ("/home/me/proj/x.csv", "/home/me/proj/", "", None),
+        ("../../x.csv", "/home/me/proj", "notebooks", "/home/me/x.csv"),
+        ("~/x.csv", "/home/me/proj", "", "~/x.csv"),
+        ("~", "/home/me/proj", "", "~"),
+        # a project inside /tmp (tests, evals): every /tmp path is exempt
+        ("/tmp/pytest-1/other/x.csv", "/tmp/pytest-1/proj", "", None),
+        ("../../x.csv", "/tmp/pytest-1/proj", "notebooks", None),
+        ("/data/x.csv", "/tmp/pytest-1/proj", "notebooks", "/data/x.csv"),
+        # unknown parts, each text within one folder name: outside when no path they can stand
+        # for is in the project or exempt, named by the folder before the first one
+        ("/data/\0.csv", "/home/me/proj", "", "/data/…"),
+        ("/data/a/\0/\0.csv", "/home/me/proj", "", "/data/a/…"),
+        ("\0/x.csv", "/home/me/proj", "", None),
+        ("x\0.csv", "/home/me/proj", "", None),
+        ("/\0.csv", "/home/me/proj", "", "/…"),
+        ("/\0/x.csv", "/home/me/proj", "", None),
+        ("/home/\0/x.csv", "/home/me/proj", "", "/home/…"),
+        ("/home/\0/proj/x.csv", "/home/me/proj", "", None),
+        ("/home/me/\0.csv", "/home/me/proj", "", "/home/me/…"),
+        ("/home/me/pro\0/x.csv", "/home/me/proj", "", None),
+        ("/home/me/\0x/y.csv", "/home/me/proj", "", "/home/me/…"),
+        ("/home/me/\0", "/home/me/proj", "", None),
+        ("/home/\0", "/home/me/proj", "", "/home/…"),
+        ("../../\0/x.csv", "/home/me/proj", "notebooks", None),
+        ("../../\0.csv", "/home/me/proj", "notebooks", "/home/me/…"),
+        ("../../../\0/x.csv", "/home/me/proj", "notebooks", "/home/…"),
+        ("/data/\0/../x.csv", "/home/me/proj", "", "/data/x.csv"),
+        ("/var/\0/x.csv", "/home/me/proj", "", None),
+        ("/private/\0/\0/x.csv", "/home/me/proj", "", None),
+        # a leading `//` reads `/`
+        ("//data/x.csv", "/home/me/proj", "", "/data/x.csv"),
+        ("//home/me/proj/x.csv", "/home/me/proj", "", None),
+        ("//tmp/x.csv", "/home/me/proj", "", None),
+        ("../../other/\0.csv", "/home/me/proj", "notebooks", "/home/me/other/…"),
+        ("~/\0.csv", "/home/me/proj", "", "~/…"),
+        ("~\0/x.csv", "/home/me/proj", "", "~…"),
+        ("/tmp/\0.csv", "/home/me/proj", "", None),
+        ("/home/me/proj/\0.csv", "/home/me/proj", "", None),
+        ("", "/home/me/proj", "", None),
+    ],
+)
+def test_l013_outside_resolves_text_only(
+    path: str, root: str, notebook_dir: str, shown: str | None
+) -> None:
+    from nh_gateway.lint import writes
+
+    assert writes.outside(path, root, notebook_dir) == shown
+
+
+def test_l013_exempt_places_are_the_decided_ones() -> None:
+    """Design §6.4 "Exempt": device files and the system temp folders, nothing else."""
+    from nh_gateway.lint import writes
+
+    assert writes.EXEMPT == ("/dev", "/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp")
+    for place in writes.EXEMPT:
+        assert writes.outside(f"{place}/x/y.csv", ROOT) is None, place
+        assert writes.outside(f"{place}x/y.csv", ROOT) == f"{place}x/y.csv", place
+
+
+def test_l013_canonical_text() -> None:
+    [issue] = lint(
+        'trips.to_csv("~/exports/trips.csv")', project_root=ROOT, notebook_dir="notebooks"
+    ).asks
+    assert (issue.rule, issue.key, issue.severity) == ("L013", "outside_write", "ask")
+    assert issue.message == (
+        "The cell writes to `~/exports/trips.csv`, outside the project (`trips.to_csv`)."
+    )
+    assert issue.question == "writes to `~/exports/trips.csv`, outside the project"
+    assert issue.fix == L013_FIX
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "question"),
+    [
+        (
+            'a.to_csv("/data/a.csv")\nb.to_csv("/data/b.csv")',
+            wrote("`/data/a.csv` and `/data/b.csv`", "a.to_csv", 1),
+            "writes to `/data/a.csv` and `/data/b.csv`, outside the project",
+        ),
+        (
+            'a.to_csv("/data/a.csv")\nb.to_csv("/data/b.csv")\n!touch ~/c.csv',
+            wrote("`/data/a.csv`, `/data/b.csv` and `~/c.csv`", "a.to_csv", 2),
+            "writes to `/data/a.csv`, `/data/b.csv` and `~/c.csv`, outside the project",
+        ),
+        (
+            "\n".join(f'f{n}.to_csv("/data/{n}.csv")' for n in range(5)),
+            wrote("`/data/0.csv`, `/data/1.csv`, `/data/2.csv` and 2 more", "f0.to_csv", 4),
+            "writes to `/data/0.csv`, `/data/1.csv`, `/data/2.csv` and 2 more, outside the project",
+        ),
+        (  # one path written twice is named once; each site counts
+            'a.to_csv("/data/a.csv")\na.to_csv("/data/a.csv")',
+            wrote("`/data/a.csv`", "a.to_csv", 1),
+            "writes to `/data/a.csv`, outside the project",
+        ),
+        (  # inside writes are left out, and the first outside site is the one named
+            'a.to_csv("../data/a.csv")\n!rm -r /data/old\nb.to_csv("/data/b.csv")',
+            "The cell writes to `/data/b.csv` and removes `/data/old`, outside the project "
+            "(`!rm` (+1 more)).",
+            "writes to `/data/b.csv` and removes `/data/old`, outside the project",
+        ),
+        (
+            'shutil.rmtree("/data/a")\nos.remove("/data/b.csv")',
+            removed("`/data/a` and `/data/b.csv`", "shutil.rmtree", 1),
+            "removes `/data/a` and `/data/b.csv`, outside the project",
+        ),
+        (
+            'trips.to_csv(f"/data/exports/{name}.csv")',
+            wrote("`/data/exports/…`", "trips.to_csv"),
+            "writes to `/data/exports/…`, outside the project",
+        ),
+        (  # a command's own paths before its redirections'
+            "!cp a.csv /data/b.csv > /data/log",
+            wrote("`/data/b.csv` and `/data/log`", "!cp", 1),
+            "writes to `/data/b.csv` and `/data/log`, outside the project",
+        ),
+        (
+            "!mv /data/a.csv b.csv 2> /data/err",
+            "The cell writes to `/data/err` and removes `/data/a.csv`, outside the project "
+            "(`!mv` (+1 more)).",
+            "writes to `/data/err` and removes `/data/a.csv`, outside the project",
+        ),
+        (  # a path stays on one line, readable inside E122's single quotes
+            'trips.to_csv("~/Bob\'s data/x.csv")',
+            wrote('`"~/Bob\'s data/x.csv"`', "trips.to_csv"),
+            'writes to `"~/Bob\'s data/x.csv"`, outside the project',
+        ),
+        (
+            "trips.to_csv('/data/it\\'s \"x\".csv')",
+            wrote('`"/data/it\'s \\"x\\".csv"`', "trips.to_csv"),
+            'writes to `"/data/it\'s \\"x\\".csv"`, outside the project',
+        ),
+        (
+            'trips.to_csv("/data/a`b.csv")',
+            wrote("`` /data/a`b.csv ``", "trips.to_csv"),
+            "writes to `` /data/a`b.csv ``, outside the project",
+        ),
+        (
+            'trips.to_csv("/data/a\\nb\\t.csv")',
+            wrote("`/data/a\\nb\\t.csv`", "trips.to_csv"),
+            "writes to `/data/a\\nb\\t.csv`, outside the project",
+        ),
+    ],
+)
+def test_l013_text_lists_paths_once_each_by_kind(code: str, message: str, question: str) -> None:
+    [issue] = outside_issues(code)
+    assert (issue.message, issue.question) == (message, question)
+
+
+def test_l013_needs_a_project_root() -> None:
+    """With no root L013 finds nothing: the gateway always passes one."""
+    code = 'trips.to_csv("/data/out.csv")'
+    assert outside_issues(code, project_root=None) == []
+    assert outside_issues(code, project_root="") == []
+    assert "L013" not in rules(lint(code), "ask")
+    assert outside_issues(code) != []
+
+
+L013_ABOVE = [
+    'EXPORTS = Path("/data/exports")',
+    'def save(frame, path="/data/out.csv"):\n    frame.to_csv(path)',
+    "import shutil as sh",
+    'DEST = "/data"',
+    "HERE = Path.cwd()",
+    'import pandas as pd\nFINAL = "/data/final.csv"\n',
+    "def export(frame, path):\n    frame.to_csv(path)\n\n\ndef publish(frame, path):\n"
+    "    export(frame, path)",
+]
+
+
+@pytest.mark.parametrize(
+    ("code", "above"),
+    [
+        ('trips.to_csv(EXPORTS / "trips.csv")', wrote("`/data/exports/trips.csv`", "trips.to_csv")),
+        ('sh.rmtree("/data/old")', removed("`/data/old`", "sh.rmtree")),
+        ("!cp a.csv {DEST}/out.csv", wrote(OUT, "!cp")),
+        ('trips.to_csv(f"{DEST}/out.csv")', wrote(OUT, "trips.to_csv")),
+        (
+            'trips.to_csv(HERE.parent.parent / "out.csv")',
+            wrote("`/home/me/out.csv`", "trips.to_csv"),
+        ),
+        ("trips.to_csv(FINAL)", wrote("`/data/final.csv`", "trips.to_csv")),
+        ('%cd $DEST\ntrips.to_csv("out.csv")', wrote(OUT, "trips.to_csv")),
+        ("%%writefile {DEST}/out.csv\nx = 1", wrote(OUT, "%%writefile")),
+        ('export(trips, "~/trips.csv")', wrote("`~/trips.csv`", "export")),
+        ('publish(trips, "~/trips.csv")', wrote("`~/trips.csv`", "publish")),
+        ("save(trips)", wrote(OUT, "save")),
+        ('save(trips, "~/trips.csv")', wrote("`~/trips.csv`", "save")),
+    ],
+)
+def test_l013_reads_names_from_the_cells_above(code: str, above: str) -> None:
+    """A path, import or folder bound in an earlier cell counts here; alone nh knows nothing."""
+    assert outside_issues(code) == []
+    assert [i.message for i in outside_issues(code, code_above=L013_ABOVE)] == [above]
+
+
+def test_l013_a_shell_cell_reads_no_python_name() -> None:
+    """IPython fills {name} and $name in `!` lines only: a shell cell's $DEST is the shell's."""
+    assert outside_issues("%%bash\ncp a.csv $DEST/out.csv", code_above=L013_ABOVE) == []
+    assert outside_issues("!cp a.csv $DEST/out.csv", code_above=L013_ABOVE) != []
+
+
+def test_l013_cells_above_bind_but_never_ask() -> None:
+    from nh_gateway.lint import writes
+
+    above = ['trips.to_csv("/data/out.csv")', "%cd /data", 'os.chdir("/data")']
+    assert outside_issues("trips.head()", code_above=above) == []
+    # an earlier cell's %cd isn't followed: relative paths start from the notebook's folder
+    assert outside_issues('trips.to_csv("x.csv")', code_above=above) == []
+    reads = "trips.to_csv(OUT)"
+    assert outside_issues(reads, code_above=['OUT = "/data/out.csv"']) != []
+    rebound = ['OUT = "/data/out.csv"', 'OUT = "../data/out.csv"']
+    assert outside_issues(reads, code_above=rebound) == []
+    here = f'OUT = "../data/out.csv"\n{reads}'
+    assert outside_issues(here, code_above=['OUT = "/data/out.csv"']) == []
+    broken = ['OUT = "/data/out.csv"', "def broken(:", "%%bash\nOUT=x", "%%sql\nSELECT 1"]
+    assert outside_issues(reads, code_above=broken) != []
+    assert writes.bindings(['OUT = "/data/out.csv"', "def broken(:"]) == writes.bindings(
+        ['OUT = "/data/out.csv"']
+    )
+
+
+def test_l013_a_walk_of_the_cells_above_that_raises_leaves_the_seed_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nh_gateway.lint import network, writes
+
+    def boom(source: str, seed: Any) -> Any:
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(writes, "_cell_seed", boom)
+    above = ['OUT = "/data/out.csv"']
+    assert writes.bindings(above) == network.EMPTY
+    assert outside_issues("trips.to_csv(OUT)", code_above=above) == []
+    assert outside_issues('trips.to_csv("/data/out.csv")', code_above=above) != []
+
+
+def test_l013_walks_each_cell_above_once_in_a_cache_of_its_own() -> None:
+    from nh_gateway.lint import network, writes
+
+    above = [f'OUT_{n} = "/data/{n}.csv"' for n in range(200)]
+    writes._cell_seed.cache_clear()
+    network._cell_seed.cache_clear()
+    started = time.perf_counter()
+    for _ in range(5):
+        [issue] = outside_issues("trips.to_csv(OUT_199)", code_above=above)
+    assert time.perf_counter() - started < 3.0
+    assert issue.message == wrote("`/data/199.csv`", "trips.to_csv")
+    info = writes._cell_seed.cache_info()
+    assert info.misses == 200 and info.hits == 4 * 200
+    # L012 walks the same cells into a cache of its own
+    assert network._cell_seed.cache_info().misses == 200
+    writes._cell_seed.cache_clear()
+    network._cell_seed.cache_clear()
+    assert writes.bindings(above) != network.bindings(above)
+    assert writes._cell_seed.cache_info().misses == network._cell_seed.cache_info().misses == 200
+    writes.bindings(above)
+    assert network._cell_seed.cache_info().hits == 0
+
+
+@pytest.mark.parametrize(
+    ("level", "mode", "where"),
+    [
+        ("ask", "advise", "ask"),
+        ("ask", "strict", "ask"),
+        ("error", "advise", "error"),
+        ("hint", "advise", "hint"),
+        ("hint", "strict", "error"),
+        ("off", "advise", None),
+        ("off", "strict", None),
+    ],
+)
+def test_l013_levels(level: str, mode: str, where: str | None) -> None:
+    cfg = config(outside_write=level)
+    cfg.data["lint"]["mode"] = mode
+    report = lint(
+        'trips.to_csv("~/exports/trips.csv")\ntrips.head()',
+        cfg=cfg,
+        project_root=ROOT,
+        notebook_dir="notebooks",
+    )
+    found = {s: rules(report, s) for s in ("error", "hint", "ask")}
+    assert found == {s: (["L013"] if s == where else []) for s in found}
+    assert report.ok == (where != "error")
+
+
+def test_l013_is_off_without_a_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At `off` the scan never runs; a scan that fails finds nothing, and only L013 is lost."""
+    from nh_gateway.lint import writes
+
+    calls: list[str] = []
+    monkeypatch.setattr(writes, "scan", lambda *args: calls.append("scan") or [])
+    lint('trips.to_csv("/data/out.csv")', cfg=config(outside_write="off"), project_root=ROOT)
+    assert calls == []
+    lint('trips.to_csv("/data/out.csv")', project_root=ROOT)
+    assert calls == ["scan"]
+
+    def boom(*args: Any) -> Any:
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(writes, "scan", boom)
+    report = lint(
+        f'!pip install x\ntrips = pd.read_csv("{TRIPS_URL}")\ntrips.to_csv("/data/out.csv")',
+        project_root=ROOT,
+    )
+    assert rules(report, "ask") == ["L009", "L012"]
+
+
+def test_l013_asks_with_l009_and_l012_in_one_question() -> None:
+    """All three asks, in _CHECKS order: the gate joins their clauses into one question."""
+    report = lint(
+        f'!pip install seaborn\ntrips = pd.read_csv("{TRIPS_URL}")\n'
+        'trips.to_csv("~/exports/trips.csv")',
+        project_root=ROOT,
+        notebook_dir="notebooks",
+    )
+    assert rules(report, "ask") == ["L009", "L012", "L013"] and report.ok
+    assert [issue.question for issue in report.asks][1:] == [
+        "connects to `data.example.org` over the network",
+        "writes to `~/exports/trips.csv`, outside the project",
+    ]
+    order = [rule for rule, _, _ in lint_module._CHECKS]
+    assert order.index("L012") + 1 == order.index("L013")
+
+
+def test_l013_and_l012_read_one_shell_line_each_their_way() -> None:
+    """A download into a folder outside the project is both: a site and a write."""
+    report = lint(f"!curl -o ~/trips.csv {TRIPS_URL}", project_root=ROOT, notebook_dir="notebooks")
+    assert rules(report, "ask") == ["L012", "L013"]
+    assert report.asks[1].message == wrote("`~/trips.csv`", "!curl")
+
+
+def test_l013_scan_is_fast_on_a_long_cell() -> None:
+    lines = [f'f{n} = trips.to_csv(f"../data/{{n}}/{n}.csv")' for n in range(400)]
+    lines += [f"!cp a.csv ../data/{n}.csv && touch ../data/{n}.done" for n in range(100)]
+    lines.append('trips.to_csv("/data/out.csv")')
+    started = time.perf_counter()
+    [issue] = outside_issues("\n".join(lines))
+    assert time.perf_counter() - started < 3.0
+    assert issue.message == wrote(OUT, "trips.to_csv")
+
+
+def test_l013_first_cell_writes_nothing_outside() -> None:
+    """/nh:init's first cell (first-cell.md) reads from data/raw/: no question."""
+    for block in _first_cell_blocks():
+        assert outside_issues(block, kernel_python=(3, 11)) == []
+
+
+@pytest.mark.parametrize(
+    ("line", "stages"),
+    [
+        ("echo x > a.txt", [(["echo", "x"], ["a.txt"])]),
+        ("cmd >> a; cmd2 2> b", [(["cmd"], ["a"]), (["cmd2"], ["b"])]),
+        ("cmd &> a", [(["cmd"], ["a"])]),
+        ("cmd &>> a", [(["cmd"], ["a"])]),
+        ("cmd >| a", [(["cmd"], ["a"])]),
+        ("cmd >&a", [(["cmd"], ["a"])]),
+        ("cmd 1>a 3>b", [(["cmd"], ["a", "b"])]),
+        ("cmd 2>&1", [(["cmd"], [])]),
+        ("cmd >&2", [(["cmd"], [])]),
+        ("cmd >&-", [(["cmd"], [])]),
+        ("cmd < in.txt", [(["cmd"], [])]),
+        ("> a", [([], ["a"])]),
+        ('cmd > "my file.txt"', [(["cmd"], ["my file.txt"])]),
+        ("cmd 2>>err.log | tee out.log", [(["cmd"], ["err.log"]), (["tee", "out.log"], [])]),
+        ("bash -c 'echo x > a'", [(["bash", "-c", "echo x > a"], []), (["echo", "x"], ["a"])]),
+        ("echo $(cat a > b)", [(["echo", "$(cat a > b)"], []), (["cat", "a"], ["b"])]),
+        ("sudo cmd > a", [(["cmd"], ["a"])]),
+        # quotes that don't close: read as raw text
+        ('echo "x > a.txt', [(["echo", "x", "a.txt"], ["a.txt"])]),
+        ('echo "x 2>>a.txt 2>&1', [(["echo", "x"], ["a.txt"])]),
+    ],
+)
+def test_shell_stages_name_each_commands_redirection_targets(
+    line: str, stages: list[tuple[list[str], list[str]]]
+) -> None:
+    found = secret_scan.shell_stages(line)
+    assert [(words, outputs) for _, words, outputs in found] == stages
+    # shell_commands is the same list without the outputs, and without a bare redirection
+    assert secret_scan.shell_commands(line) == [(raws, words) for raws, words, _ in found if words]
 
 
 # L010 -------------------------------------------------------------------------------------------

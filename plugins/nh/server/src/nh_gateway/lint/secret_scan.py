@@ -174,6 +174,7 @@ _HELP = re.compile(r"\?{0,2}([^?]+?)\?{0,2}", re.S)
 _SEGMENTS = re.compile(r"\n|;|&&|\|\|")
 _REDIRECT = re.compile(r"(?:(?:^|(?<=\s))1|&|(?<![\d&>]))>>?\s*(?!&)\S")
 _REDIRECTION = re.compile(r"(?:\d*|&)(?:>>?|<)(.+)?")
+_RAW_OUTPUT = re.compile(r"(?<![<>])>>?\|?\s*(?![&\s])([^\s;&|<>]+)")  # `> f`, `2>>f`, `&> f`
 _DOLLAR = re.compile(r"\$(?:\{(!?)([A-Za-z_]\w*)([^}]*)\}|([A-Za-z_]\w*))")  # not ${#X}
 _BRACE = re.compile(r"(?<![$\\{])\{([^{}]+)\}")
 _SETTING = re.compile(r"[A-Za-z_]\w*=.*", re.S)  # a shell NAME=value word
@@ -1384,12 +1385,16 @@ class _Stage:
     words: list[str] = field(default_factory=list)  # raw words, quotes kept, no redirections
     inputs: list[str] = field(default_factory=list)  # what `<` reads, unquoted
     to_file: bool = False  # its stdout goes to a file (`> f`, `>> f`, `&> f`, `1> f`)
+    outputs: list[str] = field(default_factory=list)  # every file a redirection writes, unquoted
 
 
 # shell reading -----------------------------------------------------------------------------------
 _LIST_OPS = ("&&", "||", ";;", ";", "&", "\n")
 _PIPE_OPS = ("|&", "|")
 _REDIRECTIONS = ("&>>", "&>", ">>", ">|", ">&", ">", "<<<", "<<-", "<<", "<&", "<>", "<")
+# The redirections that write the file named next (`>&` only when it names a file, not a
+# descriptor: `2>&1`, `>&-`).
+_WRITE_REDIRECTIONS = frozenset({"&>>", "&>", ">>", ">|", ">&", ">"})
 
 
 def _lex(text: str) -> list[list[_Stage]] | None:
@@ -1402,13 +1407,17 @@ def _lex(text: str) -> list[list[_Stage]] | None:
     word: list[str] = []
     reading = False  # a word has started (it may be "" so far)
     target = ""  # what the next word is: "out" (stdout's file), "in", "dup" or "skip"
+    writes = False  # the next word is a file a redirection writes (any descriptor's: L013)
     fd: str | None = None
     i, n = 0, len(text)
 
     def end_word() -> None:
-        nonlocal reading, target
+        nonlocal reading, target, writes
         if reading:
             raw = "".join(word)
+            if writes and (target != "dup" or (not raw.isdigit() and raw != "-")):
+                stage.outputs.append(_unquote(raw))
+            writes = False
             if target == "out" or (target == "dup" and not raw.isdigit() and raw != "-"):
                 stage.to_file = stage.to_file or _unquote(raw) not in _SCREENS
             elif target == "in":
@@ -1422,7 +1431,7 @@ def _lex(text: str) -> list[list[_Stage]] | None:
     def end_stage() -> None:
         nonlocal stage
         end_word()
-        if stage.words or stage.inputs or stage.to_file:
+        if stage.words or stage.inputs or stage.to_file or stage.outputs:
             stages.append(stage)
         stage = _Stage()
 
@@ -1465,6 +1474,7 @@ def _lex(text: str) -> list[list[_Stage]] | None:
                 fd = None
             op = next(o for o in _REDIRECTIONS if text.startswith(o, i))
             i += len(op)
+            writes = op in _WRITE_REDIRECTIONS
             if op.startswith("&>"):
                 target = "out"
             elif op in (">>", ">|", ">"):
@@ -1496,7 +1506,10 @@ def _lex_raw(text: str) -> list[list[_Stage]]:
     pipelines: list[list[_Stage]] = []
     for segment in _SEGMENTS.split(text):
         stages = [
-            _Stage([w for w in part.split() if not _REDIRECTION.fullmatch(w)])
+            _Stage(
+                [w for w in part.split() if not _REDIRECTION.fullmatch(w)],
+                outputs=_RAW_OUTPUT.findall(part),
+            )
             for part in segment.split("|")
         ]
         stages[-1].to_file = bool(_REDIRECT.search(segment))
@@ -1639,28 +1652,36 @@ def _shell_script(args: list[str]) -> str | None:
     return None
 
 
-def shell_commands(text: str, _depth: int = 0) -> list[tuple[list[str], list[str]]]:
+def shell_commands(text: str) -> list[tuple[list[str], list[str]]]:
     """Each command a shell line runs, as (raw words, unquoted words) with ``sudo``,
     ``NAME=value`` and keywords taken off the front: its lists' and pipelines' commands, then
     those of its ``$(…)`` and backtick substitutions and of a ``bash -c '…'`` script. A line
     whose quotes don't close is read as raw text. L012 reads shell this way (design §6.4)."""
+    return [(raws, words) for raws, words, _ in shell_stages(text) if words]
+
+
+def shell_stages(text: str, _depth: int = 0) -> list[tuple[list[str], list[str], list[str]]]:
+    """``shell_commands``' commands, in the same order, each with the files its redirections
+    write (unquoted, any descriptor's: ``> f``, ``2>> f``, ``&> f``, ``>&f``); a bare
+    redirection (``> f``) is a command with no words. L013 reads shell this way (design
+    §6.4)."""
     lexed = _lex(text)
-    found: list[tuple[list[str], list[str]]] = []
+    found: list[tuple[list[str], list[str], list[str]]] = []
     for stages in lexed if lexed is not None else _lex_raw(text):
         for stage in stages:
             raws, words = _command_words(stage)
-            if words:
-                found.append((raws, words))
+            if words or stage.outputs:
+                found.append((raws, words, list(stage.outputs)))
             if _depth >= 4:
                 continue
             if words and words[0].rsplit("/", 1)[-1] in _SHELLS:
                 script = _shell_script(words[1:])
                 if script is not None:
-                    found += shell_commands(script, _depth + 1)
+                    found += shell_stages(script, _depth + 1)
             for raw in stage.words:
                 for kind, inner, _, _ in _expansions(raw):
                     if kind == "(":
-                        found += shell_commands(inner, _depth + 1)
+                        found += shell_stages(inner, _depth + 1)
     return found
 
 

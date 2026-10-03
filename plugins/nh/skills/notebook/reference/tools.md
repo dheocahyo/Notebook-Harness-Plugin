@@ -47,7 +47,7 @@ repeating it.
 ```
 
 A hard-rule rejection (`E120`, with `L0xx` lines) writes nothing and does not
-use your cell: fix every listed problem and call again. Three rules differ:
+use your cell: fix every listed problem and call again. Four rules differ:
 - `L002` (separators): keep only the first step in this cell, with no
   separators, and propose the rest in your reply.
 - `L009` (a package install), when `harness.toml` makes it an error: don't call
@@ -57,11 +57,15 @@ use your cell: fix every listed problem and call again. Three rules differ:
 - `L012` (the network), when `harness.toml` makes it an error: don't call again
   yet. Ask the user to download what the cell needs into the project (for
   example `data/raw/`), then write the cell to read it from there.
+- `L013` (a write outside the project), when `harness.toml` makes it an error:
+  don't call again yet. Write the files inside the project instead (for
+  example `data/processed/` or `reports/`), or tell the user where the cell
+  would write and let them change it themselves.
 
-By default a package install, or a cell that reaches a host the project hasn't
-approved, is no rejection: nh asks the user first (`E122`, with the question in
-`Next:`). Ask it, stop, and after the user's yes send the exact same call again
-([asks.md](asks.md)).
+By default a package install, a cell that writes outside the project, or a
+cell that reaches a host the project hasn't approved, is no rejection: nh asks
+the user first (`E122`, with the question in `Next:`). Ask it, stop, and after
+the user's yes send the exact same call again ([asks.md](asks.md)).
 
 After 3 rejections in one message you get `E121`: stop and tell the user what
 you are trying to write.

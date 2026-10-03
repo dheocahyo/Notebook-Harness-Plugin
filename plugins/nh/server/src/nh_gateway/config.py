@@ -13,9 +13,8 @@ from typing import Any
 RESERVED_SECTIONS = {"preset", "guardrails", "secrets", "libraries", "comprehension"}
 # A [lint.rules] level; "ask" holds the cell for the user's yes (design §6.4).
 RULE_LEVELS = ("off", "hint", "error", "ask")
-# The rules that can ask: each one's finding carries the user's question (design §6.4). C5c
-# adds outside_write.
-ASK_RULES = frozenset({"package_install", "network"})
+# The rules that can ask: each one's finding carries the user's question (design §6.4).
+ASK_RULES = frozenset({"package_install", "network", "outside_write"})
 HEADLESS_ENV = "NH_HEADLESS"
 
 

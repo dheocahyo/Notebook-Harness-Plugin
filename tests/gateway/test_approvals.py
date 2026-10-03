@@ -1,7 +1,7 @@
-"""FR-12 cell approvals (design §6.4): a cell the lint asks about (L009 and L012 by default)
-waits for the user's yes (E122), and the yes in the next message lets exactly that call through
-once; a host in the project's approved list needs none. Through the real hooks and the gateway
-(FakeBackend)."""
+"""FR-12 cell approvals (design §6.4): a cell the lint asks about (L009, L012 and L013 by
+default) waits for the user's yes (E122), and the yes in the next message lets exactly that call
+through once; a host in the project's approved list needs none. Through the real hooks and the
+gateway (FakeBackend)."""
 
 from __future__ import annotations
 
@@ -996,3 +996,265 @@ async def test_the_rule_level_decides_what_a_network_cell_gets(
             "the user to download what the cell needs into the project (for example data/raw/), "
             "then write the cell to read it from there."
         )
+
+
+# --- L013: a cell that writes outside the project (C5c) -----------------------------------------
+#
+# FakeBackend runs a cell in this process, so `~` is the HOME each test points at its tmp_path,
+# and a relative path starts from the folder the test moves to. The project itself is under
+# /tmp, which L013 exempts (design §6.4 "Exempt"): a test that needs the project's own bounds
+# empties writes.EXEMPT.
+OUTSIDE = dict(
+    title="Save the trips to my home folder",
+    notes=["Writes the trips table to the home folder.", "Shows how many rows it wrote."],
+    intent="save the trips to ~/trips.csv",
+    code='import pandas as pd\n\ntrips = pd.DataFrame({"trip_id": [1, 2], "minutes": [12, 7]})\n'
+    'trips.to_csv("~/trips.csv", index=False)\ntrips.shape',
+)
+OUTSIDE_QUESTION = "This cell writes to `~/trips.csv`, outside the project. Run it as it is?"
+OUTSIDE_FINDING = "- L013: The cell writes to `~/trips.csv`, outside the project (`trips.to_csv`)."
+OUTSIDE_ASKED = [
+    FIRST,
+    "nh: E122",
+    OUTSIDE_FINDING,
+    f"Next: Ask the user, then stop: '{OUTSIDE_QUESTION}'. After a yes, send the same call again.",
+]
+
+
+@pytest.fixture
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    folder = tmp_path / "home"
+    folder.mkdir()
+    monkeypatch.setenv("HOME", str(folder))
+    return folder
+
+
+@pytest.mark.parametrize("who", ["main", "writer"])
+async def test_an_outside_write_asks_and_the_yes_writes_it_once(
+    nh: Harness, home: Path, who: str
+) -> None:
+    nh.turns.prompt("p1", text="save the trips to ~/trips.csv")
+    asked = await add(nh, who, "p1", "wf_run-1", **OUTSIDE)
+    if who == "main":
+        assert asked.is_error and lines(asked) == OUTSIDE_ASKED, text(asked)
+    else:
+        assert asked.is_error and lines(asked)[2:] == [
+            OUTSIDE_FINDING,
+            f"- The main conversation asks the user: '{OUTSIDE_QUESTION}'",
+            f"Next: {RETURN_TO_WORKFLOW}",
+        ], text(asked)
+    assert not (home / "trips.csv").exists() and nh_code_cells(nh) == []
+    assert pending(nh)["key"] == approvals.cell_key(NOTEBOOK, "add", OUTSIDE["code"])
+    assert [e["rules"] for e in events(nh, "cell_asked")] == [["L013"]]
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **OUTSIDE))
+    assert (home / "trips.csv").read_text() == "trip_id,minutes\n1,12\n2,7\n"
+    assert [c["source"] for c in nh_code_cells(nh)] == [OUTSIDE["code"]]
+    assert pending(nh) is None and [e["rules"] for e in events(nh, "cell_granted")] == [["L013"]]
+    again = await nh.call("nh_add_cell", "p2", **dict(OUTSIDE, title="Save the trips again"))
+    assert again.is_error and "nh: E110" in text(again)
+
+
+INSIDE = dict(
+    title="Save the trips for later steps",
+    notes=["Writes the trips table under data/processed.", "Later cells read it from there."],
+    intent="save the trips",
+    code='import os\nimport pandas as pd\n\ntrips = pd.DataFrame({"trip_id": [1, 2], "minutes": [12, 7]})\n'
+    'os.makedirs("../data/processed", exist_ok=True)\n'
+    'trips.to_csv("../data/processed/trips.csv", index=False)\ntrips.shape',
+)
+
+
+async def test_an_inside_write_is_written_with_no_question(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway passes the project root and the notebook's folder (`notebooks/`): `../data`
+    is inside from there, `../../` is not."""
+    from nh_gateway.lint import writes
+
+    monkeypatch.setattr(writes, "EXEMPT", ())
+    monkeypatch.chdir(nh.project / "notebooks")  # where the kernel runs
+    nh.turns.prompt("p1", text="save the trips for the next steps")
+    written = await nh.call("nh_add_cell", "p1", **INSIDE)
+    assert_written(written)
+    assert (nh.project / "data" / "processed" / "trips.csv").exists()
+    assert pending(nh) is None and events(nh, "cell_asked") == []
+    [added] = events(nh, "cell_added")
+    assert "L013" not in added["hints"]
+    climbs = INSIDE["code"].replace("../data/processed", "../../exports")
+    nh.turns.prompt("p2", text="save them next to the project instead")
+    asked = await nh.call("nh_add_cell", "p2", **dict(INSIDE, code=climbs))
+    exports = tmp_path / "exports"
+    assert asked.is_error and lines(asked)[:3] == [
+        FIRST,
+        "nh: E122",
+        f"- L013: The cell writes to `{exports}` and `{exports}/trips.csv`, outside the "
+        "project (`os.makedirs` (+1 more)).",
+    ], text(asked)
+    assert not exports.exists()
+
+
+async def test_an_edit_that_writes_outside_asks_too(nh: Harness, home: Path) -> None:
+    nh.turns.prompt("p1", text="load the data")
+    uid = (await nh.call("nh_add_cell", "p1", **LOAD)).meta["nh/cell_id"]
+    nh.turns.prompt("p2", text="also save it to my home folder in that cell")
+    code = LOAD["code"] + '\ndf.to_csv("~/sales.csv")'
+    asked = await nh.call("nh_edit_cell", "p2", cell_id=uid, code=code)
+    assert asked.is_error and lines(asked)[:3] == [
+        FIRST,
+        "nh: E122",
+        "- L013: The cell writes to `~/sales.csv`, outside the project (`df.to_csv`).",
+    ], text(asked)
+    assert pending(nh)["key"] == approvals.cell_key(NOTEBOOK, f"edit:{uid}", code)
+    assert not (home / "sales.csv").exists()
+    nh.turns.prompt("p3", text="yes")
+    edited = await nh.call("nh_edit_cell", "p3", cell_id=uid, code=code)
+    assert not edited.is_error and "Updated" in text(edited), text(edited)
+    assert (home / "sales.csv").exists()
+    assert [e["rules"] for e in events(nh, "cell_granted")] == [["L013"]]
+
+
+async def test_an_edit_reads_paths_from_the_notebooks_folder_too(
+    nh: Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """nh_edit_cell passes the notebook's folder as nh_add_cell does: from `notebooks/`,
+    `../data/processed` is inside and `../../` is not."""
+    from nh_gateway.lint import writes
+
+    monkeypatch.setattr(writes, "EXEMPT", ())
+    monkeypatch.chdir(nh.project / "notebooks")  # where the kernel runs
+    nh.turns.prompt("p1", text="load the data")
+    uid = (await nh.call("nh_add_cell", "p1", **LOAD)).meta["nh/cell_id"]
+    keep = '\nimport os\nos.makedirs("../data/processed", exist_ok=True)\ndf.to_csv("{}")'
+    inside = LOAD["code"] + keep.format("../data/processed/sales.csv")
+    nh.turns.prompt("p2", text="also keep a copy for the later steps")
+    edited = await nh.call("nh_edit_cell", "p2", cell_id=uid, code=inside)
+    assert not edited.is_error and "Updated" in text(edited), text(edited)
+    assert (nh.project / "data" / "processed" / "sales.csv").exists()
+    assert events(nh, "cell_asked") == [] and pending(nh) is None
+    outside = LOAD["code"] + keep.format("../../sales.csv")
+    nh.turns.prompt("p3", text="keep it next to the project instead")
+    asked = await nh.call("nh_edit_cell", "p3", cell_id=uid, code=outside)
+    assert asked.is_error and lines(asked)[:3] == [
+        FIRST,
+        "nh: E122",
+        f"- L013: The cell writes to `{tmp_path / 'sales.csv'}`, outside the project (`df.to_csv`).",
+    ], text(asked)
+    assert not (tmp_path / "sales.csv").exists()
+
+
+async def test_a_function_an_earlier_cell_defines_asks_where_it_is_called(
+    nh: Harness, home: Path
+) -> None:
+    """The cell that defines `export` writes nothing; the call that gives it a path outside the
+    project asks, named by the function (design §6.4 "A function the cell defines")."""
+    define = dict(
+        title="Define the export helper",
+        notes=["Defines export(frame, path), which saves a frame as CSV.", "Nothing is saved yet."],
+        intent="define a helper that saves a frame",
+        code="def export(frame, path):\n    frame.to_csv(path, index=False)\n\n\nexport",
+    )
+    nh.turns.prompt("p1", text="add a helper to save frames")
+    assert_written(await nh.call("nh_add_cell", "p1", **define))
+    call = dict(
+        OUTSIDE,
+        code='import os\nimport pandas as pd\n\ntrips = pd.DataFrame({"trip_id": [1, 2]})\n'
+        'export(trips, os.path.expanduser("~/trips.csv"))',
+    )
+    nh.turns.prompt("p2", text="save the trips to ~/trips.csv")
+    asked = await nh.call("nh_add_cell", "p2", **call)
+    assert asked.is_error and lines(asked)[:3] == [
+        FIRST,
+        "nh: E122",
+        "- L013: The cell writes to `~/trips.csv`, outside the project (`export`).",
+    ], text(asked)
+    assert not (home / "trips.csv").exists() and [e["rules"] for e in events(nh, "cell_asked")] == [
+        ["L013"]
+    ]
+
+
+async def test_an_install_a_download_and_an_outside_write_ask_one_question(
+    nh: Harness, home: Path
+) -> None:
+    code = "%pip install seaborn\n" + NETWORK["code"] + '\ntrips.to_csv("~/trips.csv")'
+    nh.turns.prompt("p1", text="install seaborn, load the trips and save them to ~/trips.csv")
+    asked = await nh.call("nh_add_cell", "p1", **dict(NETWORK, code=code))
+    assert asked.is_error and lines(asked)[1:5] == [
+        "nh: E122",
+        FINDING,
+        NETWORK_FINDING,
+        OUTSIDE_FINDING,
+    ], text(asked)
+    assert lines(asked)[-1] == (
+        "Next: Ask the user, then stop: 'This cell installs `seaborn` into the kernel only, and "
+        "the next env sync removes it (`uv add seaborn` keeps it); it also connects to "
+        "`data.example.org` over the network; it also writes to `~/trips.csv`, outside the "
+        "project. Run it as it is?'. After a yes, send the same call again."
+    )
+    assert [e["rules"] for e in events(nh, "cell_asked")] == [["L009", "L012", "L013"]]
+
+
+async def test_no_secret_in_a_path_reaches_the_question(nh: Harness, home: Path) -> None:
+    token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    code = OUTSIDE["code"].replace("~/trips.csv", f"~/{token}/trips.csv")
+    nh.turns.prompt("p1", text="save the trips")
+    asked = await nh.call("nh_add_cell", "p1", **dict(OUTSIDE, code=code))
+    body = text(asked)
+    assert asked.is_error and "- L013: The cell writes to `~/[redacted:" in body, body
+    assert "outside the project. Run it as it is?" in body and token not in body, body
+
+
+@pytest.mark.parametrize(
+    ("toml", "outcome"),
+    [
+        ('[lint]\nmode = "strict"\n', "E122"),
+        ('[lint.rules]\noutside_write = "error"\n', "E120"),
+        ('[lint.rules]\noutside_write = "hint"\n', "written"),
+        ('[lint.rules]\noutside_write = "off"\n', "written"),
+    ],
+)
+async def test_the_rule_level_decides_what_an_outside_write_gets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: Path, toml: str, outcome: str
+) -> None:
+    project = make_project(tmp_path, toml)
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    async with Client(create_server(project, backend)) as client:
+        h = Harness(project, backend, client, Turns(project, tmp_path / "data"))
+        h.turns.prompt("p1", text="save the trips to ~/trips.csv")
+        result = await h.call("nh_add_cell", "p1", **OUTSIDE)
+    body = text(result)
+    if outcome == "written":
+        assert_written(result)
+        hinted = "The cell writes to `~/trips.csv`, outside the project" in body
+        assert hinted == ("hint" in toml), body
+        assert (home / "trips.csv").exists()
+    else:
+        assert result.is_error and f"nh: {outcome}" in body, body
+        assert not (home / "trips.csv").exists()
+    if outcome == "E120":
+        assert lines(result)[-1] == (
+            "Next: Don't call again yet: this project refuses cells that write outside it. Write "
+            "the files inside the project instead (for example data/processed/ or reports/), or "
+            "tell the user where the cell would write and let them change it themselves."
+        )
+
+
+async def test_l012s_refusal_comes_before_l013s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At `error`, E120 lists both rules; its Next is L012's (design §6.4 L013 "Fix")."""
+    project = make_project(tmp_path, '[lint.rules]\nnetwork = "error"\noutside_write = "error"\n')
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    code = NETWORK["code"] + '\ntrips.to_csv("~/trips.csv")'
+    async with Client(create_server(project, backend)) as client:
+        h = Harness(project, backend, client, Turns(project, tmp_path / "data"))
+        h.turns.prompt("p1", text="load the trips and save them to ~/trips.csv")
+        result = await h.call("nh_add_cell", "p1", **dict(NETWORK, code=code))
+    body = text(result)
+    assert result.is_error and "nh: E120" in body, body
+    assert "- L012: " in body and "- L013: The cell writes to `~/trips.csv`" in body, body
+    assert lines(result)[-1].startswith(
+        "Next: Don't call again yet: this project refuses cells that reach the network."
+    )
