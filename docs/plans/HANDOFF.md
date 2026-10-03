@@ -59,19 +59,12 @@ Two workflows were stopped for the move. Their work is saved here; both patches 
 ### Cloud session status (2026-09-30), stopped at the user's request after C4
 
 - **Committed and pushed:** 17ae694 (step 1, error-retry) and 13c01ef (C4). A PR from `release/0.2.0` to `master` is open.
-- **C12's independent parts, built early and not committed:** `c12-early-wip.patch` (base 17ae694; apply with `git apply -3` after C4). It holds:
-  - the a7 and a8 integration tests (`tests/integration/test_large_outputs.py`, `test_lab_restart.py`);
-  - the drift.yml `file-issue` job and the ci.yml artifact path (`--basetemp "$RUNNER_TEMP/pytest-integration"`);
-  - three gateway fixes the tests exposed:
-    - a room save request after nh's writes (cells were lost when Lab restarted mid-run);
-    - websocket-client's pure-Python UTF-8 frame check replaced (50 MB stream exec 11 s → 0.8 s);
-    - `prune_outputs_dir(keep=)`;
-  - the plan's V11 "trim" fallback in `exec/shaping.py`, which brought a7's 50 MB stream overhead from 2.4 s to 0.6 s p95 on this slower machine;
-  - its §6.13 text in `docs/plans/c12-design-6.13.md` (inside the patch).
-- **Its second review was cut off by a container restart:** `c12-early-review.json` holds two of the three reviewers' findings:
-  - redaction: 3 blockers and 1 major in the trim (a pattern secret longer than the margin before the tail window; HTML over its share; joined error frames; progress-bar output emptied);
-  - gateway: 8 minors.
-  Rerun the tests/docs reviewer, then fix and verify, before committing it.
+- **Since then, committed and pushed** (2026-10-02/03; CI green at 402cd54):
+  - 81de81c C5a (package_install "ask", E122) and 428b161 C5b (L012 network, approved hosts).
+  - C12's independent parts, after the third reviewer, two fix rounds, an adversarial attack on the trim and a verifier: 856c811 (design §6.13), 99b8090 (UTF-8 check), f745139 (room save, a8), cffc0d3 (trim, a7), c2ac840 (drift and CI workflows), and the commit removing this file's C12 patch and review.
+  - 53ce5b7: a7's ~5 s stalls were new kernel websockets dead from the start (ipykernel 7.3.0 behind jupyter_server 2.21.1). `kernel.open_client` now checks each new connection to an idle kernel. 402cd54 waits out a new kernel's `starting` first (CI found that gap); 4713147 fixed two tests that failed only on macOS. An upstream issue is drafted in `upstream-issue-draft.md`, not filed: filing it needs the user's OK.
+  - What is left of C12 is in the plan's C12 row (README nhctl table, troubleshooting pass, init and SessionStart mentions, full eval run, acceptance, removing `docs/plans/`).
+- **Next:** C5c (L013 outside_write), then C5d and C5e (V13), then C6.
 - **Scopes for C5–C12** are drafted in `scopes/`. `workflows/chunk.js` is the chunk workflow (implement, 2–3 reviewers, fix, verify) they were written for; its args are `repo`, `scratch`, `evalDocs`, `chunk`, `head`, `evalCases`, `scope`, `lenses` and `extraRules`.
 - **Environment fixes this container needed** (not in the repo):
   - uv ≥ 0.10 (`pip install -U uv`);
