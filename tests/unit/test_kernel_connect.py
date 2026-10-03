@@ -322,12 +322,15 @@ def test_either_the_busy_or_the_reply_passes_the_check(
 
 
 def test_the_check_ends_at_its_first_frame(fake: Kernel) -> None:
-    """The reply 0.3 s after the busy: the check takes the busy and doesn't wait for it."""
+    """The busy alone, no reply: the check takes the busy and doesn't wait for the reply. One
+    that waited would time out and connect again (a second client, after 0.52 s at the least);
+    the bound leaves a slow runner its margin (macOS CI took 0.18 s for ~0.02 s of work)."""
     fake.check_frames = {"busy"}
     began = time.monotonic()
     kc = kernel.open_client(SERVER, KID)
     took = time.monotonic() - began
-    assert sent(kc) == ["kernel_info_request"] and took < SETTLE_S + 0.15
+    assert fake.clients == [kc] and sent(kc) == ["kernel_info_request"]
+    assert took < 2 * kernel.CHECK_TIMEOUT_S + RETRY_SETTLE_S
 
 
 def test_a_dead_connection_with_other_requests_traffic_is_still_replaced(

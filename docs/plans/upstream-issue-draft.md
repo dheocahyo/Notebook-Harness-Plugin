@@ -37,6 +37,7 @@ Starts `jupyter server` on a free port with a token, starts one kernel, then N t
 silent) on shell, waits up to 3 s for its execute_reply, closes. Prints the dead connections
 (no reply; a second request on the same connection is tried too).
 """
+
 import datetime, json, os, secrets, socket, subprocess, sys, tempfile, time, uuid
 
 import requests
@@ -45,26 +46,58 @@ import websocket  # websocket-client
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 delay = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
 base = tempfile.mkdtemp()
-s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+port = s.getsockname()[1]
+s.close()
 token = secrets.token_hex(16)
 env = {**os.environ, "JUPYTER_RUNTIME_DIR": base, "JUPYTER_CONFIG_DIR": base}
 server = subprocess.Popen(
-    [sys.executable, "-m", "jupyter_server", "--no-browser", "--ip=127.0.0.1", f"--port={port}",
-     f"--IdentityProvider.token={token}", f"--ServerApp.root_dir={base}"],
-    env=env, stdout=open(os.path.join(base, "server.log"), "w"), stderr=subprocess.STDOUT,
+    [
+        sys.executable,
+        "-m",
+        "jupyter_server",
+        "--no-browser",
+        "--ip=127.0.0.1",
+        f"--port={port}",
+        f"--IdentityProvider.token={token}",
+        f"--ServerApp.root_dir={base}",
+    ],
+    env=env,
+    stdout=open(os.path.join(base, "server.log"), "w"),
+    stderr=subprocess.STDOUT,
 )
 url, headers = f"http://127.0.0.1:{port}", {"Authorization": f"token {token}"}
 
 
 def request(ws, session):
     msg_id = uuid.uuid4().hex
-    ws.send(json.dumps({
-        "header": {"msg_id": msg_id, "username": "u", "session": session, "msg_type": "execute_request",
-                   "version": "5.3", "date": datetime.datetime.now(datetime.timezone.utc).isoformat()},
-        "parent_header": {}, "metadata": {}, "channel": "shell", "buffers": [],
-        "content": {"code": "1", "silent": True, "store_history": False, "user_expressions": {},
-                    "allow_stdin": False, "stop_on_error": False},
-    }))
+    ws.send(
+        json.dumps(
+            {
+                "header": {
+                    "msg_id": msg_id,
+                    "username": "u",
+                    "session": session,
+                    "msg_type": "execute_request",
+                    "version": "5.3",
+                    "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+                "parent_header": {},
+                "metadata": {},
+                "channel": "shell",
+                "buffers": [],
+                "content": {
+                    "code": "1",
+                    "silent": True,
+                    "store_history": False,
+                    "user_expressions": {},
+                    "allow_stdin": False,
+                    "stop_on_error": False,
+                },
+            }
+        )
+    )
     until = time.monotonic() + 3
     ws.settimeout(0.3)
     while time.monotonic() < until:
@@ -85,14 +118,19 @@ try:
         except requests.ConnectionError:
             pass
         time.sleep(0.5)
-    kernel_id = requests.post(url + "/api/kernels", headers=headers, json={"name": "python3"}).json()["id"]
+    kernel_id = requests.post(
+        url + "/api/kernels", headers=headers, json={"name": "python3"}
+    ).json()["id"]
     channels = f"ws://127.0.0.1:{port}/api/kernels/{kernel_id}/channels"
     first = websocket.create_connection(f"{channels}?session_id={uuid.uuid4().hex}", header=headers)
-    request(first, "warm-up"); first.close()  # the kernel is up and idle
+    request(first, "warm-up")
+    first.close()  # the kernel is up and idle
     dead = []
     for i in range(n):
         session = uuid.uuid4().hex
-        ws = websocket.create_connection(f"{channels}?session_id={session}", header=headers, timeout=5)
+        ws = websocket.create_connection(
+            f"{channels}?session_id={session}", header=headers, timeout=5
+        )
         if delay:
             time.sleep(delay)
         answered = request(ws, session)
