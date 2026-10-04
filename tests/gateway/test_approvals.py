@@ -6,9 +6,10 @@ gateway (FakeBackend)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -537,6 +538,83 @@ async def test_headless_grants_nothing_even_with_a_yes_record(
     assert pending(nh)["turn_id"] == "p1"  # the ledger isn't touched while headless
     monkeypatch.delenv("NH_HEADLESS")
     assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+
+
+@contextlib.asynccontextmanager
+async def process(tmp_path: Path, project: Path, backend: FakeBackend) -> AsyncIterator[Harness]:
+    """One `claude -p` process of a session: a new gateway on the same project and the same
+    hook data, as `claude -p --resume` starts one (design §6.4, "Spike V13")."""
+    async with Client(create_server(project, backend)) as client:
+        yield Harness(project, backend, client, Turns(project, tmp_path / "data"))
+
+
+@pytest.mark.parametrize("first", ["headless", "interactive"])
+async def test_headless_mixed_across_processes_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """NH_HEADLESS changed between a session's processes: nothing is written unasked either
+    way. After a headless E122 nothing is recorded, so the first interactive yes gets nh's
+    question; a headless yes to an interactive question is spent, so the next yes asks anew."""
+    project = make_project(tmp_path)
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    for prompt_id, words, headless in zip(
+        ("m1", "m2", "m3"),
+        ("install seaborn", "yes", "yes"),
+        (first == "headless", first == "interactive", False),
+        strict=True,
+    ):
+        if headless:
+            monkeypatch.setenv("NH_HEADLESS", "1")
+        else:
+            monkeypatch.delenv("NH_HEADLESS", raising=False)
+        async with process(tmp_path, project, backend) as h:
+            h.turns.prompt(prompt_id, text=words)
+            result = await h.call("nh_add_cell", prompt_id, **INSTALL)
+            if headless:
+                assert lines(result) == [FIRST, "nh: E122", FINDING, HEADLESS_NEXT]
+            elif first == "headless" and prompt_id == "m3":
+                assert_written(result)
+            else:
+                assert_asked(result)
+    if first == "headless":
+        assert [e["outcome"] for e in events(h, "cell_asked")] == ["headless", "asked"]
+        assert [e["turn_id"] for e in events(h, "cell_granted")] == ["m3"]
+        assert [c["source"] for c in nh_code_cells(h)] == [INSTALL["code"]]
+        assert pending(h) is None
+    else:
+        assert [e["outcome"] for e in events(h, "cell_asked")] == ["asked", "headless", "asked"]
+        assert events(h, "cell_granted") == [] and nh_code_cells(h) == []
+        assert pending(h)["turn_id"] == "m3"
+
+
+async def test_a_new_gateway_holds_a_call_whose_active_notebook_it_forgot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The active notebook is one gateway's (design §6.4, Known gaps). Asked in a process whose
+    active notebook was OTHER, the identical call with no `notebook` is another key in a new
+    gateway (harness.toml's notebook): "held", every time, so the yes is lost and nothing is
+    written. The call that names the notebook keeps the key and is granted."""
+    project = make_project(tmp_path)
+    monkeypatch.setenv("NH_PROJECT_DIR", str(project))
+    backend = FakeBackend(project)
+    async with process(tmp_path, project, backend) as h:
+        h.turns.prompt("m0", text="load the data in the other notebook")
+        assert_written(await h.call("nh_add_cell", "m0", **dict(LOAD, notebook=OTHER)))
+        h.turns.prompt("m1", text="install seaborn")
+        assert_asked(await h.call("nh_add_cell", "m1", **INSTALL))  # in OTHER, the active one
+    assert pending(h)["key"] == approvals.cell_key(OTHER, "add", INSTALL["code"])
+    async with process(tmp_path, project, backend) as h:
+        h.turns.prompt("m2", text="yes")
+        for _ in range(2):  # HELD's Next has the model send it again exactly as before
+            held = await h.call("nh_add_cell", "m2", **INSTALL)
+            assert held.is_error and lines(held)[-2:] == HELD, text(held)
+        assert pending(h)["turn_id"] == "m1" and nh_code_cells(h) == []
+        assert_written(await h.call("nh_add_cell", "m2", **dict(INSTALL, notebook=OTHER)))
+    assert pending(h) is None
+    sources = [c["source"] for c in backend.notebook(OTHER)["cells"] if c["cell_type"] == "code"]
+    assert sources == [LOAD["code"], INSTALL["code"]]
+    assert [e["outcome"] for e in events(h, "cell_asked")] == ["asked", "held", "held"]
 
 
 # --- the ledger ------------------------------------------------------------------------------

@@ -1,13 +1,17 @@
 """config.load: [lint.rules] levels, "ask" among them for the rules that can ask (design
-§6.4), and headless()."""
+§6.4), and headless(), with NH_HEADLESS forwarded by the plugin's .mcp.json."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from nh_gateway import config
+from nh_gateway._meta_rules import tool_meta
+
+MCP_JSON = Path(__file__).resolve().parents[2] / "plugins" / "nh" / ".mcp.json"
 
 
 def project(tmp_path: Path, toml: str) -> Path:
@@ -99,3 +103,20 @@ def test_headless_turns_approval_off(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert config.load(root)["approval"]["approve_before_run"] is True
     monkeypatch.setenv("NH_HEADLESS", "1")
     assert config.load(root)["approval"]["approve_before_run"] is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", True), ("", False)])
+def test_mcp_json_forwards_nh_headless_to_the_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    """Claude Code can pass a stdio server only an allowlisted environment plus the server's own
+    `env` (CLAUDE_CODE_MCP_ALLOWLIST_ENV=1, the local-agent entrypoint), so .mcp.json forwards
+    NH_HEADLESS itself; unset, `${NH_HEADLESS:-}` expands to "", which isn't headless in the
+    gateway or its tools' _meta (design §6.4, "Spike V13")."""
+    env = json.loads(MCP_JSON.read_text())["mcpServers"]["nh"]["env"]
+    assert env["NH_HEADLESS"] == "${NH_HEADLESS:-}"
+    monkeypatch.setenv("NH_HEADLESS", value)
+    assert config.headless() is expected
+    (tmp_path / ".nh").mkdir()
+    meta = tool_meta(tmp_path, approve_before_run=True)
+    assert ("anthropic/requiresUserInteraction" in meta["nh_add_cell"]) is (not expected)

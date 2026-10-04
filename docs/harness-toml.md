@@ -211,4 +211,4 @@ as `# %%`), L003 (title), L004 (bullets), L005 (missing intent) and L007
 |---|---|
 | `NH_JUPYTER_URL` | Overrides `[jupyter].url`. The only way to use a JupyterLab on another host. |
 | `NH_JUPYTER_TOKEN` | Token for the server at `NH_JUPYTER_URL` or `[jupyter].url`. |
-| `NH_HEADLESS=1` | Forces `approve_before_run = false`, for runs with nobody to answer prompts (set it for `claude -p`: nh can't tell such a run apart by itself). A cell nh would ask about (a rule at `"ask"`, E122) is refused, since no yes can arrive. |
+| `NH_HEADLESS=1` | Forces `approve_before_run = false`, for runs with nobody to answer prompts (set it for an unattended `claude -p` run: nh doesn't treat `-p` as headless by itself, since a `-p` run can still carry the user's next message). A cell nh would ask about (a rule at `"ask"`, E122) is refused, since no yes can arrive. Without it, nh treats a `claude -p` run as interactive: a "yes" sent as the next message (stream-json input, or `claude -p "yes" --resume <session>`) has that exact cell written once. |

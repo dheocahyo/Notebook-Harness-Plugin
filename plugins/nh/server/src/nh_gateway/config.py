@@ -99,9 +99,11 @@ def rule_levels(key: str) -> tuple[str, ...]:
 
 
 def headless() -> bool:
-    """``NH_HEADLESS=1``: a run with nobody to answer (a ``claude -p`` run sets it; the gateway
-    can't see ``-p`` itself). No approval prompt, and no yes can arrive for a question nh asks,
-    so E122 stands (design §6.4)."""
+    """``NH_HEADLESS=1``: a run with nobody to answer. Set it for an unattended ``claude -p``
+    run: nothing sets it for you, and nh doesn't treat ``-p`` as headless by itself, since a
+    print-mode run can still carry the user's next message (design §6.4, spike V13). No approval
+    prompt, and no yes can arrive for a question nh asks, so E122 stands (design §6.4).
+    ``.mcp.json`` forwards it; unset, it arrives as "", which isn't headless."""
     return os.environ.get(HEADLESS_ENV) == "1"
 
 
