@@ -109,6 +109,13 @@ CATALOGUE: dict[str, tuple[str, str]] = {
         "Not {verb}: this needs the user's yes first.",
         "Ask the user nh's question, then stop. After a yes, send the same call again.",
     ),
+    "E123": (
+        "Not {verb}: the approved {what} stopped at step {step}; nh changes nothing more this "
+        "message.",
+        "Report the batch to the user: what each step did, then where and why it stopped (the "
+        "error, the 'check this' finding or nh's question). No retry and no new cell this "
+        "message; wait for the user.",
+    ),
     "E125": (
         "Not written: the code holds nh's [redacted:…] marker, not the real value.",
         # nh doesn't load .env into the kernel: os.environ alone misses a .env value (C3 review)
@@ -208,6 +215,8 @@ class NhError(ToolError):
             "url": "",
             "cell_id": "",
             "previous": "none",
+            "what": "batch",
+            "step": "k",
         }
         defaults.update({k: v for k, v in fields.items() if v is not None})
         inline = "{detail}" in head

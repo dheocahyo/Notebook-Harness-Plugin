@@ -163,6 +163,20 @@ def no_write_mode(record: dict[str, Any] | None, turn_id: str | None) -> str | N
     return mode if mode in intent.MODES else None
 
 
+def approved_batch(record: dict[str, Any] | None, turn_id: str | None) -> int | None:
+    """The ``n`` of the batch the previous message asked for, when ``turn_id`` is the record's
+    turn and its message is a yes (design §6.3), else None. The gateway also needs no pending
+    question of the previous message and an interactive session before it grants one."""
+    if record is None or not turn_id or turn_id != record.get("turn_id"):
+        return None
+    if record.get("answer") != "yes":
+        return None
+    request = intent.valid_request(record.get("prev_request"))
+    if request is None or not request.get("batch"):
+        return None
+    return int(request["n"])
+
+
 def running(record: dict[str, Any] | None, prompt_id: str | None) -> bool:
     """Whether a human message with ``prompt_id`` was typed into the running turn (spike V16:
     Claude Code resubmits that turn's prompt id). The running turn is the human turn itself,

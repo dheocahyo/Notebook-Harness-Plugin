@@ -120,3 +120,36 @@ def test_mcp_json_forwards_nh_headless_to_the_gateway(
     (tmp_path / ".nh").mkdir()
     meta = tool_meta(tmp_path, approve_before_run=True)
     assert ("anthropic/requiresUserInteraction" in meta["nh_add_cell"]) is (not expected)
+
+
+# --- [turn] max_batch (design §6.3) ----------------------------------------------------------
+
+
+def test_max_batch_defaults_to_5() -> None:
+    assert config.DEFAULTS["turn"]["max_batch"] == 5
+    assert config.load(None)["turn"]["max_batch"] == 5
+
+
+@pytest.mark.parametrize("value", [1, 2, 7, 999])
+def test_max_batch_takes_an_integer_of_at_least_1(tmp_path: Path, value: int) -> None:
+    cfg = config.load(project(tmp_path, f"[turn]\nmax_batch = {value}\n"))
+    assert cfg.problems == [] and cfg["turn"]["max_batch"] == value
+
+
+@pytest.mark.parametrize(
+    ("written", "problems"),
+    [
+        ("0", ["turn.max_batch must be an integer >= 1"]),
+        ("-2", ["turn.max_batch must be an integer >= 1"]),
+        ("2.5", ["turn.max_batch must be an integer >= 1"]),
+        ("3.0", ["turn.max_batch must be an integer >= 1"]),
+        ('"3"', ["turn.max_batch must be int"]),
+        ("true", ["turn.max_batch must be int"]),
+    ],
+)
+def test_any_other_max_batch_reads_as_5_with_a_problem(
+    tmp_path: Path, written: str, problems: list[str]
+) -> None:
+    cfg = config.load(project(tmp_path, f"[turn]\nmax_batch = {written}\n"))
+    assert cfg.problems == problems
+    assert cfg["turn"]["max_batch"] == 5

@@ -350,11 +350,13 @@ def status_word(result: ExecResult | None) -> str:
 def machine_line(
     uid: str, exec_count: int | None, state: TurnState, cfg: Config, *, writer: bool = False
 ) -> str:
-    """``writer``: nh:cell-writer's results also count its revisions (the workflow reads them)."""
+    """``writer``: nh:cell-writer's results also count its revisions (the workflow reads them).
+    An approved batch (design §6.3) counts against its own size: ``turn=k/N batch``."""
     turn = cfg["turn"]
+    limit = f"{state.batch_total} batch" if state.batch_total else str(turn["max_code_cells"])
     line = (
         f"nh: cell={uid} exec={exec_count if exec_count is not None else '-'} "
-        f"turn={len(state.claims)}/{turn['max_code_cells']} "
+        f"turn={len(state.claims)}/{limit} "
         f"retries={state.retries.get(uid, 0)}/{turn['max_retries']} "
         f"waits={state.waits}/{turn['max_waits']} undos={state.undos}/{turn['max_undos']}"
     )

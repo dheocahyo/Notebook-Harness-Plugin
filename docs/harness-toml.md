@@ -85,6 +85,7 @@ message: it shares the budget of the message it belongs to.
 | `max_waits` | `2` | `nh_run(mode="wait")` calls per message for a cell still running. |
 | `max_undos` | `3` | `nh_undo` calls per message. |
 | `max_lint_rejects` | `3` | Rejected write attempts per message before nh asks the agent to stop and explain to you what it is trying to write. |
+| `max_batch` | `5` | The most steps one approved batch writes: when you ask for several plan steps ("run the next 3") and answer the agent's question with yes, that message may write up to `min(N, max_batch)` cells, stopping at the first step that fails or needs a look. An integer of at least 1. |
 | `stamp_ttl_s` | `1800` | Seconds a hook's turn stamp stays valid. Older stamps are discarded. |
 
 ## `[exec]`

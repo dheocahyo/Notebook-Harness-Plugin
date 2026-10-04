@@ -11,6 +11,7 @@ from fastmcp.tools import ToolResult
 
 from .. import dataflow, render
 from ..policy.errors import NhError
+from . import batch
 from .common import (
     RETRYABLE,
     RunRecord,
@@ -59,11 +60,13 @@ async def run_cell(
     ref = await svc.resolve(notebook)
     kernel = await svc.backend.kernel_status(ref)
     lead, kernel_lines = kernel_notes(svc, ref, kernel)
-    async with svc.locks.hold(ref.rel_path, turn):
+    async with svc.locks.hold(ref.rel_path, turn), batch.stops(svc, turn) as attempt:
         state = svc.ledger.get(turn.session_id, turn.prompt_id)
         cells = await snapshot(svc, ref)
         _rebuild_claims(state, cells, ref.rel_path)
         review_earlier_cells(svc, ref, cells, state)
+        # design §6.3: E123 after an approved batch's stop
+        batch.enter(svc, turn, state, new_cell=False, verb="run")
         found = find_cell(cells, cell_id)
         if found is None:
             raise NhError("E140", cell_id=cell_id)
@@ -75,6 +78,7 @@ async def run_cell(
         if target.running:
             raise NhError("E133", detail=f" running {name}")
         uid = uid_of(target)
+        attempt.uid = uid
         retry = False
         if state.claims:
             if uid not in state.claims:

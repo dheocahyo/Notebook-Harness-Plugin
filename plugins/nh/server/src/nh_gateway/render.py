@@ -726,15 +726,83 @@ def _plural(count: int, word: str, plural: str) -> str:
 
 
 def next_block(
-    status: str, *, retries_left: int, waits_left: int, cell: str, audience: str = "main"
+    status: str,
+    *,
+    retries_left: int,
+    waits_left: int,
+    cell: str,
+    audience: str = "main",
+    batch: tuple[int, int, int] | None = None,
+    check_this: bool = False,
 ) -> str:
     """The reply contract for the agent, by run status (plan §4.2).
 
     ``audience="writer"``: nh:cell-writer's texts. Its final answer goes to the nh:qa-cell
     workflow, never to the user, so each says to return the whole result there.
+
+    ``batch``: (step, total, stopped_at) for a cell of the message's approved batch (design
+    §6.3; ``stopped_at`` 0 while it goes), with ``check_this`` when the result has that section.
     """
     if audience == "writer":
         return _writer_next(status, retries_left=retries_left, waits_left=waits_left, cell=cell)
+    plain = _main_next(status, retries_left=retries_left, waits_left=waits_left, cell=cell)
+    if batch is None:
+        return plain
+    return _batch_next(status, plain, cell=cell, batch=batch, check_this=check_this)
+
+
+BATCH_LAST = "That was step {total} of {total}, the last of the approved batch. "
+
+
+def _batch_next(
+    status: str, plain: str, *, cell: str, batch: tuple[int, int, int], check_this: bool
+) -> str:
+    """The next block of a cell in an approved batch (design §6.3): go on to the next step,
+    or stop there and report."""
+    step, total, stop = batch
+    subject = cell[:1].upper() + cell[1:]
+    if not stop:
+        if status != "ok":  # a result that isn't ok always stops the batch
+            return plain
+        if step < total:
+            return (
+                f"Step {step} of {total} of the approved batch ran OK. Give the user a short "
+                f"report on {cell}: what it did and the real numbers, surprises first, named by "
+                f"title and [n]. Then write step {step + 1} of the plan with nh_add_cell, "
+                "without waiting for the user."
+            )
+        last = plain.replace("Do not write a second cell.", "Do not write another cell.")
+        return BATCH_LAST.format(total=total) + last
+    if status == "ok" and check_this and stop == step:
+        return (
+            f"The approved batch stops at step {step} of {total}: {cell} ran, but its result "
+            "needs a look (see 'check this'). Reply to the user about it: lead with the 'check "
+            "this' finding, then what the cell did and the real numbers, and say which planned "
+            "steps did not run. Write no other cell and don't change this one in this message; "
+            "wait for the user."
+        )
+    if status == "ok":
+        return (
+            f"{subject} ran OK, but the approved batch stopped at step {stop} of {total}. Report "
+            "the batch to the user: what each step did, then where and why it stopped. Write no "
+            "other cell; wait for the user."
+        )
+    if status == "error" and stop == step:
+        return (
+            f"The approved batch stops at step {step} of {total}: {subject} failed. Don't fix it "
+            "in this message: a batch has no retries. Explain in plain words: quote the failing "
+            "code, what Python said, the likely cause and one fix; say which planned steps did "
+            "not run; then wait."
+        )
+    verb = "stops" if stop == step else "stopped"
+    return (
+        f"{plain} The approved batch {verb} at step {stop} of {total}: say which planned steps "
+        "did not run."
+    )
+
+
+def _main_next(status: str, *, retries_left: int, waits_left: int, cell: str) -> str:
+    """The main conversation's reply contract for one cell's result."""
     subject = cell[:1].upper() + cell[1:]  # opens a sentence; untitled labels read "the cell `…`"
     if status == "ok":
         return (

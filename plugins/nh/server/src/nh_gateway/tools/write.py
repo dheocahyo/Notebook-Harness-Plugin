@@ -31,7 +31,7 @@ from ..lint.lint import LintReport, lint_cell
 from ..policy.errors import RETURN_TO_WORKFLOW, NhError, scrub
 from ..policy.turn import TurnContext, TurnState
 from ..state import write_last_cell
-from . import approvals
+from . import approvals, batch
 from .common import (
     RETRYABLE,
     RunRecord,
@@ -496,8 +496,9 @@ async def report_run(
     harness_ms = int((time.monotonic() - started_at) * 1000) if started_at else None
     result = await _wait(svc, record.execution, turn, cfg, ctx)
     status = effective_status(result, record.execution)
-    state.status[uid] = status
-    svc.ledger.save(state)
+    if not batch.going(state):  # a going batch sets it with its stop (batch.reported)
+        state.status[uid] = status
+        svc.ledger.save(state)
     exec_count = result.execution_count if result else None
     note_last_cell(svc, record, status, exec_count, finished=result is not None)
     if result is not None:
@@ -520,6 +521,8 @@ async def report_run(
     selfcheck, check_this = (
         render.selfcheck(before, after, code=code) if (before and after) else ([], [])
     )
+    # design §6.3: a result that isn't ok, or has a 'check this', stops an approved batch
+    step = batch.reported(svc, turn, state, uid, status, check_this)
     cell_name = render.cell_label(record.title, exec_count, code)
     retries_left = max(0, int(cfg["turn"]["max_retries"]) - state.retries.get(uid, 0))
     waits_left = max(0, int(cfg["turn"]["max_waits"]) - state.waits)
@@ -548,6 +551,8 @@ async def report_run(
             waits_left=waits_left,
             cell=cell_name,
             audience="writer" if writer else "main",
+            batch=None if writer else step,
+            check_this=bool(check_this),
         ),
     )
 
@@ -659,10 +664,14 @@ async def e110(
     turn: TurnContext | None = None,
 ) -> NhError:
     """A second cell was asked for; if this message's cell failed, point at fixing it instead.
-    nh:cell-writer (``turn``) returns the refusal to the workflow either way."""
+    nh:cell-writer (``turn``) returns the refusal to the workflow either way. After an approved
+    batch's last cell (design §6.3) the detail says the batch is done."""
     uid, cell, name = await _claimed(svc, ref, cells, state)
+    full = batch.FULL_LINE.format(total=state.batch_total) if state.batch_total else ""
     if turn is not None and is_writer(turn):
-        return NhError("E110", cell=name, next_step=RETURN_TO_WORKFLOW)
+        return NhError("E110", full, cell=name, next_step=RETURN_TO_WORKFLOW)
+    if full:
+        return NhError("E110", full, cell=name)
     left = int(cfg["turn"]["max_retries"]) - state.retries.get(uid, 0)
     if state.status.get(uid) in RETRYABLE and left > 0 and cell is not None:
         notebook = state.claim_notebooks.get(uid, ref.rel_path)
@@ -693,22 +702,28 @@ async def add_cell(
     windows_guard()
     started = time.monotonic()
     turn = current_turn()
-    refuse_redacted(code)
+    try:
+        refuse_redacted(code)
+    except NhError as exc:
+        await batch.refused_early(svc, turn, exc)  # design §6.3: it stops an approved batch
+        raise
     cfg = svc.config()
     ref = await svc.resolve(notebook)
     kernel = await svc.backend.kernel_status(ref)
     lead, kernel_lines = kernel_notes(svc, ref, kernel)
 
-    async with svc.locks.hold(ref.rel_path, turn):
+    async with svc.locks.hold(ref.rel_path, turn), batch.stops(svc, turn):
         state = svc.ledger.get(turn.session_id, turn.prompt_id)
         state.notebook = ref.rel_path
         cells = await snapshot(svc, ref)
         _rebuild_claims(state, cells, ref.rel_path)
         review_earlier_cells(svc, ref, cells, state)
         writer = is_writer(turn)
+        # design §6.3: the message's batch (E123 after its stop), then E110's cap
+        batch.enter(svc, turn, state, new_cell=True)
         if writer:
             await refuse_other_run(svc, ref, cells, state, turn)
-        if len(state.claims) >= int(cfg["turn"]["max_code_cells"]):
+        if len(state.claims) >= batch.cap(state, cfg):
             raise await e110(svc, ref, cells, state, cfg, turn)
         refuse_if_running(svc, ref, cells)
         if state.lint_rejects >= int(cfg["turn"]["max_lint_rejects"]):
@@ -862,7 +877,11 @@ async def edit_cell(
     windows_guard()
     started = time.monotonic()
     turn = current_turn()
-    refuse_redacted(code)
+    try:
+        refuse_redacted(code)
+    except NhError as exc:
+        await batch.refused_early(svc, turn, exc)  # design §6.3: it stops an approved batch
+        raise
     writer = is_writer(turn)
     if writer:
         base_sha = None  # refuse_user_code: nobody in the background can confirm the user's change
@@ -871,12 +890,13 @@ async def edit_cell(
     kernel = await svc.backend.kernel_status(ref)
     lead, kernel_lines = kernel_notes(svc, ref, kernel)
 
-    async with svc.locks.hold(ref.rel_path, turn):
+    async with svc.locks.hold(ref.rel_path, turn), batch.stops(svc, turn) as attempt:
         state = svc.ledger.get(turn.session_id, turn.prompt_id)
         state.notebook = ref.rel_path
         cells = await snapshot(svc, ref)
         _rebuild_claims(state, cells, ref.rel_path)
         review_earlier_cells(svc, ref, cells, state)
+        batch.enter(svc, turn, state, new_cell=False)  # design §6.3: E123 after a batch's stop
         if writer:
             await refuse_other_run(svc, ref, cells, state, turn)
         found = find_cell(cells, cell_id)
@@ -890,6 +910,7 @@ async def edit_cell(
         if target.running:
             raise NhError("E133", detail=f" running {target_label}")
         uid = uid_of(target)
+        attempt.uid = uid
         if writer:
             refuse_user_code(svc, uid, ref, target, target_label)
 

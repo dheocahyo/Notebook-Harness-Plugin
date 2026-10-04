@@ -90,6 +90,11 @@ def load(project: Path | None) -> Config:
         if value not in levels:
             problems.append(f"lint.rules.{key} must be {'|'.join(levels)}")
             data["lint"]["rules"][key] = DEFAULTS["lint"]["rules"].get(key, "hint")
+    # The most steps one approved batch writes (design §6.3): an integer of at least 1.
+    max_batch = data["turn"]["max_batch"]
+    if isinstance(max_batch, bool) or not isinstance(max_batch, int) or max_batch < 1:
+        problems.append("turn.max_batch must be an integer >= 1")
+        data["turn"]["max_batch"] = DEFAULTS["turn"]["max_batch"]
     return Config(data=data, problems=problems, source_mtime=mtime)
 
 

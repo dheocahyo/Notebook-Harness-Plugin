@@ -580,3 +580,28 @@ def test_run_for_agent_gives_up_after_the_wait(layout: Layout) -> None:
 
     assert tr.run_for_agent(layout, SESSION, "a1", sleep=sleep, clock=lambda: clock[0]) is None
     assert sum(slept) == pytest.approx(tr.META_WAIT_S)
+
+
+def test_approved_batch_is_the_previous_requests_n_in_a_yes_turn(layout: Layout) -> None:
+    """The batch grant's record part (design §6.3): a yes message right after a batch request,
+    for the record's own turn (an alias passed as its canonical turn)."""
+    asked = tr.opened(SESSION, "p1", 1.0, None, classified("ask", BATCH3))
+    assert tr.approved_batch(asked, "p1") is None  # the ask message itself
+    yes = tr.opened(SESSION, "p2", 2.0, asked, classified(answer="yes"))
+    assert tr.approved_batch(yes, "p2") == 3
+    assert tr.approved_batch(yes, "p1") is None and tr.approved_batch(yes, None) is None
+    alias = tr.aliased(yes, "n1", 2.5)
+    assert tr.approved_batch(alias, tr.canonical(alias, "n1")) == 3
+    absorbed = tr.absorbed(yes, "p2", classified(answer="no"))  # never an answer mid-turn
+    assert tr.approved_batch(absorbed, "p2") == 3
+    for answer in ("no", None):
+        other = tr.opened(SESSION, "p2", 2.0, asked, classified(answer=answer))
+        assert tr.approved_batch(other, "p2") is None
+    later = tr.opened(SESSION, "p3", 3.0, yes, classified(answer="yes"))
+    assert tr.approved_batch(later, "p3") is None  # two messages later: the yes had no request
+    stale = tr.opened(SESSION, "p1", 1.0, None, classified("ask", {"rerun_stale": True}))
+    rerun_yes = tr.opened(SESSION, "p2", 2.0, stale, classified(answer="yes"))
+    assert tr.approved_batch(rerun_yes, "p2") is None  # C7's request, not a batch
+    assert tr.approved_batch(None, "p2") is None
+    write_record(layout, {"v": 1, "prompt_id": "p2", "ts": 2.0, "answer": "yes"})
+    assert tr.approved_batch(tr.read(layout, SESSION), "p2") is None  # a v1 record
