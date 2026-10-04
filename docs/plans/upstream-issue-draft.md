@@ -187,8 +187,10 @@ A message sent right after the handshake runs: tornado hands it to `on_message` 
 Wait 20 ms after the handshake before the first message; when the kernel is idle, check a new
 connection with a `kernel_info_request` (its busy or its reply within 0.5 s); if it doesn't
 answer, open another connection (0.1 s before its first message: an immediate retry stuck 3 of
-24 times, 0 of 22 after 20 ms) and keep listening on the first, which then usually answers; use
-whichever answers first.
+24 times, 0 of 22 after 20 ms), check it the same way, and use the first connection whose own
+check answers in time (at most three), closing the unanswered ones. We used to take the stuck
+connection once it answered (after the next one opened), but under load such a connection
+sometimes missed the next request (2 traced cases among 122 such connections).
 
 ## Separately: Nagle on kernel websockets (jupyter_server)
 

@@ -5,8 +5,9 @@ sent right after the handshake is sometimes dead: the kernel doesn't run its req
 another connection to it opens.
 ``open_client`` sends nothing for ``CONNECT_SETTLE_S``, and when nh's own GET says the kernel is
 idle, the connection must answer a ``kernel_info_request`` (its busy or its reply), else nh
-connects again, a bounded number of times, still listening on the unanswered connections; the
-first to answer is used and the others are closed in a thread (never the kernel). A probe holds
+connects again, a bounded number of times; the first connection to answer its own check in time
+is used and the others are closed in a thread (never the kernel). A stuck one's answer once the
+next opens passes no check; it counts only when none answers in time. A probe holds
 ``probe_lock`` while it connects, and a run that starts meanwhile has it retire its client at its
 end. These tests use a stand-in client and kernel; the real stack is
 ``tests/integration/test_kernel_connections.py``.
@@ -38,8 +39,8 @@ KID = "0f2b5c1e-1111-4222-8333-944445555666"
 SETTLE_S = 0.02  # design §6.13: 0 of 850 first messages died this long after the handshake
 RETRY_SETTLE_S = 0.1  # a connection replacing a dead one: immediate retries died 3 of 24 times
 REPLACED = "connecting again"
-LATE = "answered nh's kernel_info_request late"
 UNANSWERED = "none of 3 new connections answered"
+KEPT = "no new connection answered nh's kernel_info_request in its window"
 
 
 class Channel:
@@ -80,11 +81,13 @@ class Kernel:
     ``states``, one per GET while it lasts; the first ``dead`` connections never answer anything.
     The check's answer: ``check_frames`` are the frames it gets (of busy, idle, reply),
     ``check_hold`` those held back until the next request is sent (after
-    ``KernelRequest.send()``'s drain), ``slow`` the seconds before the rest arrive. ``run_delay``
-    holds a run's (not a probe's) whole answer back that long. ``slow_close`` is how long a dead
-    connection's stop() takes; ``noise`` puts other requests' messages on a dead connection.
-    ``stuck``: a dead connection's requests are answered once another connection opens, as on
-    the real stack (design §6.13), not never.
+    ``KernelRequest.send()``'s drain). ``slow``: the kernel answers no check until that long
+    after the first was sent, then each at once, as a kernel running its requests in turn does.
+    ``run_delay`` holds a run's (not a probe's) whole answer back that long. ``slow_close`` is
+    how long a dead connection's stop() takes; ``noise`` puts other requests' messages on a dead
+    connection. ``stuck``: a dead connection's requests are answered once another connection
+    opens, as on the real stack (design §6.13), not never: True for every dead one, or the
+    indexes of the stuck ones (the others stay dead).
     """
 
     def __init__(self, state: Any = "idle", dead: int = 0) -> None:
@@ -94,10 +97,11 @@ class Kernel:
         self.check_frames = {"busy", "idle", "reply"}
         self.check_hold: set[str] = set()
         self.slow = 0.0
+        self.free_at: float | None = None  # when a slow kernel answers (set at the first check)
         self.run_delay = 0.0
         self.slow_close = 0.0
         self.noise = False
-        self.stuck = False
+        self.stuck: bool | set[int] = False
         self.exists = True
         self.clients: list[FakeKernelClient] = []
         self.shutdowns = 0
@@ -112,13 +116,17 @@ class Kernel:
             raise state
         return None if state is None else {"id": KID, "execution_state": state}
 
+    def is_stuck(self, index: int) -> bool:
+        return self.stuck is True or (isinstance(self.stuck, set) and index in self.stuck)
+
 
 class Socket:
     """Stands in for jupyter-kernel-client's KernelWebSocketClient."""
 
-    def __init__(self, kernel_: Kernel, dead: bool) -> None:
+    def __init__(self, kernel_: Kernel, dead: bool, index: int = 0) -> None:
         self.kernel = kernel_
         self.dead = dead
+        self.index = index  # which connection to the kernel it is, from 0
         self.connection_ready = threading.Event()
         self.shell_channel = Channel()
         self.iopub_channel = Channel()
@@ -166,7 +174,7 @@ class Socket:
 
     def _answer_check(self, parent: dict[str, Any]) -> None:
         if self.dead:
-            if self.kernel.stuck:
+            if self.kernel.is_stuck(self.index):
                 self.waiting.append(parent)
             return
         reply = message("kernel_info_reply", parent, status="ok", protocol_version="5.4")
@@ -176,7 +184,10 @@ class Socket:
         )
         now = [f for f in frames if f[0] not in self.kernel.check_hold]
         if self.kernel.slow:
-            threading.Timer(self.kernel.slow, self._deliver, args=(now,)).start()
+            if self.kernel.free_at is None:
+                self.kernel.free_at = time.monotonic() + self.kernel.slow
+            delay = max(0.0, self.kernel.free_at - time.monotonic())
+            threading.Timer(delay, self._deliver, args=(now,)).start()
         else:
             self._deliver(now)
 
@@ -222,7 +233,8 @@ class FakeKernelClient:
         self.kwargs = kwargs
         self.kernel = kernel_
         self.has_kernel = kernel_.exists
-        self.socket = Socket(kernel_, dead=len(kernel_.clients) < kernel_.dead)
+        index = len(kernel_.clients)
+        self.socket = Socket(kernel_, dead=index < kernel_.dead, index=index)
         if self.socket.dead and kernel_.noise:  # an earlier request's late reply and status
             stale = {"msg_id": uuid.uuid4().hex, "msg_type": "kernel_info_request"}
             self.socket.iopub_channel.put(message("status", stale, execution_state="idle"))
@@ -236,7 +248,7 @@ class FakeKernelClient:
         self.socket.opened_at = time.monotonic()
         self.socket.connection_ready.set()
         for other in self.kernel.clients:  # a new connection unsticks the stuck ones
-            if other is not self and other.socket.dead and self.kernel.stuck:
+            if other is not self and other.socket.dead and self.kernel.is_stuck(other.socket.index):
                 other.socket.dead = False
                 for parent in other.socket.waiting:
                     other.socket._answer_check(parent)
@@ -346,12 +358,15 @@ def test_a_dead_connection_with_other_requests_traffic_is_still_replaced(
     assert len(records(caplog, logging.INFO, REPLACED)) == 1
 
 
-def test_a_late_answer_on_an_earlier_connection_is_used(fake: Kernel, caplog, monkeypatch) -> None:
-    """An idle but slow kernel: the first connection's answer comes after its window, while the
-    second's check waits. nh uses the first, closes the second, and connects no more. The window
-    is 1 s here, so the time taken tells taking the answer when it comes (~1.2 s) from waiting
-    out the second window (2 windows and the retry's settle, ~2.1 s) on a slow runner too: with
-    0.2 s windows that was 0.37 s against 0.52 s, and macOS CI took 0.56 s."""
+def test_a_slow_kernel_is_answered_on_the_newest_connection(
+    fake: Kernel, caplog, monkeypatch
+) -> None:
+    """An idle but slow kernel: it answers the first connection's check after its window, and
+    the second's, sent meanwhile, right after. nh uses the second, closes the first, and
+    connects no more. The window is 1 s here, so the time taken tells taking the second's answer
+    when it comes (~1.2 s) from waiting out the second window (2 windows and the retry's settle,
+    ~2.1 s) on a slow runner too: with 0.2 s windows that was 0.37 s against 0.52 s, and macOS
+    CI took 0.56 s."""
     monkeypatch.setattr(kernel, "CHECK_TIMEOUT_S", 1.0)
     caplog.set_level(logging.INFO, logger="nh_gateway")
     fake.slow = kernel.CHECK_TIMEOUT_S + 0.15  # inside the second connection's window
@@ -359,31 +374,108 @@ def test_a_late_answer_on_an_earlier_connection_is_used(fake: Kernel, caplog, mo
     kc = kernel.open_client(SERVER, KID)
     took = time.monotonic() - began
     first, second = fake.clients
-    assert kc is first and first.stops == [] and first.socket.connection_ready.is_set()
-    assert closed(second) == [False] and fake.shutdowns == 0
+    assert kc is second and second.stops == [] and second.socket.connection_ready.is_set()
+    assert closed(first) == [False] and fake.shutdowns == 0
     assert sent(first) == sent(second) == ["kernel_info_request"]
     assert took < 1.5 * kernel.CHECK_TIMEOUT_S + RETRY_SETTLE_S
     assert len(records(caplog, logging.INFO, REPLACED)) == 1
-    [late] = records(caplog, logging.INFO, LATE)
-    assert "nh uses it and closes the newer one" in late.getMessage()
     assert records(caplog, logging.WARNING, "") == []
-    # The first connection works, and its late check reaches nothing that follows.
+    # The second connection works, and its check reaches nothing that follows.
     answer = probes.run_probe(kc._manager.client, "attach", {}, 2.0)
     [_, (_, probe_id, _)] = kc.socket.sent
     assert answer == {"answer": {"msg_id": probe_id, "msg_type": "execute_request"}}
 
 
-def test_a_stuck_connection_that_answers_once_another_opens_is_used(fake: Kernel, caplog) -> None:
+def test_a_stuck_connection_that_answers_once_another_opens_is_not_used(
+    fake: Kernel, caplog
+) -> None:
     """The real stack's case (design §6.13): the first connection answers its check a few ms
-    after nh opens the second. nh uses the first, which then works, and closes the second."""
+    after nh opens the second. nh uses the second, which answered its own check, and closes the
+    first: in the integration loop, stuck connections used once they answered sometimes missed
+    the probe sent next (2 traced in 122)."""
     caplog.set_level(logging.INFO, logger="nh_gateway")
     fake.dead, fake.stuck = 1, True
     kc = kernel.open_client(SERVER, KID)
     first, second = fake.clients
-    assert kc is first and first.stops == [] and closed(second) == [False]
+    assert kc is second and second.stops == [] and closed(first) == [False]
+    assert sent(first) == sent(second) == ["kernel_info_request"]
     assert len(records(caplog, logging.INFO, REPLACED)) == 1
-    assert len(records(caplog, logging.INFO, LATE)) == 1
     assert records(caplog, logging.WARNING, "") == []
+    answer = probes.run_probe(kc._manager.client, "attach", {}, 2.0)
+    assert "answer" in answer and fake.shutdowns == 0
+
+
+def test_an_earlier_connections_late_answer_doesnt_pass_the_newer_ones_check(
+    fake: Kernel, caplog
+) -> None:
+    """Two stuck connections in a row (they come in runs): each answers once the next opens.
+    The second's check takes only the second's own answer, so nh connects a third time and uses
+    the third."""
+    caplog.set_level(logging.INFO, logger="nh_gateway")
+    fake.dead, fake.stuck = 2, True
+    kc = kernel.open_client(SERVER, KID)
+    first, second, third = fake.clients
+    assert kc is third and third.stops == []
+    assert [closed(first), closed(second)] == [[False], [False]]
+    assert len(records(caplog, logging.INFO, REPLACED)) == 2
+    assert records(caplog, logging.WARNING, "") == []
+
+
+def test_when_none_answers_in_time_the_newest_that_answered_since_is_kept(
+    fake: Kernel, caplog
+) -> None:
+    """Three stuck connections: the first two answer once the next opens, the third never. nh
+    keeps the second, which answered late, over the third, which never did, and warns."""
+    caplog.set_level(logging.INFO, logger="nh_gateway")
+    fake.dead, fake.stuck = 3, True
+    kc = kernel.open_client(SERVER, KID)
+    first, second, third = fake.clients
+    assert kc is second and second.stops == []
+    assert [closed(first), closed(third)] == [[False], [False]]
+    assert len(records(caplog, logging.INFO, REPLACED)) == 2
+    [kept] = records(caplog, logging.INFO, KEPT)
+    assert "keeps connection 2 of 3, which answered after its window" in kept.getMessage()
+    [warning] = records(caplog, logging.WARNING, UNANSWERED)
+    message = warning.getMessage()
+    assert "uses the newest that answered since and is still open, else the last one" in message
+    answer = probes.run_probe(kc._manager.client, "attach", {}, 2.0)
+    assert "answer" in answer and fake.shutdowns == 0
+
+
+def test_when_only_the_first_answers_since_it_is_the_one_kept(fake: Kernel, caplog) -> None:
+    """The first connection is stuck and answers once the second opens; the second and third
+    never answer. nh keeps the first, the newest that answered since, not the one before the
+    last."""
+    caplog.set_level(logging.INFO, logger="nh_gateway")
+    fake.dead, fake.stuck = 3, {0}
+    kc = kernel.open_client(SERVER, KID)
+    first, second, third = fake.clients
+    assert kc is first and first.stops == []
+    assert [closed(second), closed(third)] == [[False], [False]]
+    [kept] = records(caplog, logging.INFO, KEPT)
+    assert "keeps connection 1 of 3, which answered after its window" in kept.getMessage()
+    assert len(records(caplog, logging.WARNING, UNANSWERED)) == 1
+    answer = probes.run_probe(kc._manager.client, "attach", {}, 2.0)
+    assert "answer" in answer and fake.shutdowns == 0
+
+
+def test_a_connection_that_closed_after_it_answered_is_not_kept(fake: Kernel, caplog) -> None:
+    """Three stuck connections, and the second closes as the third's check goes out, after it
+    answered: nh keeps the first, which answered too and is still open."""
+    caplog.set_level(logging.INFO, logger="nh_gateway")
+    fake.dead, fake.stuck = 3, True
+
+    def drop_the_second() -> None:
+        if len(fake.clients) == 3:
+            fake.clients[1].socket.connection_ready.clear()
+
+    fake.on_check = drop_the_second
+    kc = kernel.open_client(SERVER, KID)
+    first, second, third = fake.clients
+    assert kc is first and first.stops == [] and first.socket.connection_ready.is_set()
+    assert [closed(second), closed(third)] == [[False], [False]]
+    [kept] = records(caplog, logging.INFO, KEPT)
+    assert "keeps connection 1 of 3, which answered after its window" in kept.getMessage()
     answer = probes.run_probe(kc._manager.client, "attach", {}, 2.0)
     assert "answer" in answer and fake.shutdowns == 0
 
@@ -495,24 +587,38 @@ def test_nothing_is_sent_before_the_settle(fake: Kernel, state: str) -> None:
     assert first_send - kc.socket.opened_at >= SETTLE_S == kernel.CONNECT_SETTLE_S
 
 
-def test_the_attempts_are_bounded_and_the_last_client_is_kept(fake: Kernel, caplog) -> None:
+def test_the_attempts_are_bounded_and_the_last_client_is_kept(
+    fake: Kernel, caplog, monkeypatch
+) -> None:
+    """Three windows and two retry settles (~1.12 s with 0.3 s windows), then the look for late
+    answers, which doesn't wait: waiting a window on each connection would take ~2.0 s. The
+    bound (1.7 s) leaves a slow runner ~0.6 s (macOS CI took 0.19 s more than here for one
+    connect)."""
+    monkeypatch.setattr(kernel, "CHECK_TIMEOUT_S", 0.3)
     caplog.set_level(logging.INFO, logger="nh_gateway")
     fake.dead = 99
+    began = time.monotonic()
     kc = kernel.open_client(SERVER, KID)
+    took = time.monotonic() - began
+    assert took < 5 * kernel.CHECK_TIMEOUT_S + 2 * RETRY_SETTLE_S
     assert len(fake.clients) == kernel.CONNECT_ATTEMPTS == 3
     *dropped, kept = fake.clients
     assert kc is kept and kept.stops == [] and kept.socket.connection_ready.is_set()
     assert [closed(client) for client in dropped] == [[False], [False]]
     assert len(records(caplog, logging.INFO, REPLACED)) == 2
+    [info] = records(caplog, logging.INFO, KEPT)
+    assert "keeps connection 3 of 3, the last, as none still open answered" in info.getMessage()
     [warning] = records(caplog, logging.WARNING, UNANSWERED)
-    assert KID in warning.getMessage() and "uses the last one" in warning.getMessage()
+    assert KID in warning.getMessage() and "else the last one" in warning.getMessage()
     assert "or a kernel too slow to answer" in warning.getMessage()
     # Used as before the check: a probe on it waits for its timeout.
     assert "TimeoutError" in probes.run_probe(kc._manager.client, "attach", {}, 0.3)["error"]
-    # The next connect is checked again; the warning is not repeated.
+    # The next connect is checked again; the warning is not repeated, the INFO line is.
+    monkeypatch.setattr(kernel, "CHECK_TIMEOUT_S", 0.2)
     kernel.open_client(SERVER, KID)
     assert len(fake.clients) == 6
     assert len(records(caplog, logging.INFO, REPLACED)) == 4
+    assert len(records(caplog, logging.INFO, KEPT)) == 2
     assert len(records(caplog, logging.WARNING, "")) == 1
     assert fake.shutdowns == 0
 
@@ -574,7 +680,7 @@ def test_a_connection_that_closes_during_the_check_is_silent(fake: Kernel) -> No
     socket.connection_ready.set()
     threading.Timer(0.05, socket.connection_ready.clear).start()
     began = time.monotonic()
-    assert kernel.first_answer([(socket, kernel.ask(socket))], 5.0) is None
+    assert kernel.answered(socket, kernel.ask(socket), 5.0) is None
     assert time.monotonic() - began < 1.0
 
     class Closed(Socket):
@@ -584,7 +690,7 @@ def test_a_connection_that_closes_during_the_check_is_silent(fake: Kernel) -> No
     closed_socket = Closed(fake, dead=False)
     closed_socket.connection_ready.set()
     assert kernel.ask(closed_socket) is None
-    assert kernel.first_answer([(closed_socket, None)], 0.1) is None
+    assert kernel.answered(closed_socket, None, 0.1) is None
 
 
 def test_a_failed_connect_still_raises_e134(fake: Kernel, monkeypatch) -> None:

@@ -433,7 +433,7 @@ def attach_session(
 CONNECT_SETTLE_S = 0.02  # nothing is sent on a new connection sooner (design §6.13)
 RETRY_SETTLE_S = 0.1  # the same for a connection that replaces an unanswered one
 CHECK_TIMEOUT_S = 0.5  # an idle kernel's first answer to the check came within ~5-50 ms here
-CHECK_POLL_S = 0.002  # how often the check reads the queues of the connections it waits on
+CHECK_POLL_S = 0.002  # how often the check reads the connection's queues
 CONNECT_ATTEMPTS = 3
 STARTING_WAIT_S = 10.0  # how long a new kernel's "starting" is waited out before the check
 STARTING_POLL_S = 0.05
@@ -513,18 +513,16 @@ def heard(client: Any, msg_id: str | None) -> str | None:
     return None
 
 
-def first_answer(asked: list[tuple[Any, str | None]], timeout: float) -> tuple[int, str] | None:
-    """The first of ``asked`` (websocket client, its check's msg_id) to answer its check within
-    ``timeout``: its index and the answer's message type. None at the timeout, or once none of
-    them is connected."""
+def answered(client: Any, msg_id: str | None, timeout: float) -> str | None:
+    """The type of the websocket client's first answer to its check ``msg_id`` within
+    ``timeout``, or None at the timeout, or once it isn't connected."""
     until = time.monotonic() + timeout
     while True:
-        for i, (client, msg_id) in enumerate(asked):
-            kind = heard(client, msg_id)
-            if kind is not None:
-                return i, kind
+        kind = heard(client, msg_id)
+        if kind is not None:
+            return kind
         left = until - time.monotonic()
-        if left <= 0 or not any(client.connection_ready.is_set() for client, _ in asked):
+        if left <= 0 or not client.connection_ready.is_set():
             return None
         time.sleep(min(left, CHECK_POLL_S))
 
@@ -538,12 +536,14 @@ def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> Ju
     ``CONNECT_SETTLE_S``, and when nh's own GET says the kernel is idle, it must answer a
     ``kernel_info_request`` (its busy or its reply) within ``CHECK_TIMEOUT_S``. Else nh connects
     again, settling ``RETRY_SETTLE_S``, at most ``CONNECT_ATTEMPTS`` connections in all, and
-    keeps listening on the unanswered ones: the first to answer is used (a stuck one answers
-    once the next connection opens; a slow kernel's, when it gets to it), and the others are
-    closed in a thread (a stuck one's close can take ~10 s), never the kernel. If none answers,
-    the last one is used, as before the check. A new kernel's ``starting`` is waited out first
-    (``_idle``); a kernel that isn't idle then is not checked: a busy one would answer only
-    after its running cell.
+    uses the first that answers its own check in time. An unanswered one's later answer passes
+    no check (a stuck one answers once the next connection opens, and used then, it sometimes
+    missed the request after: design §6.13; a slow kernel answers the newer one's check right
+    after the earlier one's). It counts only when none answers in time: then the newest still
+    open that answered since is used, else the last (as before the check). The others are
+    closed in a thread once nh has its connection (a stuck one's close can take ~10 s), never
+    the kernel. A new kernel's ``starting`` is waited out first (``_idle``); a kernel that isn't
+    idle then is not checked: a busy one would answer only after its running cell.
     """
     global _unanswered_logged
     note_utf8_check()
@@ -556,7 +556,7 @@ def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> Ju
             if attempt > 1:
                 log.info(
                     "kernel %s: no answer to a new connection's kernel_info_request in %.1fs; "
-                    "connecting again (attempt %d of %d), still listening on the unanswered ones",
+                    "connecting again (attempt %d of %d)",
                     kernel_id,
                     CHECK_TIMEOUT_S,
                     attempt,
@@ -572,30 +572,35 @@ def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> Ju
                 return kc
             sent = time.monotonic()
             checks.append(ask(kc._manager.client))
-            asked = [(c._manager.client, msg_id) for c, msg_id in zip(clients, checks, strict=True)]
-            found = first_answer(asked, CHECK_TIMEOUT_S)
-            if found is not None:
-                index, kind = found
-                kept = clients[index]
-                if kept is kc:
-                    log.debug(
-                        "connection check answered (%s) in %.3fs", kind, time.monotonic() - sent
-                    )
-                else:
-                    log.info(
-                        "kernel %s: an earlier connection answered nh's kernel_info_request "
-                        "late, %.1fs after nh connected; nh uses it and closes the newer one",
-                        kernel_id,
-                        time.monotonic() - began,
-                    )
-                return kept
-        kept = clients[-1]
+            kind = answered(kc._manager.client, checks[-1], CHECK_TIMEOUT_S)
+            if kind is not None:
+                log.debug("connection check answered (%s) in %.3fs", kind, time.monotonic() - sent)
+                kept = kc
+                return kc
+        late = [  # answered since, and still open; nothing here waits
+            c
+            for c, msg_id in zip(clients, checks, strict=True)
+            if c._manager.client.connection_ready.is_set()
+            and heard(c._manager.client, msg_id) is not None
+        ]
+        kept = late[-1] if late else clients[-1]
+        log.info(
+            "kernel %s: no new connection answered nh's kernel_info_request in its window; "
+            "nh keeps connection %d of %d, %s",
+            kernel_id,
+            clients.index(kept) + 1,
+            len(clients),
+            "which answered after its window"
+            if late
+            else "the last, as none still open answered after its window",
+        )
         if not _unanswered_logged:
             _unanswered_logged = True
             log.warning(
                 "kernel %s: none of %d new connections answered nh's kernel_info_request in "
-                "%.1fs (stuck connections, or a kernel too slow to answer); nh uses the last "
-                "one, and a probe or run on it may wait for its timeout",
+                "%.1fs (stuck connections, or a kernel too slow to answer); nh uses the newest "
+                "that answered since and is still open, else the last one, and a probe or run on "
+                "it may wait for its timeout",
                 kernel_id,
                 CONNECT_ATTEMPTS,
                 time.monotonic() - began,

@@ -54,10 +54,10 @@ Checked, for each case:
 
 The gateway logs at INFO into the project's ``.nh/logs/gateway.log`` (CI keeps it), with each
 REST call that takes ``SLOW_REST_S`` or more, and the report lists those calls and each kernel
-connection nh replaced because it didn't answer its check, or used when it answered late. A ~5 s
-pre-run stall (``harness_ms`` ~5050) failed this test in 2 of 9 runs during C12's review and 3
-of 6 after it: the probe client nh opens after each run was dead from the start, and the next
-call's attach and before-probes waited out their timeouts on it (design §6.13, dead kernel
+connection nh replaced because it didn't answer its check, or kept when none answered in time. A
+~5 s pre-run stall (``harness_ms`` ~5050) failed this test in 2 of 9 runs during C12's review
+and 3 of 6 after it: the probe client nh opens after each run was dead from the start, and the
+next call's attach and before-probes waited out their timeouts on it (design §6.13, dead kernel
 connections; fixed in ``kernel.open_client``).
 """
 
@@ -96,7 +96,7 @@ NB = "notebooks/01_eda.ipynb"
 BUDGET_S = 1.5  # turn overhead p95 (design §6.8)
 SLOW_REST_S = 1.0  # a REST call this slow goes to gateway.log (a stalled call)
 REPLACED = "connecting again"  # kernel.open_client's INFO line for a connection it replaced
-LATE = "kernel_info_request late"  # ... and for an earlier one that answered late, which it used
+KEPT = "no new connection answered"  # ... and for the one it kept when none answered in time
 MAX_CHARS = 2000  # [output] max_chars, the default
 MAX_IMAGES = 2  # [output] max_images, the default
 UNLIMITED = ("--ZMQChannelsWebsocketConnection.iopub_data_rate_limit=1e10",)
@@ -423,9 +423,10 @@ async def unlimited_lab(helpers, base: Path, monkeypatch) -> AsyncIterator[tuple
 @pytest.fixture
 def gateway_info_log(monkeypatch) -> Any:
     """The gateway's INFO records too in the project's ``.nh/logs/gateway.log`` (WARNING and up
-    otherwise), which CI keeps as an artifact: each kernel connection nh replaced or used late,
-    and each REST call that takes SLOW_REST_S or more, with its method, path, time and outcome,
-    so a stalled call leaves a trace there."""
+    otherwise), which CI keeps as an artifact: each kernel connection nh replaced because it
+    didn't answer its check, or kept when none answered in time, and each REST call that takes
+    SLOW_REST_S or more, with its method, path, time and outcome, so a stalled call leaves a trace
+    there."""
     logger = logging.getLogger("nh_gateway")
     level = logger.level
     logger.setLevel(logging.INFO)
@@ -558,7 +559,7 @@ async def test_large_outputs_are_capped_in_the_room_and_cut_for_claude(
     lines += [line for line in logged if "a7: slow REST call" in line] or [
         f"no REST call took {SLOW_REST_S}s or more"
     ]
-    lines += [line for line in logged if REPLACED in line or LATE in line] or [
+    lines += [line for line in logged if REPLACED in line or KEPT in line] or [
         "no kernel connection was replaced"
     ]
     over: list[str] = []
