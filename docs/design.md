@@ -562,17 +562,17 @@ Paths: gateway files are relative to `nh_gateway/`; `hooks/`, `scripts/nhctl/` a
 - **First ask wins.** One question at a time: a second ask in the same turn gets E122 "already waiting for the user's answer".
 - **Clearing.** A successful gated write in that turn clears `pending`.
 - **Next human turn.** If `answer == "yes"` and `pending.turn_id == prev_turn_id`, the call with the exact matching key is accepted once; a question with a `run_id` (nh:cell-writer's, until the main conversation asks it itself) only once that run's report reached the asking message's reply, before the yes message opened (6.1, 6.4). Any other answer drops `pending`.
-- **Batch and re-run-stale requests** are granted when `answer == "yes"` and `prev_request` is set. The grant lives in new `TurnState` fields:
+- **Batch and re-run-stale requests** are granted when `answer == "yes"` and `prev_request` is set; a batch also needs no question of the previous message pending (first ask wins) and an interactive session (6.3). No pending question is recorded for a batch ask: the record's `request`, read as the next message's `prev_request`, is its question (6.3). The grant lives in new `TurnState` fields:
 
 | Field | Holds |
 |---|---|
-| `batch_total` | `min(n, [turn] max_batch)`, set by the first gated call of the grant turn (6.3) |
-| `batch_stop` | set by `report_run` on status != ok (running and queued included), a non-empty `check_this`, or any E12x; after that, new cells and retries get E123 (6.3) |
+| `batch_total` | `min(n, [turn] max_batch)`, decided by the first gated call of the message (add, edit or re-run): `None` until then, `0` for no batch (6.3) |
+| `batch_stop` | 0 while the batch goes, else the step k it stopped at: set by `report_run` on status != ok (running and queued included) or a non-empty `check_this`, by any E12x refusal of a gated write, by an `nh_undo`, or by a new cell while an earlier step isn't ok; after that, every add, edit, re-run and undo of the message gets E123 (6.3) |
 | `rerun_plan` | the approved call's `then`; each accepted `nh_run(cell_id=rerun_plan[0])` pops the head (6.5) |
 | `rerun_stop` | set by a non-ok status or `check_this`; later re-runs get E123 (6.5) |
 | `rerun_stale` | the granted "re-run the stale cells" request (defined in 6.5) |
 
-- **Locking.** Every grant check and slot use happens inside `svc.locks.hold`.
+- **Locking.** Every grant check and slot use happens inside `svc.locks.hold`, or, for a refusal raised before the notebook is resolved (E125, 6.3), under `svc.locks.hold_turn`, the same per-turn lock `hold()` takes first.
 - **Headless** (`NH_HEADLESS=1`, which an unattended `claude -p` run has to set): no yes can arrive, so E122 stands and the gate fails closed (6.4). nh doesn't treat `-p` as headless by itself: Claude Code does mark a print-mode run to its hooks and servers (`CLAUDE_CODE_ENTRYPOINT=sdk-cli` unless one was inherited, and `-p` in its argv), but such a run can still carry a person's next message (spike V13 A and C, 6.4), so only `NH_HEADLESS=1` makes it headless.
 - **Trust boundary.** The gateway trusts the hook-written record against a model that follows instructions; it is not an adversarial boundary. `file_guard` already denies `.nh/`, and `SHELL_NH_STATE_WRITE` (`_shared/patterns.py`) gains a Python `open('.nh/…','w'|'a')` pattern (6.6).
 
@@ -609,7 +609,7 @@ The existing E102 gains the detail "nh missed this message; send it again" (6.1)
 | Key | Default | Values |
 |---|---|---|
 | `[preset] level` | `"junior"` | `junior` \| `senior`; any other value reads as junior with a config warning, and the doctor reports D171. `/nh:init` doesn't ask; `nhctl preset senior\|junior [--json]` edits it (6.9) |
-| `[turn] max_batch` | `5` | the most steps one approved batch runs (6.3) |
+| `[turn] max_batch` | `5` | the most steps one approved batch runs; an integer ≥ 1, anything else reads as 5 with a config problem (6.3) |
 | `[lint.rules]` level `ask` | — | joins `off` \| `hint` \| `error` in `config.load` validation for the rules that can ask (`config.ASK_RULES`: `package_install`, then `network` and `outside_write`); `LintReport` gains `asks` (6.4) |
 | `[guard] shell_install`, `network`, `outside_write`, `harness_toml` | `"ask"` | `ask` \| `warn` \| `off`; one parser covers them and `foreign_mcp` (6.6) |
 
@@ -622,7 +622,7 @@ The existing E102 gains the detail "nh missed this message; send it again" (6.1)
   - Rule 7 becomes "RUNNING or QUEUED… ask before re-running".
   - Rule 9 adds "…or print env vars or credentials. Ask before installing packages or writing outside the project."
   - Rule 10 and the pinned lines stay unchanged.
-- **Reminder** order: `[NO_PROMPT_ID]` + head + mode part + `drift_line` + `last_cell_line`. The mode parts are an explain part (6.2), an ask-turn part ("ask one question, write nothing") and an approved-batch part (6.3). `RULE` and `QA_REPORT` stay byte-identical.
+- **Reminder** order: `[NO_PROMPT_ID]` + head + mode part + `drift_line` + `last_cell_line`. The mode parts are an explain part (6.2), an ask-turn part ("ask one question, write nothing"), an approved-batch part and its stop part for a "stop" typed mid-batch (6.3). `RULE` and `QA_REPORT` stay byte-identical.
 - **Explanation depth** for the preset goes in the SessionStart context, not the per-turn reminder (6.9).
 - **Skills:** new `skills/explain` (6.2), `skills/plan` (6.3) and `skills/review` (6.10). `skills/notebook/SKILL.md` stays ≤ 150 lines; detail moves to a new `reference/asks.md` and the existing `reference/planning.md`. The skill-set pin (`test_skill_files.py:118`) grows to six.
 - **Tools:** the count stays 5.
@@ -868,6 +868,218 @@ Chunk C2 (plan D2, D0 c, D0 e). Files: `policy/errors.py`, `app.py`, `_shared/tu
 - INSTRUCTIONS pins (in `test_explain_only.py`): rules 1, 5, 7 and 9 as changed here, rules 1-10 in order, and at most 2048 chars.
 
 **Perf** (50 interleaved runs, d1cc942 vs C2 after its review, p50/p95 in ms; prompt-submit on an explain message, workflow on a plain message's launch): system 3.9 prompt-submit 117.4/125.7 → 117.5/127.4, workflow 121.2/132.1 → 119.9/129.2; server venv 3.13 prompt-submit 83.0/91.1 → 83.9/90.6, workflow 87.4/97.4 → 86.7/102.8. All under the 150 ms budget. The review fix's lead-mark skip adds 4.7 µs per message to `classify()` on system 3.9 (36.7 → 41.4 µs, five messages up to 4000 chars). Its end-to-end run (50 interleaved runs of prompt-submit, system 3.9) had the machine at load average ~7 from another app holding a core: 8882db8 127.6/161.9, the fix 129.7/154.2. Both are over 150 only from that load, and the fix is no slower.
+
+### 6.3 /nh:plan and the approved batch (FR-10)
+
+Chunk C6 (plan D3; D0 a–c and e as they apply to a batch; plan defaults 1, 3, 4, 5, 6 and 13), built as three micro-steps. This section is written for all three in C6a, so C6b and C6c implement against it.
+
+| Step | Builds | Files |
+|---|---|---|
+| C6a | the gateway: the grant, E110's cap, the stop rules and E123, the batch's machine line and next blocks (the writer's included), `[turn] max_batch` | `_shared/turn_record.py` (`approved_batch`), `policy/turn.py` (`TurnState`, `NotebookLocks.hold_turn`), `policy/errors.py` (E123, `NhError(head=…)`), `tools/batch.py` (new), `tools/write.py`, `tools/run.py`, `tools/undo.py`, `tools/common.py` (`machine_line`, `record_finish`), `render.py` (`next_block`), `config.py`, `defaults.toml`, `skills/notebook/reference/errors.md`, `docs/harness-toml.md`, `docs/troubleshooting.md` |
+| C6b | the hooks and the writer: the reminder's ask-turn and approved-batch parts, `workflow_guard`'s N launches, per-slot writer runs, the writer column of the batch matrix | `hooks/nh_hooks/prompt_submit.py`, `hooks/nh_hooks/pre_tool.py`, `policy/turn.py`, `tools/write.py`, `reference/qa-workflow.md`, and `workflows/qa-cell.js` / `agents/cell-writer.md` only if the writer must see its slot (below: it needn't) |
+| C6c | the plan skill, `planning.md`'s batch path, the docs, the three evals | `skills/plan/SKILL.md` (new), `skills/notebook/SKILL.md` (its existing planning.md pointer line), `reference/planning.md`, both READMEs, `evals/plan-no-code`, `evals/batch-asks-once`, `evals/batch-stops-on-check-this` |
+
+**The flow** (user decisions for FR-10, 2026-09-28; any preset)
+
+| Message | Classifier (6.1) | nh | Claude |
+|---|---|---|---|
+| `/nh:plan <goal>` | mode `plan` | E109 for every write (6.2) | the plan skill: 5–12 numbered cell-sized steps, in chat only (plan default 5) |
+| an edit of the plan ("drop step 4") | nothing | as any message | re-prints the list; advisory, nh doesn't check it (plan default 6) |
+| "go" | answer yes, no request | a normal message: one cell | step 1 (or the step the last reply proposed) |
+| "run the next 3", "run steps 3-5" | mode `ask`, request `{batch, n}` | E109 for every write | asks one question in chat, "Run steps 3–5 in one reply?", for at most `max_batch` steps; writes nothing |
+| a whole-message yes ("go" alone too, plan default 1) | answer yes, `prev_request` the batch | the grant: up to `min(n, max_batch)` new cells this message | writes the steps in order, one cell each, a short report after each; stops at the first error or "check this" |
+| anything else after the question ("no", "go on", "yes, but …", a new ask) | not yes | no grant: one cell, as always | |
+
+- **Plan mode writes nothing (confirmed, C2).** `turn_record.no_write_mode` returns `plan` and `ask` as well as `explain`, so the main conversation's add, edit, re-run and undo get E109 with `E109_NEXT["plan"]` or `["ask"]`, a writer's add and edit get E109 (`_writer_turn`), and `workflow_guard` denies an nh:qa-cell launch (`test_explain_only.py` and `test_hook_workflow.py` pin plan and ask turns). C6 adds no check for them.
+- **INSTRUCTIONS** stay as C2 left them: rule 1 already ends "Only exception: a batch or re-run list the user approved when nh asked." (6.2's per-line counts). No tool description changes ("Once per user message" stays in `nh_add_cell`'s): the batch's own next block and reminder part say what to do, so no tool snapshot changes (no Gs).
+
+**No pending question for a batch ask** (decided in C6a)
+- The gateway records nothing in the ledger for "run the next 3". The plan's grant rule is "answer == yes and prev_request is set", and the record already holds what was asked:
+
+| Why | |
+|---|---|
+| nothing to record it from | the ask turn is mode `ask`, so every write is refused by E109 in `TurnGate`, before any tool runs; no gated call reaches the ledger |
+| the record is the question's identity | the hook writes `request` into the ask turn's record, and the next message's record carries it as `prev_request` (6.1), so it lives exactly one message, like a pending question whose `turn_id` must be `prev_turn_id` |
+| one shape for questions nh asks itself | `pending` stays `cell` \| `rerun` (6.1): hashes of calls nh refused. A batch question is the user's own request echoed back; there is no call to hash |
+
+- So a batch question can't be "already waiting" (E122's waiting row) and never drops a cell question: they are separate records. How the two meet is under "Cell approvals in a batch" below.
+- The gateway can't see whether Claude actually asked. A "yes" after a reply that asked something else still grants the batch the user's own previous message requested (Known gaps).
+
+**The grant** (`tools/batch.py` `decide()`, inside `svc.locks.hold`)
+- The turn's batch is decided once, by its first gated call: the first `nh_add_cell`, `nh_edit_cell` or `nh_run(mode="run")` of the turn that reaches the gateway's write path, from the main conversation or a writer of the turn's run. (`nh_undo` neither decides a batch nor counts as a step, but it stops a going one and gets E123 after a stop: below. `nh_run` wait and interrupt are not gated writes.) The decision is stored in `TurnState.batch_total` and never changes in that turn:
+
+| `batch_total` | Means |
+|---|---|
+| `None` | not decided yet (no gated call yet; a ledger written before C6) |
+| `0` | no batch: E110's cap is `[turn] max_code_cells`, as before |
+| `N` ≥ 1 | the approved batch: up to N new cells this message |
+
+- `N = min(n, [turn] max_batch)` when all of these hold, else `0`:
+
+| Condition | Why |
+|---|---|
+| the call's canonical turn is the record's `turn_id` (`turn_record.approved_batch(record, turn_id)`) | a notification's alias counts as its human turn; a call of an earlier turn gets no batch |
+| the record's `answer` is `yes` | its opening message: a yes typed mid-turn is never an answer (6.1), so "same turn" never grants |
+| the record's `prev_request` is `{batch, n}` | the previous message asked for the batch; two messages later it is gone ("prev" is one message back) |
+| no question of the previous message is pending (`ledger.pending(session)` with `turn_id == prev_turn_id`) | first ask wins: one yes answers one question. Both can exist only when the batch request was typed mid-turn into a message whose cell nh had asked about (6.1's absorbed request); the yes then answers that cell's question (6.4) and grants no batch |
+| not headless (`config.headless()`) | no yes can arrive (6.0 b): a scripted "yes" grants nothing, as for E122 |
+
+- **Single use.** A grant belongs to its yes message: the next message's `prev_request` is the yes message's own request (None for "yes"), so a second yes later grants nothing. Within the message, the batch is decided once, so a cell grant used later in it (6.4) can't open a batch afterwards.
+- **Locking.** `decide()` runs inside `svc.locks.hold(notebook, turn)` for add, edit and re-run, and an undo's stop and E123 inside the undo's own `hold`. E125 is refused before the notebook is resolved (6.8, pinned), so its stop, or its E123 after a stop (below), is decided under `svc.locks.hold_turn(turn)`, the same per-turn lock `hold()` takes first, which needs no notebook. Every grant check and slot use happens under a lock (6.0 b).
+
+**E110's cap** (`tools/write.py` `add_cell`)
+- `len(state.claims) >= (state.batch_total or [turn] max_code_cells)` refuses with E110, so a batch of N allows N claimed cells; after the batch's last cell, E110 as usual. With `max_code_cells` raised by hand, a batch still caps at its N: the user approved that many.
+- E110 after a full batch has its own first line, so it doesn't claim one cell per message: `Not written (by design): the approved batch's N cells are written; the last is {cell}.` (`batch.FULL_HEAD`, through `NhError(head=…)`), then the detail line `- The rest of the plan waits for the user's next message.` (`batch.FULL_LINE`) and E110's Next ("Don't write more cells. Reply with the remaining steps as a numbered list and ask which to do next."; a writer's: `RETURN_TO_WORKFLOW`).
+- Only E110's cap changes. A batch is new cells: an edit of a cell this message didn't claim still gets E113, a re-run of one E114, an edit of an OK cell E112 (a writer's revision excepted, as before).
+- **One cell per nh:qa-cell run** (C6a, until C6b's slots): in a batch, a writer whose run already wrote this message's cell (`state.writer_run == turn.run_id`) gets E110 with the first line `Not written (by design): one new cell per nh:qa-cell run, and this run already wrote one.` (`batch.RUN_HEAD`) and `RETURN_TO_WORKFLOW`. Before C6a the cap of 1 did this; a cap of N must not let one run (one QA pass) write N cells. A different run still gets 6.4's "- Another nh:qa-cell run owns this message's cell." (`refuse_other_run`).
+- **Each step waits for the last one's result** (`batch.enter`, inside the lock, before E110; edits and re-runs too). In a going batch a claimed cell reads `running` until its report is built: `record_finish` (the run's done callback in `tools/common.py`) leaves a going batch's claimed cell to `batch.reported`, which sets its status and the stop together once its `check this` is known.
+
+| A claimed step at the next gated call | Result |
+|---|---|
+| `running` (its result isn't in yet: a call sent in parallel) | E133 `The kernel is busy with step k of the approved batch, whose result isn't in yet.`, Next `Wait for step k's result; send this call again only if that result says to go on.` (a writer's: `RETURN_TO_WORKFLOW`). Nothing is written and the batch goes on: that result then stops it, or the call is sent again |
+| neither `ok` nor `running`, at an `nh_add_cell` (the user typed into it before it ran: `conflict`) | the batch stops at that step (`not_ok`) and the call gets E123 |
+| `ok`, every one | the call goes on to the next check |
+
+  - In order, one at a time, none of this happens: each step's result arrives before the next call, and a non-OK one already stopped the batch. A full batch's next add skips it and gets E110.
+
+**The stop rules**
+- `TurnState.batch_stop` is 0 while the batch goes, else the step k it stopped at (1 ≤ k ≤ N). Once set it stays for the message (plan default 3: no retry of the failing cell in that reply).
+
+| Cause | Where | k |
+|---|---|---|
+| a result's status isn't `ok`: `error`, `running`, `queued`, `aborted`, `timeout`, `interrupted`, `deleted`, `lost` | `report_run` (`batch.reported`), for add, edit, re-run, wait and interrupt alike | the reported cell's place in `state.claims` (a cell this message didn't claim, such as an earlier message's cell it waited for: the steps written so far, at least 1) |
+| a result with a non-empty `check this` section | `report_run` | as above |
+| an E12x refusal of a gated write: E120, E121, E122, E124 (C7), E125 | `batch.refused`, inside the lock (E125: `batch.refused_early`, under `hold_turn`) | the step the call would have written: the target's place in `state.claims` (E125 on an edit, before the notebook is read: its `cell_id` as passed, when that is one of the message's cells), or the steps written so far plus one; at most N |
+| an `nh_undo` that removes or restores a cell, or finds nh's cell already deleted (E142) | `batch.undone`, inside the undo's lock | the undone cell's place in `state.claims`, or the steps written so far plus one; at most N |
+| an earlier step neither `ok` nor `running` at the next `nh_add_cell` | `batch.enter` | that step's place |
+
+- A report in a going batch sets the cell's status and the stop together, after its `check this` is known (`batch.reported`; `record_finish` leaves the status to it), so a parallel call can't see the step OK before its check is in: it sees `running` and gets E133 (above).
+- Not stops: E110, E112, E113, E114, E133 (a busy kernel, or a step whose result isn't in yet: wait, then call again) and the other non-E12x refusals, which change nothing a batch depends on; E109 (a mode typed mid-message refuses every later write anyway); and E120 for an `nh_run` mode other than run, wait or interrupt (a malformed call: it reaches no lock and writes nothing).
+- **E12x stops it too** (plan D3, "any E12x also stops it"): a refused step means the plan's next cell isn't in the notebook as approved, and the steps after it build on it. A lint refusal (E120) is the model's to fix in a normal message; in a batch it stops the run instead, so no rewrite happens unseen. Whether E120 and E121 should stop a batch is a call for V14 (Known gaps).
+- **An undo stops it too**: the steps after an undone cell would build on a notebook without it. The undo itself goes through (it is the user's way back), its next block adds `The approved batch stops here, at step k of N: say which planned steps did not run.`, and later calls, undos included, get E123.
+- **The refusal that stops the batch** (`batch.refused`) gets the detail line `- The approved batch stops here, at step k of N: nh changes nothing more this message.` before its Next. E120, E121 and E125 get `batch.REFUSED_NEXT` in place of their Next (E120's and E125's say to fix and call again; E121's asks the user how to proceed without the batch's report): "Don't call again: the approved batch stops here. Tell the user what each step did, which step nh refused and why, and what you would change; then wait." E122 keeps its own Next (ask nh's question, then stop). A writer's refusal keeps `RETURN_TO_WORKFLOW`. A refusal after the stop is E123, not this: E125, refused before the lock, becomes E123 once the batch has stopped (`batch.refused_early`).
+
+**E123** (`policy/errors.py`)
+- First line: "Not {verb}: the approved {what} stopped at step {step}; nh changes nothing more this message." (`{what}`: `batch`, or C7's `re-run`; `{step}`: "k of N"; `{verb}`: written for add and edit, run for `nh_run`, undone for `nh_undo`).
+- Next: "Report the batch to the user: what each step did, then where and why it stopped (the error, the 'check this' finding or nh's question). No retry and no new cell this message; wait for the user." A writer's: `RETURN_TO_WORKFLOW`.
+- Raised inside the lock, after `review_earlier_cells` and before every other check of the write path (`batch.enter`; `nh_undo`: after its E115), for every `nh_add_cell`, `nh_edit_cell`, `nh_run(mode="run")` and `nh_undo` of the message once `batch_stop` is set: new cells, retries, a writer's revision, an undo. E125 comes first (6.8: before the notebook is resolved), and after a stop it is E123 too (`batch.refused_early`, under `hold_turn`). E123 itself stops nothing more.
+- **Gate order** (add): E125 (E123 after a stop), then in the lock E123, the waiting step's E133 and the `not_ok` stop, E110 (a writer's one-cell-per-run first, then the cap), E133, E121, E120, E122. Edit: E125 (E123 after a stop), then E123 and the waiting step's E133, then 6.4's order. Re-run: E123 and the waiting step's E133, then its own order. Undo: E115, then E123, then its own order.
+
+**The per-cell result** (`report_run`)
+- **Machine line** (`tools/common.py` `machine_line`): `turn=k/N batch` in place of `turn=k/max_code_cells` while the message has a batch (k: the cells it claimed): `nh: cell=nh-… exec=7 turn=2/3 batch retries=0/2 waits=0/2 undos=0/3`. Anything that reads the line by key (`qa-cell.js` reads only `revisions=`) is unaffected.
+- **Next block** (`render.next_block(status, …, batch=(k, N, s), check_this=…)`; `s` is `batch_stop` after this report, 0 while the batch goes). A cell this message didn't claim (an earlier message's cell it waited for: k = 0) gets the plain block while the batch goes and the "stopped earlier" rows once it has stopped, so no block offers a retry that E123 would refuse. Main conversation:
+
+| Case | Next |
+|---|---|
+| going, `ok`, k < N | "Step k of N of the approved batch ran OK. Give the user a short report on {cell}: what it did and the real numbers, surprises first, named by title and [n]. Then write step k+1 of the plan with nh_add_cell, without waiting for the user." |
+| going, `ok`, k = N | "That was step N of N, the last of the approved batch." + the usual OK block, ending "Do not write another cell." |
+| stopped here (s = k), `ok` with `check this` | "The approved batch stops at step k of N: {cell} ran, but its result needs a look (see 'check this'). Reply to the user about it: lead with the 'check this' finding, then what the cell did and the real numbers, and say which planned steps did not run. Write no other cell and don't change this one in this message; wait for the user." |
+| stopped earlier (s ≠ k), `ok` with `check this` | "{Cell} ran, but its result needs a look (see 'check this'), and the approved batch stopped at step s of N. Reply to the user: lead with the 'check this' finding, then what each step did and where and why the batch stopped. Write no other cell and don't change this one in this message; wait for the user." |
+| stopped, `ok` without `check this` (a wait after a `running` stop, a result after a parallel E125) | "{Cell} ran OK, but the approved batch stopped at step s of N. Report the batch to the user: what each step did, then where and why it stopped. Write no other cell; wait for the user." |
+| stopped here, `error` | "The approved batch stops at step k of N: {Cell} failed. Don't fix it in this message: a batch has no retries. Explain in plain words: quote the failing code, what Python said, the likely cause and one fix; say which planned steps did not run; then wait." |
+| stopped earlier, `error` | "{Cell} failed, and the approved batch stopped at step s of N. Don't fix it in this message: a batch has no retries. Explain in plain words: quote the failing code, what Python said, the likely cause and one fix; say where and why the batch stopped and which planned steps did not run; then wait." |
+| stopped, any other status | that status's usual block, then "The approved batch stops at step k of N: say which planned steps did not run." (stopped earlier: "stopped at step s"; `running` and `queued` keep their one wait) |
+
+  - At the batch's last step (s = k = N) every planned step ran, so the "stopped here" texts drop "say which planned steps did not run" (the other-status one ends "The approved batch stops at step N of N.").
+- **nh:cell-writer's next block** (`_writer_next`): unchanged while the batch goes (each step's run returns its result to the workflow; C6b's slots). Once it has stopped, nothing more changes this message, so the writer gets no retry and no revision:
+
+| Case | Next |
+|---|---|
+| stopped, `error` | "{Cell} failed, so the approved batch stops here, at step k of N: a batch has no retries. Return this whole result to the workflow as your final answer (status error). Don't change it again." (stopped earlier: "{Cell} failed, and the approved batch stopped at step s of N: …") |
+| stopped here, `ok` with `check this` | "{Cell} ran, but its result needs a look (see 'check this'), so the approved batch stops here, at step k of N: no revision of it this message. Return this whole result to the workflow as your final answer (status ok). Don't reply to the user or write a second cell." |
+| stopped, any other `ok` | "{Cell} ran OK, but the approved batch stopped at step s of N: no revision of it this message. Return this whole result to the workflow as your final answer (status ok). Don't reply to the user or write a second cell." |
+| stopped, any other status | the writer's usual block, then "The approved batch stops at step k of N." (stopped earlier: "stopped at step s") |
+
+**Cell approvals in a batch** (6.4; the composition, decided in C6a)
+
+| Situation | Result |
+|---|---|
+| a step that asks nothing | written as the next step; `gate_cell` does nothing for it |
+| a step that asks (E122) | the question is recorded as in 6.4 (pending, this message's turn) and the batch stops at that step: the reply reports the steps that ran and asks nh's question, then stops; later calls get E123 |
+| the next message is a yes | 6.4's grant: that exact call is written once, as that message's one cell. No batch: the yes message's `prev_request` is None. The rest of the plan needs a new "run the next N" |
+| a yes that could answer a cell question and a batch request (the request typed mid-turn into the asking message) | first ask wins: the cell call is granted, the batch is not (the grant's table) |
+| the yes message of a batch | holds no question of the previous message (the table above), so 6.4's "held" row can't arise in a batch |
+| headless | no batch, and E122 records nothing (6.4) |
+
+**Events** (`.nh/log.jsonl`; never prompt text)
+
+| Event | Fields |
+|---|---|
+| `batch_granted` | `session_id`, `turn_id`, `n` (asked), `total` (N) |
+| `batch_not_granted` | `session_id`, `turn_id`, `n`, `reason`: `pending` (first ask wins) or `headless`; only for a record that asked for one |
+| `batch_stopped` | `session_id`, `turn_id`, `step`, `total`, `reason`: the status, `check_this`, `not_ok` (an earlier step at the next add), `undo` or the refusal's code |
+
+**Config** (`[turn] max_batch`, plan default 4)
+- `defaults.toml`: `max_batch = 5` under `[turn]`, commented "the most steps one approved batch writes ("run the next N", after the user's yes)". `docs/harness-toml.md` documents it in `[turn]`.
+- `config.load`: an integer ≥ 1. A bool, a float, a string, 0 or less falls back to 5 with the problem "turn.max_batch must be an integer >= 1" (a string or a bool is already `_merge`'s "turn.max_batch must be int"; the value stays 5).
+- The hooks (C6b) read it from `harness.toml` the same way (`common.setting`, then the same check, default 5).
+
+**Docs** (C6a)
+- `reference/errors.md` (model-facing): an E123 row (why the batch stopped, an undo included; report each step, no retry, no new cell, no re-run, no undo; the writer returns it); E110's row says a yes to "run the next N" allows N cells; E133's row adds the batch's waiting step (send it again only if the last result says to go on).
+- `docs/troubleshooting.md`: an E123 row; E110's row quotes the batch's first line and names a cell beyond the batch's N or a second cell from one run; E133's row adds the batch's waiting step.
+- `docs/harness-toml.md`: `max_batch` in `[turn]`.
+
+**C6b: the hooks and the writer (designed here)**
+- **`turn_record.approved_batch(record, turn_id) -> int | None`** (C6a, Python 3.9): the `n` of the previous message's batch request when `turn_id` is the record's turn and its answer is yes. The gateway's `decide()` and both hooks use it. Both add "not headless" (the hooks: `NH_HEADLESS=1`, as `workflow_guard` already reads it); only the gateway adds "no pending question" (the hooks don't read the ledger: Known gaps).
+- **Reminder** (`prompt_submit.mode_parts`, §6.0 f order: `[NO_PROMPT_ID]` + head + mode part + `drift_line` + `last_cell_line`, clipped at 400; `RULE`, `QA_REPORT` and `NO_PROMPT_ID` byte-identical). `max` is `[turn] max_batch` as the hooks read it, `k = min(n, max)`:
+
+| Record | Part |
+|---|---|
+| mode `explain` | `EXPLAIN` (6.2) |
+| mode `ask` with a batch request | `ASK_BATCH`: "[nh] Ask, don't write: one question in chat, "Run steps a-b in one reply?", for the plan steps the user asked for{cap}; then stop." with `{cap}` " (nh runs at most {max} at once: ask about the first {max} of them)" when n > max. The record keeps only `{batch, n}` ("run steps 7-9" is n = 3, with no start), so the part names no step numbers and no "next"; Claude takes them from the user's words and the plan |
+| mode `ask` otherwise (C7's re-run request, until C7 words its own) | `ASK`: "[nh] Ask, don't write: one question in chat, then stop." |
+| no mode, `approved_batch()` gives n, not headless | `BATCH`: "[nh] Approved batch, for this reply in place of one new cell: up to {k} new cells, one plan step each, in order (ultracode: one nh:qa-cell run per step, each after the last report), a short report after each; stop at the first error or 'check this' and wait." |
+| an absorbed message (typed mid-turn) into a turn with `BATCH`, classified as a no ("stop", "no", "cancel", …) | `BATCH_STOP`: "[nh] The user said stop: write no more batch steps this reply; report what ran and wait." Advisory: the gateway doesn't stop the batch for it (Known gaps) |
+| anything else | nothing (as 6.2) |
+
+  - The head is still `[RULE]` + the part for a new message, the part alone for an absorbed one, and the notification's first line + the part for a notification (an alias keeps the record's answer and `prev_request`). `RULE` and `QA_REPORT` stay byte-identical, so `BATCH` says itself that it replaces the one new cell for this reply; after `QA_REPORT` ("write no new cell unless its writer wrote none", still true of the main conversation's own cells under ultracode), `BATCH`'s ultracode clause is what lets the next step's run launch. A message absorbed into a batch turn (6.1: tighten only) shows its new mode's part, and the gateway refuses the batch's later writes (E109).
+  - The parts' exact texts are C6b's to pin in `test_hook_prompt.py`, within these words and the 400-char clip (the clip cuts `last_cell_line` first). The batch part shows while the record says yes; after a stop the gateway's E123 holds (the hook doesn't read the ledger).
+- **`workflow_guard`** (advisory; the gateway enforces). In a message whose record gives `approved_batch()` (and not headless), an nh:qa-cell launch is allowed while the message's own runs number fewer than `k` and none of them is open (`run_open`: launched and not reported); else denied: a run still open with `WORKFLOW_BATCH_OPEN_REASON` "nh: the approved batch's last step is still being written and checked; wait for its report, then launch the next step's run.", the k runs used with `WORKFLOW_BATCH_DONE_REASON` "nh: this user message's approved batch already had its {k} nh:qa-cell runs, one per step. Reply from their reports; the rest of the plan waits for the user's next message." Every other message: one run, as before (`WORKFLOW_AGAIN_REASON`, unchanged). The deny order stays subagent, `approve_before_run`, mode, then the run count.
+- **Per-slot writer runs** (`TurnState.writer_run` becomes `writer_runs: dict[uid, run_id]`, the run that wrote each claimed cell; a ledger's old `writer_run` loads as the first claim's owner). For a writer's call:
+
+| Call | Allowed when | Else |
+|---|---|---|
+| `nh_add_cell` | the run owns no cell of the message yet, every claimed cell is `ok` (one whose result isn't in: C6a's E133), every run that owns one is no longer open, and the cap allows one more (`batch_total or max_code_cells`) | E110 with `batch.RUN_HEAD` (C6a: "one new cell per nh:qa-cell run, and this run already wrote one.") for a run that owns one; E110 "- Another nh:qa-cell run owns this message's cell." otherwise (today's text: with no batch, the first run owns the message's one cell) |
+| `nh_edit_cell` (a retry or a revision) | the target is the run's own cell, and no later step is written (a revision after step k+1 would change what k+1 built on) | E110 "- Another nh:qa-cell run owns this message's cell." / E112 for a later step |
+
+  - The slot is the cell's place in `state.claims`; the writer needn't see it: the main conversation passes the step's text as `ask` and "step k of N of the approved batch" in `context` (`qa-workflow.md`), and the writer's result shows `turn=k/N batch`. So `qa-cell.js` and `cell-writer.md` change only if V14 shows the writer needs it.
+  - `qa-workflow.md` gains a batch paragraph: in an approved batch, one run per step, launched only after the last one's report; a short report after each; stop launching at a report whose status isn't ok, whose result has a "check this" section, whose outcome is `needs_approval`, `refused` or `writer_failed`, or whose QA verdict is `revise` or `fail` (the gateway's E123 holds for the first three anyway).
+  - **Fallback (plan default 13).** Only if C6b shows slots can't be made reliable: the batch runs on the main thread (the batch part says so under ultracode) and the user is told. Not the plan of record.
+- **Tests (C6b):** `test_hook_prompt.py` (the four parts pinned, their order and clip, an absorbed ask, an absorbed stop, a notification in a batch turn, no `BATCH` headless; `RULE`/`QA_REPORT`/`NO_PROMPT_ID` pins unchanged), `test_hook_workflow.py` (k launches in a grant turn, sequential only, one otherwise, the deny reasons, headless), `test_approvals.py`'s writer column of the batch matrix, per-slot writer cases in `test_qa_workflow.py`.
+
+**C6c: the plan skill, planning.md and the evals (designed here)**
+- **`skills/plan/SKILL.md`** (`/nh:plan`): frontmatter `name: plan`, a description, `argument-hint: "<goal>"`, `disable-model-invocation: true`, `allowed-tools: [mcp__plugin_nh_nh__nh_inspect]` (as `skills/explain`). Body: inspect what the plan needs (outline, vars); reply with 5–12 numbered cell-sized steps in `reference/planning.md`'s format; no code, no code fences, no write call (E109 refuses them: mode plan); the list lives in chat only; end with where to start: "go" for step 1, or "run the next N" / "run steps a-b" for several in one reply (nh asks once). An edit message re-prints the updated list.
+- **`reference/planning.md`** gains "The batch path": the ask message (one question, at most `max_batch` steps, write nothing), the yes message (steps in order, one cell each, a short report after each, the batch's next blocks, stop at the first error, `check this` or nh question; E123 means report and wait; no retry of the failing step in that reply), and after it (the remaining steps; a new "run the next N" for more). `skills/notebook/SKILL.md` is at its 150-line cap and already points to planning.md (its last line, "- [reference/planning.md](reference/planning.md): the 5-12 step plan."): that line becomes "…: the 5-12 step plan and the batch path." and no line is added.
+- **Skill set** (`test_skill_files.py`): `explain`, `init`, `notebook`, `plan`, `status` (review comes in C10); the plan skill's frontmatter pinned like explain's.
+- **Evals** (new; each reaches two consecutive clean rounds of 3, CI's flags; `big-ask-plans` must still pass):
+
+| Case | Prompt and earlier turns | Graders |
+|---|---|---|
+| `plan-no-code` | `/nh:plan <goal>` over the shared fixture | no `nh_add_cell`/`nh_edit_cell`/`nh_run`/`nh_undo` call (as 6.2's `no-writes`), a step 5 and no step 13, no code fence, `skill-registered` (`nh:plan`), a judge on the plan's shape |
+| `batch-asks-once` | a plan in the conversation; "run the next 3" | no write call, one question in the reply, a judge: it asks whether to run those steps in one reply, writes nothing, no code |
+| `batch-stops-on-check-this` | a plan, "run the next 3" and the question; "yes" | `nh_add_cell` called twice, not three times (the mock's second result has a `check this` section and the batch's stop block, its first the going block with `turn=1/3 batch`), a judge: it reports the finding and waits |
+
+  - **Earlier turns.** A case supplies them with `context.history_file` (a `.jsonl` transcript; the prompt becomes the next user turn: the eval docs, "Seed the workspace or conversation"). The hook never saw those turns, so its record of the yes turn has no `prev_request` and no `BATCH` part shows: unless the scaffold can seed `.nh/state/turns/<session>.json` under the resumed session's id (C6c checks a kept trace), the case grades the model following the conversation, the plan skill and the mocked results. If a run can't resume a history file, the earlier turns go in the prompt, quoted as they were, and the case's description says so.
+  - The mocks are the real gateway's texts (the batch machine line and next blocks, E123), replayed against the gateway in `test_skill_files.py` as C2 does for the explain mocks.
+
+**Known gaps**
+- **What Claude asked.** The gateway sees the user's request and their yes, not the question. A "yes" to a reply that asked something else still grants the batch the user's previous message requested. The request is the user's own words, so the batch is no surprise; the ask-turn part tells Claude to ask the one question.
+- **Steps are the model's.** The gateway counts cells, not plan steps: it can't tell that the batch's cells are steps 3–5 in order. The skill, the reminder and the next blocks carry that; V14 checks it live.
+- **E120 and E121 stop the batch** (plan D3). If V14 finds that too strict (a note slip ends a batch), exempting them is a one-line change for the user to decide.
+- **The batch part after a stop.** The reminder can't see `batch_stop`; a notification after a stop still shows `BATCH`, and the gateway's E123 holds.
+- **The batch part where the gateway grants none.** The hooks don't read the ledger, so when a cell question of the previous message is pending (first ask wins: `batch_not_granted`, reason `pending`), `BATCH` still shows; the gateway holds the message to one cell, and its E110 says so. Headless is checked on both sides.
+- **A "stop" typed mid-batch.** C1's rule holds (6.1, user decision 2026-09-29): a message absorbed mid-turn only tightens, and its yes or no is never an answer, so the gateway doesn't stop a going batch when the user types "stop" while Claude writes it. C6b's `BATCH_STOP` part tells Claude to stop. Making the gateway stop it too (an `absorbed_no` flag in the record, E123 with reason `user`) changes C1's decision, so it is the user's call.
+- **Ultracode until C6b.** C6a keeps one nh:qa-cell run per message (`workflow_guard`) and one cell per run (`batch.RUN_HEAD`), so under ultracode a batch's first step goes through the run, and the main conversation may write the next ones itself, as without ultracode, until C6b's slots.
+- **A result nh couldn't check.** When the after-probe fails (the kernel busy with the user's own run in JupyterLab, a probe timeout), an OK result has no `check this` section and the batch goes on. nh's own steps can't cause it: the next step waits for the last result (E133). Stopping on it (fail closed) needs its own next block; V14 shows whether it happens.
+
+**Tests** (C6a)
+- `tests/gateway/test_approvals.py`, the batch kind of the approval matrix, main conversation: {batch} × {yes, no, other, "go" alone, "go on"} × {same message, next message, two messages later}; the stops on an error, on `check this`, on `running` and on `queued`, each followed by E123 for a new cell and for a retry; the `max_batch` cap, and N under a raised `max_code_cells`; single use (a second "yes" later grants nothing); an E122 inside a batch (stops it; the next yes grants that call alone), on an add and on an edit; E125 on an add and on an edit, after a full batch (step N) and after a stop (E123); E121's stop; a non-E12x refusal (E112) that doesn't stop it; a stop on the last step (E123 before E110); first ask wins, and an older message's pending question that doesn't block it; headless; a batch request typed mid-turn is granted by the next yes; an edit and a re-run as the yes message's first call; parallel steps (E133 until the last result is in, with no exec delay and with the after-probe held; the step then sent again; a full batch's parallel add gets E110, not E133); a wait on an earlier message's cell (the plain block; its error stops the batch at the steps written so far); an undo (one that removes a step, one that restores an edited step, one that finds the step already deleted: each stops a going batch; E123 after a stop); a writer's second cell from one run; a writer's failed step (no retry); a writer's step sent before the last result is in (E133 with `RETURN_TO_WORKFLOW`); the main conversation writing the next step after the run's report (Known gaps, "Ultracode until C6b"); an absorbed "stop" (the gateway goes on: Known gaps).
+- `tests/gateway/test_gateway.py`: E110 at N and the batch's E110 first line and detail; the plain cap unchanged without a batch; E123's texts; `turn=k/N batch` in a real result; an E12x stop's detail line and Next.
+- `tests/gateway/test_r3_gateway.py`: the batch's next blocks through the gateway (going, last step, stopped by an error).
+- `tests/unit/test_r2_render.py`: `machine_line`'s batch form and every `next_block` batch case, the writer's included.
+- `tests/unit/test_config.py`: `max_batch`'s default and its validation.
+- `tests/unit/test_turn_record.py`: the `approved_batch` table.
+- `tests/unit/test_skill_files.py` (unchanged): E123 joins `CATALOGUE`, so its rows in `errors.md` and `troubleshooting.md` are required; `max_batch` is in `harness-toml.md`.
 
 ### 6.4 Cell approvals: package install, network, outside writes
 

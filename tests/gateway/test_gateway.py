@@ -429,3 +429,96 @@ async def test_markdown_and_install_smuggling_rejected(nh: Harness) -> None:
     ):
         result = await nh.call("nh_add_cell", "p1", **dict(LOAD, code=code))
         assert result.is_error and rule in text(result), text(result)
+
+
+# --- the approved batch (design §6.3) ----------------------------------------------------------
+
+TOTALS = dict(
+    title="Total price by region",
+    notes=["Sums the price per region.", "Shows which region sells the most."],
+    intent="total price by region",
+    code="totals = df.groupby('region')['price'].sum()\ntotals",
+)
+
+
+def batch_message(nh: Harness, n: int = 3) -> None:
+    """p1 asks for the batch; p2, the user's yes, may write ``n`` cells."""
+    nh.turns.prompt("p1", text=f"run the next {n}")
+    nh.turns.prompt("p2", text="yes")
+
+
+def first_lines(result) -> list[str]:
+    return text(result).splitlines()
+
+
+async def test_without_a_batch_the_cap_is_max_code_cells(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="yes")  # a yes with no batch asked before it
+    first = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert "turn=1/1 retries" in text(first)
+    second = await nh.call("nh_add_cell", "p1", **DROP)
+    assert "nh: E110" in text(second) and "batch" not in text(second)
+
+
+async def test_a_batch_raises_e110s_cap_to_its_size(nh: Harness) -> None:
+    batch_message(nh, 2)
+    one = await nh.call("nh_add_cell", "p2", **LOAD)
+    two = await nh.call("nh_add_cell", "p2", **DROP)
+    assert "turn=1/2 batch retries=0/2" in text(one) and "turn=2/2 batch retries=0/2" in text(two)
+    three = await nh.call("nh_add_cell", "p2", **TOTALS)
+    assert first_lines(three) == [  # its own first line: not "one new cell per message"
+        "Not written (by design): the approved batch's 2 cells are written; the last is "
+        '"Drop rows with missing price" [2].',
+        "nh: E110",
+        "- The rest of the plan waits for the user's next message.",
+        "Next: Don't write more cells. Reply with the remaining steps as a numbered list and ask "
+        "which to do next.",
+    ]
+    assert len([c for c in nh_cells(nh) if c["cell_type"] == "code"]) == 2
+
+
+async def test_a_lint_refusal_stops_the_batch_and_says_not_to_call_again(nh: Harness) -> None:
+    batch_message(nh)
+    assert not (await nh.call("nh_add_cell", "p2", **LOAD)).is_error
+    refused = await nh.call("nh_add_cell", "p2", **dict(DROP, notes=["Only one bullet."]))
+    body = first_lines(refused)
+    assert body[:2] == ["Not written: the cell broke nh's hard rules.", "nh: E120"]
+    assert body[-2:] == [
+        "- The approved batch stops here, at step 2 of 3: nh changes nothing more this message.",
+        "Next: Don't call again: the approved batch stops here. Tell the user what each step "
+        "did, which step nh refused and why, and what you would change; then wait.",
+    ]
+    fixed = await nh.call("nh_add_cell", "p2", **DROP)
+    assert first_lines(fixed)[:2] == [
+        "Not written: the approved batch stopped at step 2 of 3; nh changes nothing more this "
+        "message.",
+        "nh: E123",
+    ]
+    assert first_lines(fixed)[-1] == (
+        "Next: Report the batch to the user: what each step did, then where and why it stopped "
+        "(the error, the 'check this' finding or nh's question). No retry and no new cell this "
+        "message; wait for the user."
+    )
+
+
+async def test_e125_as_the_first_call_decides_and_stops_the_batch(nh: Harness) -> None:
+    """E125 comes before the notebook is resolved (design §6.8); in a batch it still stops it,
+    under the turn's lock, and decides the batch when it is the message's first gated call."""
+    batch_message(nh)
+    marked = await nh.call("nh_add_cell", "p2", **dict(LOAD, code="key = '[redacted:API_KEY]'"))
+    body = first_lines(marked)
+    assert body[1] == "nh: E125"
+    assert body[-2:] == [
+        "- The approved batch stops here, at step 1 of 3: nh changes nothing more this message.",
+        "Next: Don't call again: the approved batch stops here. Tell the user what each step "
+        "did, which step nh refused and why, and what you would change; then wait.",
+    ]
+    after = await nh.call("nh_add_cell", "p2", **LOAD)
+    assert "nh: E123" in text(after) and "step 1 of 3" in text(after)
+    assert not nh_cells(nh)
+
+
+async def test_e125_outside_a_batch_is_unchanged(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load it")
+    marked = await nh.call("nh_add_cell", "p1", **dict(LOAD, code="key = '[redacted:API_KEY]'"))
+    assert "batch" not in text(marked) and first_lines(marked)[-1].startswith("Next: Read the")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error

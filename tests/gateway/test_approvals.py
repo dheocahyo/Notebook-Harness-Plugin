@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -25,7 +26,7 @@ from nh_gateway.lint.lint import Issue
 from nh_gateway.policy import turn as policy_turn
 from nh_gateway.policy.errors import CATALOGUE, RETURN_TO_WORKFLOW, WRITER_LINE, NhError
 from nh_gateway.policy.turn import TurnState
-from nh_gateway.tools import approvals
+from nh_gateway.tools import approvals, batch
 from tests.fakes.net import serving
 from tests.fakes.turns import Turns, text
 from tests.gateway.conftest import NOTEBOOK, Harness, make_project
@@ -1874,3 +1875,850 @@ async def test_after_an_earlier_messages_report_the_call_asks_anew(
     assert pending(nh)["turn_id"] == "p3" and not nh_code_cells(nh)
     nh.turns.prompt("p4", text="yes")
     assert_written(await nh.call("nh_add_cell", "p4", **INSTALL))
+
+
+# --- the approved batch (design §6.3, C6a): the batch kind of the matrix, main conversation ----
+
+STEPS = [
+    LOAD,
+    dict(
+        title="Total price by region",
+        notes=["Sums the price per region.", "Shows which region sells the most."],
+        intent="total price by region",
+        code="totals = df.groupby('region')['price'].sum()\ntotals",
+    ),
+    dict(
+        title="Count rows per region",
+        notes=["Counts the rows of each region.", "A small region makes its total less sure."],
+        intent="rows per region",
+        code="counts = df['region'].value_counts()\ncounts",
+    ),
+    dict(
+        title="Largest price",
+        notes=["Finds the highest price.", "A very high one may be a typo."],
+        intent="largest price",
+        code="top_price = df['price'].max()\ntop_price",
+    ),
+    dict(
+        title="Smallest price",
+        notes=["Finds the lowest price.", "A zero or negative one may be a typo."],
+        intent="smallest price",
+        code="low_price = df['price'].min()\nlow_price",
+    ),
+    dict(
+        title="Mean price",
+        notes=["Averages the prices.", "Missing prices are left out."],
+        intent="mean price",
+        code="mean_price = df['price'].mean()\nmean_price",
+    ),
+]
+# A step whose result has a 'check this' section: the filter keeps none of df's 3 rows.
+CHECKED = dict(
+    title="Keep expensive sales",
+    notes=["Keeps sales above 100.", "Expensive sales may behave differently."],
+    intent="expensive sales",
+    code="expensive = df[df['price'] > 100]\nexpensive.shape",
+)
+FAILING = dict(
+    title="Price per unit",
+    notes=["Divides the price by the units.", "Shows what one unit costs."],
+    intent="price per unit",
+    code="per_unit = 1 / 0\nper_unit",
+)
+
+
+def machine(result: Any) -> str:
+    return next(line for line in lines(result) if line.startswith("nh: cell="))
+
+
+def next_text(result: Any) -> str:
+    return text(result).split("--- next ---\n", 1)[1].split("\n---", 1)[0]
+
+
+def stopped(step: str, verb: str = "written") -> str:
+    return (
+        f"Not {verb}: the approved batch stopped at step {step}; nh changes nothing more this "
+        "message."
+    )
+
+
+def turn_state(h: Harness, turn: str) -> dict[str, Any]:
+    return ledger(h)["turns"][turn]
+
+
+def WAITING(step: str) -> list[str]:  # noqa: N802  (a pinned text, like the constants)
+    """E133 for a step sent before step ``step``'s result is in (design §6.3)."""
+    return [
+        f"The kernel is busy with step {step} of the approved batch, whose result isn't in yet.",
+        "nh: E133",
+        f"Next: Wait for step {step}'s result; send this call again only if that result says to "
+        "go on.",
+    ]
+
+
+async def ask_and_answer(h: Harness, answer: str = "yes", request: str = "run the next 3") -> None:
+    """Message p1 asks for the batch (nh writes nothing in it: E109); p2 answers."""
+    h.turns.prompt("p1", text=request)
+    assert "nh: E109" in text(await h.call("nh_add_cell", "p1", **STEPS[0]))
+    h.turns.prompt("p2", text=answer)
+
+
+@contextlib.asynccontextmanager
+async def batch_harness(
+    tmp_path: Path, toml: str = "", **backend_kw: Any
+) -> AsyncIterator[Harness]:
+    project = make_project(tmp_path, toml)
+    backend = FakeBackend(project, **backend_kw)
+    async with Client(create_server(project, backend)) as client:
+        yield Harness(project, backend, client, Turns(project, tmp_path / "data"))
+
+
+def test_e123_texts_are_pinned() -> None:
+    assert CATALOGUE["E123"] == (
+        "Not {verb}: the approved {what} stopped at step {step}; nh changes nothing more this "
+        "message.",
+        "Report the batch to the user: what each step did, then where and why it stopped (the "
+        "error, the 'check this' finding or nh's question). No retry and no new cell this "
+        "message; wait for the user.",
+    )
+    assert batch.STOP_LINE.format(step=2, total=3) == (
+        "- The approved batch stops here, at step 2 of 3: nh changes nothing more this message."
+    )
+    assert batch.REFUSED_NEXT == (
+        "Don't call again: the approved batch stops here. Tell the user what each step did, "
+        "which step nh refused and why, and what you would change; then wait."
+    )
+    assert batch.FULL_HEAD == (
+        "Not written (by design): the approved batch's {total} cells are written; the last is "
+        "{cell}."
+    )
+    assert batch.FULL_LINE == "- The rest of the plan waits for the user's next message."
+    assert batch.RUN_HEAD == (
+        "Not written (by design): one new cell per nh:qa-cell run, and this run already wrote one."
+    )
+    assert WAITING("2") == [
+        "The kernel is busy with step 2 of the approved batch, whose result isn't in yet.",
+        "nh: E133",
+        "Next: Wait for step 2's result; send this call again only if that result says to go on.",
+    ]
+    assert batch.UNDONE_NEXT.format(step=2, total=3) == (
+        "The approved batch stops here, at step 2 of 3: say which planned steps did not run."
+    )
+    assert {"E120", "E121", "E122", "E124", "E125"} == batch.STOP_CODES
+
+
+@pytest.mark.parametrize("when", ["same message", "next message", "two messages later"])
+@pytest.mark.parametrize("answer", ANSWERS)
+async def test_only_a_yes_in_the_next_message_grants_the_batch(
+    nh: Harness, answer: str, when: str
+) -> None:
+    """ "run the next 3", then the answer: only a whole-message yes ("go" alone too) in the
+    very next message lets that message write 3 cells. Nothing is recorded for the ask."""
+    nh.turns.prompt("p1", text="run the next 3")
+    if when == "same message":  # typed while Claude works: absorbed, never an answer (6.1)
+        nh.turns.prompt("p1", text=answer)
+        turn = "p1"
+    elif when == "next message":
+        nh.turns.prompt("p2", text=answer)
+        turn = "p2"
+    else:
+        nh.turns.prompt("p2", text=answer)
+        nh.turns.prompt("p3", text=answer)
+        turn = "p3"
+    assert pending(nh) is None  # a batch ask records no question (design §6.3)
+    first = await nh.call("nh_add_cell", turn, **STEPS[0])
+    if when == "same message":  # still the ask message: mode ask holds (E109)
+        assert first.is_error and "nh: E109" in text(first), text(first)
+        assert not nh_code_cells(nh) and events(nh, "batch_granted") == []
+        return
+    assert_written(first)
+    granted = answer in YES_ANSWERS and when == "next message"
+    if granted:
+        assert "turn=1/3 batch" in machine(first)
+        for k, step in enumerate(STEPS[1:3], start=2):
+            result = await nh.call("nh_add_cell", turn, **step)
+            assert_written(result)
+            assert f"turn={k}/3 batch" in machine(result)
+        late = await nh.call("nh_add_cell", turn, **STEPS[3])
+        assert late.is_error and lines(late)[:3] == [
+            "Not written (by design): the approved batch's 3 cells are written; the last is "
+            '"Count rows per region" [3].',
+            "nh: E110",
+            batch.FULL_LINE,
+        ], text(late)
+        assert len(nh_code_cells(nh)) == 3
+        assert [(e["turn_id"], e["n"], e["total"]) for e in events(nh, "batch_granted")] == [
+            (turn, 3, 3)
+        ]
+        assert turn_state(nh, turn)["batch_total"] == 3
+    else:
+        assert "turn=1/1 retries" in machine(first)
+        late = await nh.call("nh_add_cell", turn, **STEPS[1])
+        assert late.is_error and "nh: E110" in text(late) and "batch" not in text(late)
+        assert len(nh_code_cells(nh)) == 1 and events(nh, "batch_granted") == []
+        assert turn_state(nh, turn)["batch_total"] == 0
+    assert pending(nh) is None
+
+
+@pytest.mark.parametrize("request_text", ["run steps 3-5", "run the next three"])
+async def test_both_request_forms_grant_the_batch(nh: Harness, request_text: str) -> None:
+    await ask_and_answer(nh, request=request_text)
+    for step in STEPS[:3]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+    assert "nh: E110" in text(await nh.call("nh_add_cell", "p2", **STEPS[3]))
+
+
+async def test_a_batch_is_used_once(nh: Harness) -> None:
+    """A second yes later grants nothing: the yes message's own request (None) is the next
+    message's prev_request."""
+    await ask_and_answer(nh)
+    for step in STEPS[:3]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+    nh.turns.prompt("p3", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p3", **STEPS[3]))
+    late = await nh.call("nh_add_cell", "p3", **STEPS[4])
+    assert late.is_error and "nh: E110" in text(late)
+    assert len(nh_code_cells(nh)) == 4
+    assert [e["turn_id"] for e in events(nh, "batch_granted")] == ["p2"]
+
+
+async def test_a_yes_message_with_no_write_yet_keeps_its_batch_for_its_first_call(
+    nh: Harness,
+) -> None:
+    """The batch is decided by the message's first gated call, not by an inspect or a wait."""
+    await ask_and_answer(nh)
+    assert not (await nh.call("nh_inspect", "p2", view="outline")).is_error
+    for step in STEPS[:3]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+
+
+async def test_max_batch_caps_the_batch(nh: Harness) -> None:
+    """ "run the next 6" asks for more than [turn] max_batch (5): the yes allows 5."""
+    await ask_and_answer(nh, request="run the next 6")
+    for k, step in enumerate(STEPS[:5], start=1):
+        result = await nh.call("nh_add_cell", "p2", **step)
+        assert_written(result)
+        assert f"turn={k}/5 batch" in machine(result)
+    late = await nh.call("nh_add_cell", "p2", **STEPS[5])
+    assert late.is_error and "nh: E110" in text(late)
+    assert lines(late)[0].startswith("Not written (by design): the approved batch's 5 cells")
+    assert [(e["n"], e["total"]) for e in events(nh, "batch_granted")] == [(6, 5)]
+
+
+async def test_a_lower_max_batch_in_harness_toml_caps_it(tmp_path: Path) -> None:
+    async with batch_harness(tmp_path, "[turn]\nmax_batch = 2\n") as h:
+        await ask_and_answer(h)
+        for step in STEPS[:2]:
+            assert_written(await h.call("nh_add_cell", "p2", **step))
+        late = await h.call("nh_add_cell", "p2", **STEPS[2])
+        assert late.is_error and lines(late)[1:3] == ["nh: E110", batch.FULL_LINE], text(late)
+        assert lines(late)[0].startswith("Not written (by design): the approved batch's 2 cells")
+
+
+async def test_a_batch_request_typed_mid_turn_is_granted_by_the_next_yes(nh: Harness) -> None:
+    """6.1: an absorbed request becomes the turn's, so the next message's prev_request."""
+    nh.turns.prompt("p1", text="load the sales data")
+    assert_written(await nh.call("nh_add_cell", "p1", **STEPS[0]))
+    nh.turns.prompt("p1", text="then run the next 2")  # mode ask for the rest of p1
+    assert "nh: E109" in text(await nh.call("nh_add_cell", "p1", **STEPS[1]))
+    nh.turns.prompt("p2", text="yes")
+    for step in STEPS[1:3]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+    assert "nh: E110" in text(await nh.call("nh_add_cell", "p2", **STEPS[3]))
+
+
+# --- the batch's stops -----------------------------------------------------------------------
+
+
+async def test_an_error_stops_the_batch(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    first = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert next_text(first).startswith("Step 1 of 3 of the approved batch ran OK.")
+    failed = await nh.call("nh_add_cell", "p2", **FAILING)
+    assert failed.meta["nh/status"] == "error" and "turn=2/3 batch" in machine(failed)
+    assert next_text(failed).startswith(
+        'The approved batch stops at step 2 of 3: "Price per unit" [2] failed.'
+    )
+    uid = failed.meta["nh/cell_id"]
+    after = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert lines(after)[:2] == [stopped("2 of 3"), "nh: E123"], text(after)
+    retry = await nh.call("nh_edit_cell", "p2", cell_id=uid, code="per_unit = 1 / 1\nper_unit")
+    assert lines(retry)[:2] == [stopped("2 of 3"), "nh: E123"]  # no retry in a batch
+    rerun = await nh.call("nh_run", "p2", cell_id=uid)
+    assert lines(rerun)[:2] == [stopped("2 of 3", "run"), "nh: E123"]
+    assert lines(rerun)[-1] == f"Next: {CATALOGUE['E123'][1]}"
+    assert len(nh_code_cells(nh)) == 2
+    assert [(e["step"], e["total"], e["reason"]) for e in events(nh, "batch_stopped")] == [
+        (2, 3, "error")
+    ]
+    assert turn_state(nh, "p2")["batch_stop"] == 2
+
+
+async def test_a_check_this_stops_the_batch(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    checked = await nh.call("nh_add_cell", "p2", **CHECKED)
+    assert_written(checked)
+    assert "--- check this ---" in text(checked)
+    assert next_text(checked).startswith(
+        'The approved batch stops at step 2 of 3: "Keep expensive sales" [2] ran, but its '
+        "result needs a look (see 'check this')."
+    )
+    after = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert lines(after)[:2] == [stopped("2 of 3"), "nh: E123"]
+    uid = checked.meta["nh/cell_id"]
+    tidy = await nh.call("nh_edit_cell", "p2", cell_id=uid, code="expensive = df[df['price'] > 2]")
+    assert lines(tidy)[:2] == [stopped("2 of 3"), "nh: E123"]
+    assert [e["reason"] for e in events(nh, "batch_stopped")] == ["check_this"]
+
+
+@pytest.mark.parametrize("why", ["running", "queued"])
+async def test_a_cell_still_running_or_queued_stops_the_batch(tmp_path: Path, why: str) -> None:
+    async with batch_harness(tmp_path, "[exec]\nsoft_timeout_s = 5\n") as h:  # 5 s at least
+        await ask_and_answer(h)
+        assert_written(await h.call("nh_add_cell", "p2", **STEPS[0]))
+        if why == "running":
+            h.backend.exec_delay_s = 6
+        else:
+            h.backend.kernel_busy = True
+        slow = await h.call("nh_add_cell", "p2", **STEPS[1])
+        assert slow.meta["nh/status"] == why, text(slow)
+        assert next_text(slow).endswith(
+            "The approved batch stops at step 2 of 3: say which planned steps did not run."
+        )
+        after = await h.call("nh_add_cell", "p2", **STEPS[2])
+        assert lines(after)[:2] == [stopped("2 of 3"), "nh: E123"]
+        assert [e["reason"] for e in events(h, "batch_stopped")] == [why]
+        h.backend.kernel_busy = False
+        waited = await h.call("nh_run", "p2", cell_id=slow.meta["nh/cell_id"], mode="wait")
+        assert waited.meta["nh/status"] == "ok", text(waited)
+        assert next_text(waited).startswith(
+            '"Total price by region" [2] ran OK, but the approved batch stopped at step 2 of 3.'
+        )
+        again = await h.call("nh_add_cell", "p2", **STEPS[2])
+        assert lines(again)[:2] == [stopped("2 of 3"), "nh: E123"]  # a stop is for the message
+        edit = await h.call(
+            "nh_edit_cell", "p2", cell_id=slow.meta["nh/cell_id"], code=STEPS[1]["code"] + "\n"
+        )
+        assert lines(edit)[:2] == [stopped("2 of 3"), "nh: E123"]
+
+
+async def test_an_e122_inside_a_batch_stops_it_and_the_next_yes_grants_that_call_alone(
+    nh: Harness,
+) -> None:
+    """A step nh asks about: its question is recorded as any cell's (6.4), and the batch
+    stops there. The next message's yes writes that exact call, as its one cell: no batch."""
+    await ask_and_answer(nh)
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    asked = await nh.call("nh_add_cell", "p2", **INSTALL)
+    assert lines(asked) == [
+        FIRST,
+        "nh: E122",
+        FINDING,
+        batch.STOP_LINE.format(step=2, total=3),
+        ASK_NEXT,
+    ]
+    assert pending(nh)["turn_id"] == "p2" and pending(nh)["key"] == install_key()
+    after = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert lines(after)[:2] == [stopped("2 of 3"), "nh: E123"]
+    assert [e["reason"] for e in events(nh, "batch_stopped")] == ["E122"]
+    nh.turns.prompt("p3", text="yes")
+    granted = await nh.call("nh_add_cell", "p3", **INSTALL)
+    assert_written(granted)
+    assert "turn=1/1 retries" in machine(granted)
+    late = await nh.call("nh_add_cell", "p3", **STEPS[1])
+    assert late.is_error and "nh: E110" in text(late) and "batch" not in text(late)
+    assert [c["source"] for c in nh_code_cells(nh)] == [STEPS[0]["code"], INSTALL["code"]]
+
+
+async def test_the_first_step_asking_stops_the_batch_at_step_1(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    asked = await nh.call("nh_add_cell", "p2", **INSTALL)
+    assert batch.STOP_LINE.format(step=1, total=3) in lines(asked)
+    after = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert lines(after)[:2] == [stopped("1 of 3"), "nh: E123"]
+
+
+async def test_a_yes_that_could_answer_a_cell_question_and_a_batch_answers_the_question(
+    nh: Harness,
+) -> None:
+    """First ask wins: the cell was asked about before the batch request was typed mid-turn,
+    so the yes grants that call and no batch."""
+    nh.turns.prompt("p1", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p1", **INSTALL))
+    nh.turns.prompt("p1", text="and run the next 3")  # absorbed: request batch, mode ask
+    nh.turns.prompt("p2", text="yes")
+    assert_written(await nh.call("nh_add_cell", "p2", **INSTALL))
+    late = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert late.is_error and "nh: E110" in text(late)
+    assert events(nh, "batch_granted") == []
+    assert [(e["turn_id"], e["reason"]) for e in events(nh, "batch_not_granted")] == [
+        ("p2", "pending")
+    ]
+
+
+async def test_headless_grants_no_batch(nh: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    await ask_and_answer(nh)
+    monkeypatch.setenv("NH_HEADLESS", "1")
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    late = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert late.is_error and "nh: E110" in text(late)
+    assert [e["reason"] for e in events(nh, "batch_not_granted")] == ["headless"]
+
+
+# --- each step waits for the last one's result (E133; review C6a) ----------------------------
+
+
+def _after_probe_held(h: Harness) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the next report's after-probe (its run is over, its 'check this' not known yet):
+    (entered, release)."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = h.backend.probe
+
+    async def held(ref: Any, name: str, args: dict[str, Any], timeout: float) -> Any:
+        reporting = any(frame.function == "report_run" for frame in inspect.stack(0))
+        if name == "vars" and not entered.is_set() and reporting:
+            entered.set()
+            await release.wait()
+        return await real(ref, name, args, timeout)
+
+    h.backend.probe = held  # type: ignore[method-assign]
+    return entered, release
+
+
+async def test_a_parallel_step_gets_e133_until_the_last_result_is_in(nh: Harness) -> None:
+    """Two steps sent at once, the first still running when the second takes the lock: the
+    second gets E133 (nothing is written and nothing stops), and sent again after the first
+    one's OK result it is written as the next step."""
+    await ask_and_answer(nh)
+    nh.backend.exec_delay_s = 0.3
+    results = await asyncio.gather(
+        nh.call("nh_add_cell", "p2", **STEPS[0]), nh.call("nh_add_cell", "p2", **STEPS[1])
+    )
+    nh.backend.exec_delay_s = 0
+    bodies = [text(r) for r in results]
+    [written] = [r for r in results if not r.is_error]
+    [waited] = [r for r in results if r.is_error]
+    assert lines(waited) == WAITING("1"), bodies
+    assert next_text(written).startswith("Step 1 of 3 of the approved batch ran OK."), bodies
+    assert events(nh, "batch_stopped") == [] and len(nh_code_cells(nh)) == 1
+    first_was_load = '"Load sales data"' in lines(written)[0]
+    again = await nh.call("nh_add_cell", "p2", **(STEPS[1] if first_was_load else STEPS[0]))
+    assert_written(again)
+    assert "turn=2/3 batch" in machine(again)
+
+
+async def test_two_quick_steps_sent_at_once_never_skip_a_check(nh: Harness) -> None:
+    """No exec delay: the first step's run is over before the second call takes the lock, but
+    its report isn't built. Its cell still reads running (record_finish leaves a going batch's
+    step to its report), so the second gets E133, and no step is written after a 'check this'
+    one."""
+    await ask_and_answer(nh)
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    results = await asyncio.gather(
+        nh.call("nh_add_cell", "p2", **CHECKED), nh.call("nh_add_cell", "p2", **STEPS[1])
+    )
+    bodies = [text(r) for r in results]
+    [written] = [r for r in results if not r.is_error]
+    [waited] = [r for r in results if r.is_error]
+    assert lines(waited) == WAITING("2"), bodies
+    assert len(nh_code_cells(nh)) == 2
+    if "--- check this ---" in text(written):  # the checked step took the lock first
+        assert [(e["step"], e["reason"]) for e in events(nh, "batch_stopped")] == [
+            (2, "check_this")
+        ]
+        again = await nh.call("nh_add_cell", "p2", **STEPS[1])
+        assert lines(again)[:2] == [stopped("2 of 3"), "nh: E123"]
+        assert len(nh_code_cells(nh)) == 2
+
+
+@pytest.mark.parametrize("step", ["checked", "ok"])
+async def test_the_next_step_waits_for_the_last_steps_check(nh: Harness, step: str) -> None:
+    """Held at step 2's after-probe, step 2 reads running in the ledger, so step 3, an edit and
+    a re-run of a step all get E133 and nothing stops. Then step 2's result decides: its
+    'check this' stops the batch (step 3 sent again: E123), an OK one lets step 3 in."""
+    await ask_and_answer(nh)
+    first = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert_written(first)
+    entered, release = _after_probe_held(nh)
+    second = asyncio.create_task(
+        nh.call("nh_add_cell", "p2", **(CHECKED if step == "checked" else STEPS[1]))
+    )
+    await asyncio.wait_for(entered.wait(), 10)
+    state = turn_state(nh, "p2")
+    assert [state["status"][uid] for uid in state["claims"]] == ["ok", "running"]
+    uid = first.meta["nh/cell_id"]
+    for call in (
+        nh.call("nh_add_cell", "p2", **STEPS[2]),
+        nh.call("nh_edit_cell", "p2", cell_id=uid, code=STEPS[0]["code"] + "\n"),
+        nh.call("nh_run", "p2", cell_id=uid),
+    ):
+        assert lines(await call) == WAITING("2")
+    assert turn_state(nh, "p2")["batch_stop"] == 0 and events(nh, "batch_stopped") == []
+    release.set()
+    result = await second
+    third = await nh.call("nh_add_cell", "p2", **STEPS[2])
+    if step == "checked":
+        assert "--- check this ---" in text(result)
+        assert next_text(result).startswith("The approved batch stops at step 2 of 3:")
+        assert lines(third)[:2] == [stopped("2 of 3"), "nh: E123"]
+        assert [(e["step"], e["reason"]) for e in events(nh, "batch_stopped")] == [
+            (2, "check_this")
+        ]
+        assert len(nh_code_cells(nh)) == 2
+    else:
+        assert next_text(result).startswith("Step 2 of 3 of the approved batch ran OK.")
+        assert_written(third)
+        assert "turn=3/3 batch" in machine(third)
+
+
+async def test_a_full_batchs_parallel_add_gets_e110_not_e133(nh: Harness) -> None:
+    """With N cells claimed, one more add is E110 at once, even while the last step's result
+    isn't in: waiting for it couldn't let the cell in."""
+    await ask_and_answer(nh, request="run the next 2")
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    entered, release = _after_probe_held(nh)
+    second = asyncio.create_task(nh.call("nh_add_cell", "p2", **STEPS[1]))
+    await asyncio.wait_for(entered.wait(), 10)
+    third = await nh.call("nh_add_cell", "p2", **STEPS[2])
+    assert lines(third)[1:3] == ["nh: E110", batch.FULL_LINE], text(third)
+    release.set()
+    assert next_text(await second).startswith("That was step 2 of 2")
+    assert len(nh_code_cells(nh)) == 2
+
+
+# --- more of the grant -----------------------------------------------------------------------
+
+
+async def test_an_older_pending_question_does_not_block_the_batch(nh: Harness) -> None:
+    """First ask wins only against a question of the previous message: one left from an
+    earlier message (its asking message's writes never reached the ledger again) doesn't."""
+    nh.turns.prompt("p0", text="install seaborn")
+    assert_asked(await nh.call("nh_add_cell", "p0", **INSTALL))
+    await ask_and_answer(nh)
+    assert pending(nh) is not None and pending(nh)["turn_id"] == "p0"
+    for k, step in enumerate(STEPS[:3], start=1):
+        result = await nh.call("nh_add_cell", "p2", **step)
+        assert_written(result)
+        assert f"turn={k}/3 batch" in machine(result)
+    assert [e["turn_id"] for e in events(nh, "batch_granted")] == ["p2"]
+
+
+@pytest.mark.parametrize("call", ["edit", "re-run"])
+async def test_an_edit_or_a_rerun_as_the_first_call_decides_the_batch(
+    nh: Harness, call: str
+) -> None:
+    """The yes message's first gated call decides the batch whatever it is (design §6.3): a
+    re-run of an earlier message's failed cell is step 1 and stops the batch on its error; a
+    fix of it is step 1 and the batch goes on."""
+    nh.turns.prompt("p0", text="per unit")
+    failed = await nh.call("nh_add_cell", "p0", **FAILING)
+    assert failed.meta["nh/status"] == "error"
+    uid = failed.meta["nh/cell_id"]
+    await ask_and_answer(nh)
+    if call == "re-run":
+        rerun = await nh.call("nh_run", "p2", cell_id=uid)
+        assert rerun.meta["nh/status"] == "error" and "turn=1/3 batch" in machine(rerun)
+        assert next_text(rerun).startswith("The approved batch stops at step 1 of 3:")
+        assert [e["reason"] for e in events(nh, "batch_stopped")] == ["error"]
+        return
+    fixed = await nh.call("nh_edit_cell", "p2", cell_id=uid, code="per_unit = 1 / 1\nper_unit")
+    assert_written(fixed)
+    assert "turn=1/3 batch" in machine(fixed)
+    assert next_text(fixed).startswith("Step 1 of 3 of the approved batch ran OK.")
+    assert "turn=2/3 batch" in machine(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+
+
+async def test_a_batch_caps_at_its_n_below_a_raised_max_code_cells(tmp_path: Path) -> None:
+    async with batch_harness(tmp_path, "[turn]\nmax_code_cells = 5\n") as h:
+        await ask_and_answer(h, request="run the next 2")
+        for step in STEPS[:2]:
+            assert_written(await h.call("nh_add_cell", "p2", **step))
+        late = await h.call("nh_add_cell", "p2", **STEPS[2])
+        assert late.is_error and lines(late)[1:3] == ["nh: E110", batch.FULL_LINE], text(late)
+        assert len(nh_code_cells(h)) == 2
+
+
+async def test_a_stop_on_the_last_step_gives_e123_not_e110(nh: Harness) -> None:
+    """E123 comes before E110's cap; at the last step every planned step ran, so its block
+    doesn't ask which did not."""
+    await ask_and_answer(nh, request="run the next 2")
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    failed = await nh.call("nh_add_cell", "p2", **FAILING)
+    assert next_text(failed) == (
+        'The approved batch stops at step 2 of 2: "Price per unit" [2] failed. Don\'t fix it in '
+        "this message: a batch has no retries. Explain in plain words: quote the failing code, "
+        "what Python said, the likely cause and one fix; then wait."
+    )
+    after = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert lines(after)[:2] == [stopped("2 of 2"), "nh: E123"], text(after)
+
+
+# --- more of the stops -----------------------------------------------------------------------
+
+MARKED = "key = '[redacted:API_KEY]'"
+
+
+async def test_e125_on_an_edit_stops_the_batch(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    first = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert_written(first)
+    marked = await nh.call("nh_edit_cell", "p2", cell_id=first.meta["nh/cell_id"], code=MARKED)
+    assert lines(marked)[1] == "nh: E125"
+    assert lines(marked)[-2:] == [
+        batch.STOP_LINE.format(step=1, total=3),
+        f"Next: {batch.REFUSED_NEXT}",
+    ]
+    after = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert lines(after)[:2] == [stopped("1 of 3"), "nh: E123"]
+
+
+async def test_an_e122_on_an_edit_stops_the_batch(nh: Harness) -> None:
+    """The yes message's first call edits an earlier cell into one nh asks about."""
+    nh.turns.prompt("p0", text="load the sales data")
+    loaded = await nh.call("nh_add_cell", "p0", **LOAD)
+    assert_written(loaded)
+    await ask_and_answer(nh)
+    asked = await nh.call(
+        "nh_edit_cell", "p2", cell_id=loaded.meta["nh/cell_id"], code=INSTALL["code"]
+    )
+    assert lines(asked)[1] == "nh: E122"
+    assert batch.STOP_LINE.format(step=1, total=3) in lines(asked)
+    assert pending(nh)["turn_id"] == "p2"
+    after = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert lines(after)[:2] == [stopped("1 of 3"), "nh: E123"]
+
+
+async def test_e121_stops_the_batch(tmp_path: Path) -> None:
+    async with batch_harness(tmp_path, "[turn]\nmax_lint_rejects = 0\n") as h:
+        await ask_and_answer(h)
+        refused = await h.call("nh_add_cell", "p2", **STEPS[0])
+        assert lines(refused)[1] == "nh: E121"
+        assert lines(refused)[-2:] == [
+            batch.STOP_LINE.format(step=1, total=3),
+            f"Next: {batch.REFUSED_NEXT}",
+        ]
+        assert [e["reason"] for e in events(h, "batch_stopped")] == ["E121"]
+
+
+async def test_a_non_e12x_refusal_does_not_stop_the_batch(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    first = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert_written(first)
+    edit = await nh.call(
+        "nh_edit_cell", "p2", cell_id=first.meta["nh/cell_id"], code=STEPS[0]["code"] + "\n"
+    )
+    assert lines(edit)[1] == "nh: E112"
+    assert "batch" not in text(edit)
+    second = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert_written(second)
+    assert "turn=2/3 batch" in machine(second)
+    assert events(nh, "batch_stopped") == []
+
+
+async def test_e125_after_a_full_batch_names_step_n(nh: Harness) -> None:
+    await ask_and_answer(nh, request="run the next 2")
+    for step in STEPS[:2]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+    marked = await nh.call("nh_add_cell", "p2", **dict(LOAD, code=MARKED))
+    assert lines(marked)[1] == "nh: E125"
+    assert batch.STOP_LINE.format(step=2, total=2) in lines(marked), text(marked)
+
+
+async def test_e125_after_a_stop_is_e123(nh: Harness) -> None:
+    """E125 comes before the lock, but once the batch has stopped it is E123 like every other
+    call: its own Next (rewrite and call again) would only meet E123."""
+    await ask_and_answer(nh)
+    failed = await nh.call("nh_add_cell", "p2", **FAILING)
+    assert failed.meta["nh/status"] == "error"
+    for call in (
+        nh.call("nh_add_cell", "p2", **dict(LOAD, code=MARKED)),
+        nh.call("nh_edit_cell", "p2", cell_id=failed.meta["nh/cell_id"], code=MARKED),
+    ):
+        body = lines(await call)
+        assert body[:2] == [stopped("1 of 3"), "nh: E123"] and body[-1] == (
+            f"Next: {CATALOGUE['E123'][1]}"
+        )
+    assert turn_state(nh, "p2")["batch_stop"] == 1
+    assert [e["reason"] for e in events(nh, "batch_stopped")] == ["error"]
+
+
+@pytest.mark.parametrize("earlier", ["ok", "error"])
+async def test_a_wait_on_an_earlier_messages_cell_in_a_batch(tmp_path: Path, earlier: str) -> None:
+    """An earlier message's cell isn't a step: its OK result gets the plain block and the
+    batch goes on; its error stops the batch at the steps written so far, and its block offers
+    no retry (E123 would refuse one)."""
+    async with batch_harness(tmp_path, "[exec]\nsoft_timeout_s = 5\n") as h:
+        h.turns.prompt("p0", text="load it")
+        h.backend.exec_delay_s = 8  # still running after the soft timeout and the ask message
+        slow = await h.call("nh_add_cell", "p0", **(LOAD if earlier == "ok" else FAILING))
+        assert slow.meta["nh/status"] == "running", text(slow)
+        h.backend.exec_delay_s = 0
+        uid = slow.meta["nh/cell_id"]
+        await ask_and_answer(h)
+        busy = await h.call("nh_add_cell", "p2", **STEPS[1])  # decides the batch; no stop
+        assert lines(busy)[1] == "nh: E133", text(busy)
+        if earlier == "ok":
+            waited = await h.call("nh_run", "p2", cell_id=uid, mode="wait")
+            assert waited.meta["nh/status"] == "ok", text(waited)
+            assert "approved batch" not in next_text(waited)
+            step = await h.call("nh_add_cell", "p2", **STEPS[1])
+            assert_written(step)
+            assert "turn=1/3 batch" in machine(step) and events(h, "batch_stopped") == []
+            return
+        deadline = time.monotonic() + 15
+        while turn_state(h, "p0")["status"].get(uid) != "error" and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        assert_written(await h.call("nh_add_cell", "p2", **LOAD))
+        waited = await h.call("nh_run", "p2", cell_id=uid, mode="wait")
+        assert waited.meta["nh/status"] == "error", text(waited)
+        assert next_text(waited).startswith(
+            '"Price per unit" [1] failed, and the approved batch stopped at step 1 of 3. '
+            "Don't fix it in this message: a batch has no retries."
+        )
+        assert [(e["step"], e["reason"]) for e in events(h, "batch_stopped")] == [(1, "error")]
+        after = await h.call("nh_add_cell", "p2", **STEPS[1])
+        assert lines(after)[:2] == [stopped("1 of 3"), "nh: E123"]
+
+
+# --- an undo in a batch ----------------------------------------------------------------------
+
+
+async def test_an_undo_stops_the_batch_at_the_undone_step(nh: Harness) -> None:
+    """The steps after an undone cell would build on a notebook without it: the undo goes
+    through and stops the batch there; every later call, an undo too, gets E123."""
+    await ask_and_answer(nh)
+    for step in STEPS[:2]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+    undone = await nh.call("nh_undo", "p2")
+    assert not undone.is_error
+    assert any(line.startswith('Removed "Total price by region" [2]') for line in lines(undone))
+    assert next_text(undone).endswith(" " + batch.UNDONE_NEXT.format(step=2, total=3))
+    after = await nh.call("nh_add_cell", "p2", **STEPS[2])
+    assert lines(after)[:2] == [stopped("2 of 3"), "nh: E123"]
+    again = await nh.call("nh_undo", "p2")
+    assert lines(again)[:2] == [stopped("2 of 3", "undone"), "nh: E123"]
+    assert [(e["step"], e["reason"]) for e in events(nh, "batch_stopped")] == [(2, "undo")]
+    assert len(nh_code_cells(nh)) == 1
+
+
+async def test_an_undo_after_a_stop_is_e123(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    assert (await nh.call("nh_add_cell", "p2", **FAILING)).meta["nh/status"] == "error"
+    refused = await nh.call("nh_undo", "p2")
+    assert lines(refused)[:2] == [stopped("2 of 3", "undone"), "nh: E123"]
+    assert len(nh_code_cells(nh)) == 2
+
+
+async def test_an_undo_of_a_step_already_deleted_stops_the_batch(nh: Harness) -> None:
+    """E142's path (the user deleted nh's cell in JupyterLab): nothing is undone, but the steps
+    after it would still build on a notebook without it, so the batch stops there."""
+    await ask_and_answer(nh)
+    for step in STEPS[:2]:
+        assert_written(await nh.call("nh_add_cell", "p2", **step))
+    nh.backend.user_delete(NOTEBOOK, nh_code_cells(nh)[1]["id"])
+    undone = await nh.call("nh_undo", "p2")
+    assert "Nothing undone" in text(undone)
+    assert batch.UNDONE_NEXT.format(step=2, total=3) in text(undone)
+    after = await nh.call("nh_add_cell", "p2", **STEPS[2])
+    assert lines(after)[:2] == [stopped("2 of 3"), "nh: E123"]
+    assert [(e["step"], e["reason"]) for e in events(nh, "batch_stopped")] == [(2, "undo")]
+
+
+async def test_an_undo_restoring_an_edited_step_stops_the_batch(nh: Harness) -> None:
+    """The yes message's first step fixes an earlier message's cell; undoing that fix restores
+    the old code and stops the batch at step 1."""
+    nh.turns.prompt("p0", text="per unit")
+    failed = await nh.call("nh_add_cell", "p0", **FAILING)
+    uid = failed.meta["nh/cell_id"]
+    await ask_and_answer(nh)
+    assert_written(
+        await nh.call("nh_edit_cell", "p2", cell_id=uid, code="per_unit = 1 / 1\nper_unit")
+    )
+    undone = await nh.call("nh_undo", "p2")
+    assert not undone.is_error
+    assert next_text(undone).endswith(" " + batch.UNDONE_NEXT.format(step=1, total=3))
+    after = await nh.call("nh_add_cell", "p2", **STEPS[0])
+    assert lines(after)[:2] == [stopped("1 of 3"), "nh: E123"]
+    assert [(e["step"], e["reason"]) for e in events(nh, "batch_stopped")] == [(1, "undo")]
+
+
+async def test_an_undo_outside_a_batch_is_unchanged(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load it")
+    assert_written(await nh.call("nh_add_cell", "p1", **LOAD))
+    undone = await nh.call("nh_undo", "p1")
+    assert not undone.is_error and "batch" not in text(undone)
+
+
+# --- nh:cell-writer in a batch (C6a; the writer column comes in C6b) --------------------------
+
+
+async def test_one_qa_cell_run_writes_one_cell_of_a_batch(nh: Harness) -> None:
+    """Before C6a the cap of 1 kept a run to one cell; a batch's cap of N doesn't let one run
+    (one QA pass) write N cells. C6b's per-slot runs give each step its own run."""
+    await ask_and_answer(nh)
+    first = await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])
+    assert_written(first)
+    assert "turn=1/3 batch" in machine(first)
+    second = await add(nh, "writer", "p2", "wf_run-1", **STEPS[1])
+    assert lines(second) == [batch.RUN_HEAD, "nh: E110", f"Next: {RETURN_TO_WORKFLOW}"]
+    other = await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])
+    assert lines(other)[1:3] == ["nh: E110", "- Another nh:qa-cell run owns this message's cell."]
+    assert len(nh_code_cells(nh)) == 1 and events(nh, "batch_stopped") == []
+
+
+async def test_a_writers_failed_step_gets_no_retry(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    failed = await add(nh, "writer", "p2", "wf_run-1", **FAILING)
+    assert failed.meta["nh/status"] == "error" and "turn=1/3 batch" in machine(failed)
+    assert next_text(failed) == (
+        '"Price per unit" [1] failed, so the approved batch stops here, at step 1 of 3: a batch '
+        "has no retries. Return this whole result to the workflow as your final answer (status "
+        "error). Don't change it again."
+    )
+    fix = await as_writer(
+        nh, "p2", "wf_run-1", "nh_edit_cell", dict(cell_id=failed.meta["nh/cell_id"], code="1")
+    )
+    assert lines(fix)[:2] == [stopped("1 of 3"), "nh: E123"]
+    assert lines(fix)[-1] == f"Next: {RETURN_TO_WORKFLOW}"
+
+
+async def test_a_writers_step_sent_too_early_returns_to_the_workflow(nh: Harness) -> None:
+    """A writer's E133 for a step whose result isn't in has RETURN_TO_WORKFLOW, not the main
+    conversation's wait-and-resend; nothing stops."""
+    await ask_and_answer(nh)
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    entered, release = _after_probe_held(nh)
+    second = asyncio.create_task(nh.call("nh_add_cell", "p2", **STEPS[1]))
+    await asyncio.wait_for(entered.wait(), 10)
+    waited = await add(nh, "writer", "p2", "wf_run-9", **STEPS[2])
+    assert lines(waited) == [WAITING("2")[0], "nh: E133", f"Next: {RETURN_TO_WORKFLOW}"]
+    release.set()
+    assert_written(await second)
+    assert turn_state(nh, "p2")["batch_stop"] == 0
+
+
+async def test_after_the_runs_step_the_main_conversation_writes_the_next(nh: Harness) -> None:
+    """§6.3 Known gaps, "Ultracode until C6b": one run writes step 1, and once its report is
+    in the main conversation may write the next step itself."""
+    await ask_and_answer(nh)
+    assert_written(await add(nh, "writer", "p2", "wf_run-1", **STEPS[0]))
+    reported(nh, "wf_run-1")
+    second = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert_written(second)
+    assert "turn=2/3 batch" in machine(second)
+
+
+# --- C1's rule in a batch (design §6.3, Known gaps) --------------------------------------------
+
+
+async def test_a_stop_typed_mid_batch_leaves_the_gateways_batch_going(nh: Harness) -> None:
+    """An absorbed message only tightens and its no is never an answer (6.1), so the gateway
+    goes on; C6b's reminder part tells Claude to stop. Changing this is the user's call."""
+    await ask_and_answer(nh)
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))
+    nh.turns.prompt("p2", text="stop")
+    second = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert_written(second)
+    assert "turn=2/3 batch" in machine(second)

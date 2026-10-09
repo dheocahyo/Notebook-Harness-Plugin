@@ -59,6 +59,10 @@ class TurnState:
     # and the notebook they are in.
     undo_next: list[str] = field(default_factory=list)
     undo_next_notebook: str | None = None
+    # The approved batch (design §6.3): decided by the message's first gated call (None until
+    # then, 0 for none, else the most new cells it allows), and the step it stopped at (0: going).
+    batch_total: int | None = None
+    batch_stop: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TurnState:
@@ -326,6 +330,13 @@ class NotebookLocks:
                 yield
             finally:
                 flock.release()
+
+    @contextlib.asynccontextmanager
+    async def hold_turn(self, turn: TurnContext) -> AsyncIterator[None]:
+        """Only the per-turn lock ``hold()`` takes first: for turn state touched where no
+        notebook is resolved yet (an E125 refusal that stops an approved batch, design §6.3)."""
+        async with self._turn_lock(turn):
+            yield
 
     def _turn_lock(self, turn: TurnContext) -> asyncio.Lock:
         key = (turn.session_id, turn.prompt_id)

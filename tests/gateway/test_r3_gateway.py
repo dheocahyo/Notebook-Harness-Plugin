@@ -165,3 +165,39 @@ async def test_bools_read_true_and_false(nh: Harness) -> None:
     nh.turns.prompt("p1")
     body = text(await nh.call("nh_add_cell", "p1", **dict(LOAD, code="USE_LOG = False\nUSE_LOG")))
     assert "USE_LOG: new bool False" in body
+
+
+# design §6.3: the approved batch's next blocks, through the gateway
+def _next(result) -> str:
+    return text(result).split("--- next ---\n", 1)[1]
+
+
+async def test_a_batchs_next_blocks_go_on_then_close(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="run the next 2")
+    nh.turns.prompt("p2", text="go")
+    first = await nh.call("nh_add_cell", "p2", **LOAD)
+    assert _next(first) == (
+        'Step 1 of 2 of the approved batch ran OK. Give the user a short report on "Load sales '
+        'data" [1]: what it did and the real numbers, surprises first, named by title and [n]. '
+        "Then write step 2 of the plan with nh_add_cell, without waiting for the user."
+    )
+    last = await nh.call("nh_add_cell", "p2", **DROP)
+    assert _next(last).startswith(
+        'That was step 2 of 2, the last of the approved batch. Reply to the user about "Drop '
+        'rows with missing price" [2]: (1) what the cell does;'
+    )
+    assert _next(last).endswith("Do not write another cell.")
+
+
+async def test_a_batchs_error_block_says_no_retry(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="run steps 2-4")
+    nh.turns.prompt("p2", text="yes")
+    failed = await nh.call("nh_add_cell", "p2", **dict(LOAD, code="df = pd.read_csv(MISSING)"))
+    assert failed.meta["nh/status"] == "error"
+    assert _next(failed) == (
+        'The approved batch stops at step 1 of 3: "Load sales data" [1] failed. Don\'t fix it '
+        "in this message: a batch has no retries. Explain in plain words: quote the failing "
+        "code, what Python said, the likely cause and one fix; say which planned steps did not "
+        "run; then wait."
+    )
+    assert "retries left" not in _next(failed)

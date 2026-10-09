@@ -14,6 +14,7 @@ from ..history import Op
 from ..policy.errors import NhError
 from ..policy.turn import KEEP_TURNS, TurnState
 from ..state import write_last_cell
+from . import batch
 from .common import (
     Services,
     code_cell_for,
@@ -87,6 +88,7 @@ async def undo(
         cells = await snapshot(svc, ref)
         _rebuild_claims(state, cells, ref.rel_path)
         review_earlier_cells(svc, ref, cells, state)
+        batch.refuse_after_stop(state, turn, "undone")  # design §6.3: E123 after a batch's stop
 
         offering = _offer(svc, turn, state) if not cell_id else None
         offered = _offered_ops(svc, ref, offering)
@@ -192,6 +194,7 @@ async def undo(
         svc.history.mark_undone(op, turn_id=turn.prompt_id)
         state.undos += 1
         svc.ledger.save(state)
+        batch_line = batch.undone(svc, turn, state, op.uid)  # design §6.3: it stops a batch
         if offered and offering is not None:  # the offer is used up
             offering.undo_next = []
             svc.ledger.save(offering)
@@ -256,7 +259,8 @@ async def undo(
     out.section(
         "next",
         f"Tell the user, in plain words: what was undone, {kernel_part}and which cells are "
-        "now outdated. Offer to redo the step differently. Wait.",
+        "now outdated. Offer to redo the step differently. Wait."
+        + (f" {batch_line}" if batch_line else ""),
     )
     return text_result(out.text(), status="undone", cell_id=op.uid)
 
@@ -309,6 +313,7 @@ async def _already_gone(
     state.undo_next = [rest[0].uid] if rest else []
     state.undo_next_notebook = ref.rel_path if rest else None
     svc.ledger.save(state)
+    batch_line = batch.undone(svc, turn, state, op.uid)  # design §6.3: it stops a batch
     write_last_cell(
         svc.layout,
         session_id=turn.session_id,
@@ -334,6 +339,8 @@ async def _already_gone(
         )
     else:
         next_step = f"Tell the user {name} is already gone; there is nothing else to undo. Wait."
+    if batch_line:
+        next_step += f" {batch_line}"
     where = _where(svc, ref, "")
     lines = [
         f"Nothing undone: {name}{where} was already deleted in JupyterLab.",
