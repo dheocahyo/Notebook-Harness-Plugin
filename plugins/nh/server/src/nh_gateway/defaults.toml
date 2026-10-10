@@ -10,6 +10,9 @@ data_source = ""
 notebook = "notebooks/01_eda.ipynb"
 env_manager = ""                # uv | conda (written by nhctl scaffold)
 
+[preset]
+level = "junior"                # junior | senior (senior: 1 comment line per 16 code lines, not 8)
+
 [jupyter]
 url = ""                        # empty = discover; only a loopback URL is accepted here (remote: NH_JUPYTER_URL env)
 kernel_name = ""                # empty = the notebook's kernelspec, else python3
@@ -24,6 +27,7 @@ max_revisions = 2               # nh:qa-cell's writer: changes to an OK cell fro
 max_waits = 2
 max_undos = 3
 max_lint_rejects = 3
+max_batch = 5                   # the most steps one approved batch writes ("run the next N", after the user's yes)
 stamp_ttl_s = 1800
 
 [exec]
@@ -53,16 +57,20 @@ heading_level = 3
 
 [lint]
 mode = "advise"                 # advise | strict (strict turns every hint into an error)
-comment_ratio = 8               # at most 1 comment per N code lines; 0 = no comments
+comment_ratio = 8               # at most 1 comment line per N code lines; unset: the preset's, 8 junior or 16 senior; 0 = no comments
 max_line_length = 99
 max_cell_lines = 40
 max_nesting = 3
 max_chain = 4
 
-[lint.rules]                    # per rule: off | hint | error
-package_install = "error"
+[lint.rules]                    # per rule: off | hint | error | ask
+package_install = "ask"
+network = "ask"
+outside_write = "ask"           # a cell that writes or removes files outside the project (L013)
 notebook_write = "error"
 markdown_output = "error"
+secret_print = "error"
+secret_name = "hint"
 long_line = "hint"
 long_cell = "hint"
 deep_nesting = "hint"

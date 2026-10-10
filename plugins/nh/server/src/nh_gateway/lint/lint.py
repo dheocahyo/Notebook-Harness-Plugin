@@ -7,23 +7,27 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import io
 import re
 import sys
 import textwrap
 import tokenize
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from nh_gateway._shared import hosts
 from nh_gateway._shared.patterns import CELL_NOTEBOOK_WRITES, CELL_PACKAGE_INSTALL, CELL_SEPARATORS
 from nh_gateway._shared.text import count_words, normalize_bullet, normalize_title, split_notes
-from nh_gateway.config import Config
+from nh_gateway.config import ASK_RULES, Config
 from nh_gateway.dataflow import EVERYTHING, Flow, base_name, flow_of
+from nh_gateway.lint import network, secret_scan, writes
 from nh_gateway.lint.magics import Masked, lines_of, mask
 
-Severity = Literal["error", "hint"]
-Finding = tuple[str, str]  # (message, fix)
+Severity = Literal["error", "hint", "ask"]
+# (message, fix), or (message, fix, question) for a rule that can be an ask (design §6.4)
+Finding = tuple[str, str] | tuple[str, str, str]
 
 # Cell magics whose body is Python source (ruff skips the same set).
 PYTHON_CELL_MAGICS = frozenset({"time", "timeit", "capture", "prun", "debug", "python", "python3"})
@@ -61,6 +65,38 @@ _SHELL_INSTALL = re.compile(
 _OS_INSTALL = re.compile(
     r"\bos\.(?:system|popen)\([^)]*\b(?:pip3?|conda|mamba|uv)\b[^)]*\b(?:install|add)\b", re.I
 )
+# L009's text (design §6.4). A line that may hold a package command (a magic, a shell call from
+# Python, or a shell cell's command), where a line splits into commands, and a command: a tool
+# word, then its verb, with no other tool word between them (so the scan stays linear).
+_COMMAND_LINE = re.compile(r"^\s*[!%]|\b(?:os\.(?:system|popen)|subprocess\.[a-z_]+)\(")
+_SHELL_PACKAGE_LINE = re.compile(
+    r"^\s*(?:sudo\s+)?(?:python3?\s+-m\s+pip|pip3?|conda|mamba|micromamba|uv(?:\s+pip)?)"
+    r"\s+(?:install|add|uninstall|remove)\b",
+    re.I,
+)
+_COMMAND_SPLIT = re.compile(r"&&|\|\||;|(?<=\s)\|")
+_TOOL = r"\b(?:pip3?|conda|mamba|micromamba|uv)\b"
+_COMMAND = re.compile(
+    rf"(?P<tool>{_TOOL})(?P<mid>(?:(?!{_TOOL}).)*?)(?<![\w-])"
+    r"(?P<verb>uninstall|install|remove|add)\b",
+    re.I,
+)
+_CONDA_TOOLS = frozenset({"conda", "mamba", "micromamba"})
+_COMMAND_END = re.compile(r"\)|[\'\"]\]|[\'\"]\s*,\s*(?![\'\"\s])|\s\d*>|\s#")
+_INSTALL_WORD = re.compile(r"[\w.\-+=<>!~@:/${}*%,#&?]+(?:\[[\w,.\-]*\])?")
+# The options whose value L009 names (design §6.4); the values of the others in _VALUE_OPTION
+# (pip's, uv's and conda's) are left out, so they aren't read as packages.
+_REQUIREMENT_OPTION = re.compile(r"-r|--requirements?|--file")
+_EDITABLE_OPTION = re.compile(r"-e|--editable")
+_INDEX_OPTION = re.compile(r"-[if]|--(?:index-url|extra-index-url|index|default-index|find-links)")
+_CHANNEL_OPTION = re.compile(r"-c|--channel")
+_VALUE_OPTION = re.compile(
+    r"-[cefinprt]|--(?:requirements?|file|constraint|editable|index-url|extra-index-url"
+    r"|find-links|target|prefix|root|python|name|channel|index|default-index|group|optional"
+    r"|extra|package|src|trusted-host|platform|python-version|upgrade-strategy|only-binary"
+    r"|no-binary|log|cache-dir|timeout|retries|proxy|cert|client-cert)"
+)
+_SHELL_SAFE = re.compile(r"[\w@%+=:,./-]+")
 _PROSE_CALL_TEXT = re.compile(
     r"\b(?:Markdown|HTML|Latex)\s*\(\s*[rRbBuUfF]{0,2}(\"\"\"|'''|\"|')(.*?)\1", re.S
 )
@@ -115,12 +151,14 @@ class Issue:
     severity: Severity
     message: str  # human sentence, quotes code, never line numbers
     fix: str  # one sentence telling the agent what to change
+    question: str = ""  # an ask's clause for the user ("installs `x` into the kernel only")
 
 
 @dataclass
 class LintReport:
     errors: list[Issue]
     hints: list[Issue]
+    asks: list[Issue]  # what holds the cell for the user's yes (E122, design §6.4)
     code_lines: int
     comment_lines: int
     defs: set[str]
@@ -160,6 +198,10 @@ class _Cell:
     intent: str | None
     bullets: list[str]
     names_above: set[str] | None
+    approved_hosts: frozenset[str]  # host keys; L012 skips a site whose hosts are all here
+    code_above: tuple[str, ...]  # the code cells above, in order: L012 and L013 read their names
+    project_root: str | None  # the project's folder; L013 needs it to tell inside from outside
+    notebook_dir: str  # the notebook's folder, relative to the root (absolute outside it)
 
     @classmethod
     def build(
@@ -171,6 +213,10 @@ class _Cell:
         intent: str | None,
         bullets: list[str],
         names_above: set[str] | None,
+        approved_hosts: Collection[str] = (),
+        code_above: Sequence[str] = (),
+        project_root: str | None = None,
+        notebook_dir: str = "",
     ) -> _Cell:
         source = "\n".join(lines_of(code or ""))
         masked = mask(source)
@@ -205,11 +251,30 @@ class _Cell:
             intent=intent,
             bullets=bullets,
             names_above=names_above,
+            approved_hosts=frozenset(filter(None, map(hosts.normalize_entry, approved_hosts))),
+            code_above=tuple(code_above),
+            project_root=project_root,
+            notebook_dir=notebook_dir,
         )
 
     @property
     def python(self) -> bool:
         return self.masked.cell_magic is None or self.masked.cell_magic in PYTHON_CELL_MAGICS
+
+    @functools.cached_property
+    def secrets(self) -> secret_scan.Scan:
+        """What would show a secret; L011 and L014 share one scan."""
+        return secret_scan.scan(self.masked, self.lines, self.tree, self.names_above)
+
+    @functools.cached_property
+    def network(self) -> list[network.Site]:
+        """Where the cell reaches the network (L012)."""
+        return network.scan(self.masked, self.lines, self.tree, network.bindings(self.code_above))
+
+    @functools.cached_property
+    def written(self) -> list[writes.Write]:
+        """Where the cell writes or removes files (L013)."""
+        return writes.scan(self.masked, self.lines, self.tree, writes.bindings(self.code_above))
 
     @property
     def empty(self) -> bool:
@@ -220,6 +285,12 @@ class _Cell:
 
     def line(self, node: ast.stmt | ast.ExceptHandler) -> str:
         return self.lines[node.lineno - 1]
+
+
+def kernel_provides(name: str) -> bool:
+    """A name the kernel has without any cell defining it: a builtin or one of IPython's (L120,
+    and /nh:review's hidden-state check, design §6.10)."""
+    return name in _BUILTINS or bool(_IPYTHON_NAME.fullmatch(name))
 
 
 def lint_cell(
@@ -233,11 +304,30 @@ def lint_cell(
     require_intent: bool,
     kernel_python: tuple[int, int] | None,
     names_above: set[str] | None,
+    approved_hosts: Collection[str] = frozenset(),
+    code_above: Sequence[str] = (),
+    project_root: str | None = None,
+    notebook_dir: str = "",
 ) -> LintReport:
+    """Lint one cell. ``approved_hosts``: the project's approved host keys (the gateway reads
+    ``.nh/state/approved_hosts.json`` per call), which L012 lets through; ``code_above``: the
+    code cells above it, whose names L012 and L013 read; ``project_root`` and ``notebook_dir``
+    (the notebook's folder, relative to the root, or absolute for a notebook outside it, as the
+    review passes it): where the project is and where the kernel runs, for L013, which finds
+    nothing without a root (design §6.4, §6.10)."""
     clean_title = normalize_title(title) if title and title.strip() else None
     bullets = [re.sub(r"\s*\n\s*", " ", bullet) for bullet in split_notes(notes)]
     cell = _Cell.build(
-        code, cfg, title=clean_title, intent=intent, bullets=bullets, names_above=names_above
+        code,
+        cfg,
+        title=clean_title,
+        intent=intent,
+        bullets=bullets,
+        names_above=names_above,
+        approved_hosts=approved_hosts,
+        code_above=code_above,
+        project_root=project_root,
+        notebook_dir=notebook_dir,
     )
     issues: list[Issue] = []
     if cell.empty:
@@ -261,10 +351,12 @@ def lint_cell(
         except Exception:  # a heuristic that trips on odd code must never break a write
             continue
         if found:
-            issues.append(Issue(rule, key, level, *found))
+            message, fix, *question = found
+            issues.append(Issue(rule, key, level, message, fix, *question))
     return LintReport(
         errors=sorted((i for i in issues if i.severity == "error"), key=lambda i: i.rule),
         hints=[i for i in issues if i.severity == "hint"],
+        asks=[i for i in issues if i.severity == "ask"],
         code_lines=len(cell.code_lines),
         comment_lines=len(cell.comment_lines),
         defs=set(cell.flow.defs),
@@ -280,9 +372,14 @@ def _error(rule: str, key: str, message: str, fix: str) -> Issue:
 
 
 def _level(cfg: Config, key: str) -> Severity | None:
+    """The rule's configured level. Strict mode makes every hint an error and leaves an ask an
+    ask: only the user decides an install. Only a rule that can ask asks; ``config.load`` refuses
+    "ask" for the others, and one that gets it anyway is an error (design §6.4)."""
     level = cfg.rule(key)
     if level == "off":
         return None
+    if level == "ask":
+        return "ask" if key in ASK_RULES else "error"
     if level == "error" or cfg["lint"]["mode"] == "strict":
         return "error"
     return "hint"
@@ -574,21 +671,278 @@ def _path_text(node: ast.AST | None, paths: dict[str, str]) -> str:
 
 
 def _package_install(cell: _Cell) -> Finding | None:
+    """L009, an ask by default (design §6.4): its message names what each package command of the
+    cell does (installs, adds, removes) and to which packages, and its question says what keeps
+    an install: the next env sync removes a kernel-only one."""
     text = cell.code_text
     patterns = [CELL_PACKAGE_INSTALL, _MAGIC_INSTALL, _OS_INSTALL]
-    if cell.masked.cell_magic in _SHELL_CELL_MAGICS:
+    shell = cell.masked.cell_magic in _SHELL_CELL_MAGICS
+    if shell:
         patterns.append(_SHELL_INSTALL)
-    match = next((m for p in patterns if (m := p.search(text))), None)
-    if match is None:
+    found = _line_starts(text, patterns)
+    if not found:
         return None
-    at = match.start() + len(match.group(0)) - len(match.group(0).lstrip())
-    end = text.find("\n", at)
-    line = text[text.rfind("\n", 0, at) + 1 : end if end >= 0 else len(text)]
+    lines: list[str] = []
+    kinds: dict[str, list[_PackageCommand]] = {}
+    start = 0
+    for line in text.split("\n"):  # detection's lines, and any other line with a package command
+        commands: list[_PackageCommand] = []
+        if (
+            start in found
+            or _COMMAND_LINE.search(line)
+            or (shell and _SHELL_PACKAGE_LINE.match(line))
+        ):
+            commands = list(_package_commands(line))  # each line is scanned once
+        if start in found or commands:
+            lines.append(line)
+            for command in commands:
+                kinds.setdefault(command.kind, []).append(command)
+        start += len(line) + 1
+    if not kinds:
+        kinds["install"] = []
+    conda = cell.cfg["project"].get("env_manager") == "conda"
+    texts = [_package_text(kind, commands, conda) for kind, commands in kinds.items()]
+    if list(kinds) == ["install"]:
+        lead = "Remove the install"
+    else:
+        lead = "Remove it" if len(kinds) == 1 else "Remove the package commands"
+    tail = ": the next env sync removes kernel-only installs." if "install" in kinds else "."
+    shown = f"{_quote(lines[0])}{_more(len(lines))}"
     return (
-        f"The code installs packages ({_quote(line)}).",
-        "Remove the install and ask the user; after a yes, install with `uv add` or "
-        "`conda install` through Bash.",
+        f"The cell {'; it also '.join(t[0] for t in texts)} ({shown}).",
+        f"{lead} and ask the user; after a yes, {', then '.join(t[2] for t in texts)} through "
+        f"Bash{tail}",
+        "; it also ".join(t[1] for t in texts),
     )
+
+
+def _line_starts(text: str, patterns: list[re.Pattern[str]]) -> set[int]:
+    """Where each line that one of ``patterns`` matches starts."""
+    starts: set[int] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            at = match.start() + len(match.group(0)) - len(match.group(0).lstrip())
+            starts.add(text.rfind("\n", 0, at) + 1)
+    return starts
+
+
+@dataclass
+class _PackageCommand:
+    """One package command of an L009 line (design §6.4)."""
+
+    kind: str  # install | uv-add | remove | uv-remove
+    packages: list[str]
+    editables: list[str]
+    files: list[str]  # requirement files
+    index: list[tuple[str, str]]  # pip's and uv's index options, as written: (option, value)
+    channels: list[str]  # conda's
+
+
+def _package_commands(line: str) -> Iterator[_PackageCommand]:
+    """The package commands of one line, split at ``&&``, ``||``, ``;`` and `` |``: a tool word,
+    its verb, and the words after it up to where the command ends."""
+    for part in _COMMAND_SPLIT.split(line):
+        command = _COMMAND.search(part)
+        if command is None:
+            continue
+        conda = command["tool"].lower() in _CONDA_TOOLS
+        project = command["tool"].lower() == "uv"  # `uv pip install` matches at its `pip`
+        if command["verb"].lower() in ("uninstall", "remove"):
+            kind = "uv-remove" if project else "remove"
+        else:
+            kind = "uv-add" if project and command["verb"].lower() == "add" else "install"
+        rest = part[command.end() :]
+        end = _COMMAND_END.search(rest)
+        rest = rest[: end.start()] if end else rest
+        found = _PackageCommand(kind, [], [], [], [], [])
+        seen: set[str] = set()  # found.packages as a set: the scan stays linear
+        option: str | None = None
+        for word in (w.strip(",") for w in _INSTALL_WORD.findall(rest)):
+            if option is not None:
+                _option_value(found, option, word, conda)
+                option = None
+            elif word.startswith("-"):
+                name, eq, value = word.partition("=")
+                if eq:
+                    _option_value(found, name, value, conda)
+                elif _VALUE_OPTION.fullmatch(name) and not (conda and name == "-f"):
+                    option = name  # conda's -f is --force, which takes no value
+            elif any(ch.isalnum() for ch in word) and word not in seen:
+                seen.add(word)
+                found.packages.append(word)
+        yield found
+
+
+def _option_value(found: _PackageCommand, option: str, value: str, conda: bool) -> None:
+    """Keep the value of an option L009 names; pip's -c (constraints) and the rest are dropped."""
+    if not value:
+        return
+    if _REQUIREMENT_OPTION.fullmatch(option):
+        found.files.append(value)
+    elif _EDITABLE_OPTION.fullmatch(option):
+        found.editables.append(value)
+    elif conda and _CHANNEL_OPTION.fullmatch(option):
+        found.channels.append(value)
+    elif not conda and _INDEX_OPTION.fullmatch(option):
+        found.index.append((option, value))
+
+
+def _package_text(kind: str, commands: list[_PackageCommand], conda: bool) -> tuple[str, str, str]:
+    """(message clause, question clause, fix part) of one kind of package command."""
+    names: list[str] = []
+    targets: list[str] = []  # the suggested command's words
+    packages: list[str] = []
+    options: list[str] = []
+    option_set: set[str] = set()
+    files = False
+    seen: set[tuple[str, str]] = set()
+    for command in commands:
+        mine: list[str] = []
+        for what, value in (
+            *(("package", p) for p in command.packages),
+            *(("editable", e) for e in command.editables),
+            *(("file", f) for f in command.files),
+        ):
+            if (what, value) in seen:
+                continue
+            seen.add((what, value))
+            if what == "package":
+                mine.append(f"`{value}`")
+                targets.append(_shell_word(value))
+                packages.append(_shell_word(value))
+            elif what == "editable":
+                mine.append(f"`{value}` (editable)")
+                targets += ["--editable", _shell_word(value)]
+            else:
+                mine.append(f"the packages in `{value}`")
+                targets += ["-r", _shell_word(value)]
+                files = True
+        for option, value in command.index:
+            pair = f"{option} {_shell_word(value)}"
+            if pair not in option_set:
+                option_set.add(pair)
+                options.append(pair)
+        sources = [f"`{v}`" for _, v in command.index] + [
+            f"channel `{c}`" for c in command.channels
+        ]
+        if mine and sources:
+            mine[-1] += f" (from {_and(sources)})"
+        names += mine
+    named = _and(names) if names else "packages"
+    them = "it" if len(names) == 1 and not files else "them"
+    add = " ".join([*(targets or ["<package>"]), *options])
+    remove = " ".join(packages or ["<package>"])
+    if kind == "install":
+        message = f"installs {named} into the kernel only"
+        if conda:
+            keeps = f"adding {them} to environment.yml keeps {them}"
+            fix = f"add {named} to environment.yml and run `nhctl env sync`"
+        else:
+            keeps = f"`uv add {add}` keeps {them}"
+            fix = f"install {them} with `uv add {add}`"
+        return message, f"{message}, and the next env sync removes {them} ({keeps})", fix
+    if kind == "uv-add":
+        message = f"adds {named} to the project's dependencies"
+        return message, f"{message} with `uv add`", f"run `uv add {add}`"
+    if kind == "uv-remove":
+        message = f"removes {named} from the project's dependencies"
+        return message, f"{message} with `uv remove`", f"run `uv remove {remove}`"
+    message = f"removes {named} from the kernel"
+    if conda:
+        return message, message, f"remove {named} from environment.yml and run `nhctl env sync`"
+    return message, message, f"run `uv remove {remove}`"
+
+
+def _shell_word(word: str) -> str:
+    """``word`` as one shell argument, double-quoted when the shell would read it otherwise:
+    L009's question sits inside E122's single quotes (design §6.4)."""
+    if _SHELL_SAFE.fullmatch(word):
+        return word
+    return '"' + re.sub(r'([\\"$`])', r"\\\1", word) + '"'
+
+
+def _and(parts: list[str]) -> str:
+    """`a`, `b` and `c`."""
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _network(cell: _Cell) -> Finding | None:
+    """L012, an ask by default (design §6.4): the hosts the cell reaches that the project hasn't
+    approved, never a URL, so no userinfo, path or token reaches the text."""
+    approved = cell.approved_hosts
+    left = [
+        site
+        for site in cell.network
+        if site.unknown or not site.hosts or not set(site.hosts) <= approved
+    ]
+    if not left:
+        return None
+    named = list(dict.fromkeys(h for site in left for h in site.hosts if h not in approved))
+    parts = [f"`{host}`" for host in named[:3]]
+    if len(named) > 3:
+        parts.append(f"{len(named) - 3} more")
+    if not parts:
+        clause = "connects to the network"
+    else:
+        if any(site.unknown for site in left):
+            parts.append("other hosts")
+        clause = f"connects to {_and(parts)} over the network"
+    return (
+        f"The cell {clause} (`{left[0].where}`{_more(len(left))}).",
+        "Don't reach the network from this cell: ask the user to download what it needs into "
+        "the project (for example `data/raw/`), then read it from there.",
+        clause,
+    )
+
+
+_OUTSIDE_FIX = (
+    "Keep the cell's files inside the project (for example under `data/processed/` or "
+    "`reports/`); ask the user before writing anywhere else."
+)
+
+
+def _outside_write(cell: _Cell) -> Finding | None:
+    """L013, an ask by default (design §6.4): the files and folders the cell writes or removes
+    outside the project, each named once as it resolves."""
+    if not cell.project_root:
+        return None
+    left: list[tuple[writes.Write, str]] = []
+    for write in cell.written:
+        shown = writes.outside(write.path, cell.project_root, cell.notebook_dir)
+        if shown is not None:
+            left.append((write, shown))
+    if not left:
+        return None
+    parts = []
+    written = list(dict.fromkeys(shown for write, shown in left if not write.removes))
+    removed = list(dict.fromkeys(shown for write, shown in left if write.removes))
+    if written:
+        parts.append(f"writes to {_listed(written)}")
+    if removed:
+        parts.append(f"removes {_listed(removed)}")
+    clause = f"{' and '.join(parts)}, outside the project"
+    return (f"The cell {clause} (`{left[0][0].where}`{_more(len(left))}).", _OUTSIDE_FIX, clause)
+
+
+def _listed(items: list[str]) -> str:
+    """`a`, `b`, `c` and N more."""
+    parts = [_path_span(item) for item in items[:3]]
+    if len(items) > 3:
+        parts.append(f"{len(items) - 3} more")
+    return _and(parts)
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _path_span(path: str) -> str:
+    """A path as a code span on one line: control characters as their escapes; double-quoted
+    with ``\\`` and ``"`` escaped when it holds a ``'`` (L013's question sits inside E122's
+    single quotes, as L009's does); a double-backtick span when it holds a backtick."""
+    text = _CONTROL.sub(lambda found: found.group().encode("unicode_escape").decode(), path)
+    if "'" in text:
+        text = '"' + re.sub(r'([\\"])', r"\\\1", text) + '"'
+    return f"`` {text} ``" if "`" in text else f"`{text}`"
 
 
 def _markdown_output(cell: _Cell) -> Finding | None:
@@ -621,7 +975,83 @@ def _markdown_output(cell: _Cell) -> Finding | None:
     return None
 
 
+def _secret_print(cell: _Cell) -> Finding | None:
+    """Code that would show an env var's value (design 6.7). Names the var, never a value."""
+    hits = cell.secrets.hits
+    if not hits:
+        return None
+    hit, taint = hits[0], hits[0].taint
+    what = _secret_what(taint)
+    if taint.holder:
+        what = f"`{taint.holder}`, which holds {what}"
+    if hit.last and hit.sink == taint.holder:  # the last line is the variable itself
+        where = "The last line"
+    else:
+        where = f"The last line {_quote(hit.sink)}" if hit.last else _quote(hit.sink)
+    return f"{where} would show {what}{_more(len(hits))}.", _secret_fix(taint)
+
+
+def _secret_what(taint: secret_scan.Taint) -> str:
+    if taint.whole:
+        return "every value in `.env`" if taint.dotenv else "every env var's value"
+    if taint.var and taint.dotenv:
+        return f"the value of `{taint.var}` from `.env`"
+    if taint.var:
+        return f"the value of env var `{taint.var}`"
+    return "a value from `.env`" if taint.dotenv else "an env var's value"
+
+
+def _secret_fix(taint: secret_scan.Taint) -> str:
+    holds_mapping = taint.kind == "mapping" and taint.holder
+    if taint.whole or holds_mapping:  # a variable of values, e.g. env_lines, gets no sorted()
+        source = "dotenv_values()" if taint.dotenv else "os.environ"
+        names = taint.holder if holds_mapping else taint.mapping or source
+        return (
+            f"Show only the names, e.g. `sorted({names})`, or check one without its value, "
+            f'e.g. `print("NAME" in {names})`.'
+        )
+    if taint.holder and not taint.var:
+        holder = taint.holder
+        return (
+            f"Check it without showing the value, e.g. `print({holder} is not None)` "
+            f"or `print(bool({holder}))`."
+        )
+    name = taint.var or "NAME"
+    if taint.dotenv:
+        values = taint.mapping or "dotenv_values()"
+        return (
+            f'Check it without showing the value, e.g. `print("{name}" in {values})` '
+            f'or `print(bool({values}.get("{name}")))`.'
+        )
+    return (
+        f'Check it without showing the value, e.g. `print("{name}" in os.environ)` '
+        f'or `print(bool(os.getenv("{name}")))`.'
+    )
+
+
 # readability hints -------------------------------------------------------------------------------
+def _secret_name(cell: _Cell) -> Finding | None:
+    """A shown name that says it holds a secret (L014); L011 already names the tainted ones."""
+    scan = cell.secrets
+    reported = scan.reported if _level(cell.cfg, "secret_print") else set()
+    found: dict[str, secret_scan.Shown] = {}  # name -> where it is shown first
+    for shown in scan.shown:
+        for name in secret_scan.secret_names(shown.expr):
+            if name not in reported:
+                found.setdefault(name, shown)
+    if not found:
+        return None
+    name, shown = next(iter(found.items()))
+    if shown.last and shown.sink == name:
+        where = "The last line"
+    else:
+        where = f"The last line {_quote(shown.sink)}" if shown.last else _quote(shown.sink)
+    return (
+        f"{where} shows `{name}`, whose name says it holds a secret{_more(len(found))}.",
+        f"Show whether it is set instead, e.g. `print(bool({name}))`, or leave it out of the output.",
+    )
+
+
 def _long_line(cell: _Cell) -> Finding | None:
     limit = cell.cfg["lint"]["max_line_length"]
     long = [line for line in cell.lines if len(line) > limit]
@@ -1115,8 +1545,7 @@ def _kernel_only_name(cell: _Cell) -> Finding | None:
     above, flow = cell.names_above, cell.flow
     if above is None or EVERYTHING in above or not flow.parsed or flow.open:
         return None
-    candidates = flow.uses - above - flow.bound - _BUILTINS
-    missing = sorted(n for n in candidates if not _IPYTHON_NAME.fullmatch(n))
+    missing = sorted(n for n in flow.uses - above - flow.bound if not kernel_provides(n))
     if not missing:
         return None
     one = len(missing) == 1
@@ -1154,7 +1583,11 @@ def _long_bullet(cell: _Cell) -> Finding | None:
 _CHECKS: list[tuple[str, str, Callable[[_Cell], Finding | None]]] = [
     ("L008", "notebook_write", _notebook_write),
     ("L009", "package_install", _package_install),
+    ("L012", "network", _network),
+    ("L013", "outside_write", _outside_write),
     ("L010", "markdown_output", _markdown_output),
+    ("L011", "secret_print", _secret_print),
+    ("L014", "secret_name", _secret_name),
     ("L120", "kernel_only_name", _kernel_only_name),
     ("L111", "non_idempotent", _non_idempotent),
     ("L118", "hidden_warnings", _hidden_warnings),

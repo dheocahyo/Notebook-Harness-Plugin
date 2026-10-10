@@ -10,6 +10,7 @@ from fastmcp import Context
 from fastmcp.tools import ToolResult
 
 from .. import meta
+from .._shared import secrets
 from .._shared.paths import read_json
 from .._shared.text import unescape_markdown
 from ..backend.base import CellView, NotebookRef
@@ -38,6 +39,9 @@ VIEWS = ("status", "overview", "outline", "vars", "var", "cell", "intents")
 
 
 def _clip(text: str, limit: int) -> str:
+    """A view's text, redacted whole and then cut (design §6.8): the cell view's source, notes
+    and outputs, the var views, outline rows and the status lines."""
+    text = secrets.current().redact(text)
     if len(text) <= limit:
         return text
     return (
@@ -48,7 +52,7 @@ def _clip(text: str, limit: int) -> str:
 def _first_line(source: str, width: int = 80) -> str:
     for line in source.splitlines():
         if line.strip():
-            line = line.strip()
+            line = secrets.current().redact(line.strip())  # before the cut
             return line if len(line) <= width else line[: width - 1] + "…"
     return ""
 
@@ -252,11 +256,15 @@ async def inspect_notebook(
         except NhError as exc:
             lines = await _status_lines(svc, None)
             lines.append(str(exc).splitlines()[0])
-            return text_result(_clip("\n".join(["nh status"] + lines + config_lines(cfg)), limit))
+            return text_result(
+                _clip("\n".join(["nh status"] + lines + config_lines(cfg, svc.layout)), limit)
+            )
         lines = await _status_lines(svc, ref)
         return text_result(
             _clip(
-                "\n".join([f"nh status — notebook {ref.rel_path}"] + lines + config_lines(cfg)),
+                "\n".join(
+                    [f"nh status — notebook {ref.rel_path}"] + lines + config_lines(cfg, svc.layout)
+                ),
                 limit,
             )
         )
@@ -348,9 +356,16 @@ async def inspect_notebook(
     outline = _outline(cells, stale, int(cfg["inspect"]["outline_limit"]), cell_id)
     head = [f"notebook {ref.rel_path}: {len(cells)} cells"]
     if view == "outline":
-        return text_result(_clip("\n".join(header + head + outline + config_lines(cfg)), limit))
+        return text_result(
+            _clip("\n".join(header + head + outline + config_lines(cfg, svc.layout)), limit)
+        )
 
     body = (
-        header + head + outline + ["--- variables ---"] + _vars_block(payload) + config_lines(cfg)
+        header
+        + head
+        + outline
+        + ["--- variables ---"]
+        + _vars_block(payload)
+        + config_lines(cfg, svc.layout)
     )
     return text_result(_clip("\n".join(body), limit))

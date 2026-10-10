@@ -7,7 +7,9 @@ works in the same notebook you are looking at.
 
 - **One cell per message.** The agent adds one code cell, runs it in your
   kernel and reports the real output. Your next message is the review of that
-  cell. Big asks get a numbered plan instead of a notebook full of code.
+  cell. Big asks get a numbered plan instead of a notebook full of code
+  (`/nh:plan <goal>` asks for one), and "run the next 3" writes several of its
+  steps in one reply after one question.
 - **Notes.** Above each cell sits a short note: a title of at most 8 words and
   2-5 bullets on what the cell does and why. The ask behind each cell is kept
   in the cell's metadata, so the notebook carries its own intent trail.
@@ -20,10 +22,21 @@ works in the same notebook you are looking at.
   code, real output and kernel variables without running anything. The
   writer may fix the cell from QA's findings (twice by default) before
   Claude replies. It is still one cell per message, and one undo removes it.
-- **Guardrails.** No package installs from cells, no raw edits to `.ipynb`
-  files, no writes from subagents except nh's own cell writer inside
-  `/nh:qa-cell`. nh's server enforces every rule and refuses what it can't
-  verify.
+  A cell nh asks you about first comes back to Claude, which asks you and,
+  after your yes, writes it itself without a QA check.
+- **Review.** `/nh:review` runs a copy of the notebook top to bottom in a
+  separate kernel and reports the cells that fail, hidden state (a name a cell
+  reads before the cell that defines it, cells run out of order), long cells
+  to move to `src/`, and each cell's intent by heading. Your kernel and the
+  notebook stay as they are. Cells that would install packages, reach a host
+  your project hasn't approved, write outside the project (`/tmp` aside) or
+  show a secret, or that nh can't parse, run there only after your
+  `/nh:review yes`.
+- **Guardrails.** No raw edits to `.ipynb` files, no cells that print an env
+  var's value, no writes from subagents except nh's own cell writer inside
+  `/nh:qa-cell`, and a cell that installs packages, reaches a host your
+  project hasn't approved, or writes outside the project, waits for your yes.
+  nh's server enforces every rule and refuses what it can't verify.
 
 ## Requirements
 
@@ -97,11 +110,24 @@ distinct values. On the uv path this takes under 10 minutes.
 | **go** | the proposed next cell |
 | **edit** … | changes that cell and re-runs it |
 | **undo** | removes the cell; tells you what is still in the kernel |
-| **explain** | walks through the cell in chat; the notebook stays as is |
+| **explain** … | walks through the cell step by step in chat; nh blocks notebook changes in that message unless it also names one ("fix", "add", "make", …) |
 | **tidy** | applies the readability hints to that cell |
+| **run the next 3** (or **run steps 2-4**) | after a plan: asks once ("Run steps 2-4 in one reply?") and writes nothing; your **yes** (or **go**) alone then writes those steps in order, one cell each with a short report, and stops at the first error, "check this" finding or nh question |
 
 If a cell fails, the agent fixes it in place, at most twice, then explains the
-error in plain words.
+error in plain words. In an approved batch it doesn't: the batch stops there,
+and the agent explains the error and which planned steps didn't run.
+
+## Plans and batches
+
+For a goal that needs many cells ("build a churn model"), the agent replies
+with a plan of 5-12 numbered steps, one cell each, in plain words, and changes
+nothing; type `/nh:plan <goal>` to ask for one. Then say **go** for step 1, or
+**run the next 3** to have several steps written in one reply. The agent asks
+once ("Run steps 1-3 in one reply?"); only a whole-message **yes** (or **go**)
+approves it, and any other answer gets no batch (at most one cell). The batch
+writes at most `[turn] max_batch` steps (5 by default), reports after each,
+and stops at the first error, "check this" finding or nh question.
 
 ## Commands
 
@@ -109,10 +135,15 @@ error in plain words.
 |---|---|
 | `/nh:init` | set up a project in this folder, or adopt an existing notebook |
 | `/nh:status` | check every part of the setup, with fixes |
+| `/nh:explain [cell]` | a numbered walkthrough of a cell (the last one by default) in chat, changing nothing; nh enforces it unless the text names a change ("fix", "add", "make", …) |
+| `/nh:plan <goal>` | a 5-12 step plan for the goal in chat, one cell per step, changing nothing; then "go" or "run the next N" |
 | `/nh:qa-cell <ask>` | one agent writes this message's cell, another QA-checks it (automatic under ultracode) |
+| `/nh:review [notebook]` | run a copy of the notebook (harness.toml's by default) top to bottom in a separate kernel and report failing cells, hidden state, cells to move to `src/` and the intents by heading, saved in `.nh/reviews/`; it asks first about cells that would install packages, reach a host your project hasn't approved, write outside the project (`/tmp` aside) or show a secret, or that nh can't parse: answer `/nh:review yes` or `/nh:review no`. Your kernel and the notebook are never touched |
 | `nhctl lab start`, `status`, `stop` | the project's JupyterLab |
 | `nhctl doctor` | the same checks as `/nh:status`, from a shell |
+| `nhctl preset senior`, `junior` | the project's preset in `harness.toml`: senior allows 1 comment line per 16 code lines and asks for short explanations, junior (the default) 1 per 8; the comment budget applies from nh's next tool call, the explanation depth from a new session or /clear |
 | `nhctl fresh-run` | run a copy of the notebook top to bottom in a fresh kernel |
+| `nhctl fresh-run --review` | `/nh:review`'s run: a copy of the notebook in a separate kernel, past errors; reports failing cells, hidden-state dependencies, cells over `[lint] max_cell_lines` (candidates for `src/`) and the cells' intents by heading, in `.nh/reviews/`. Cells that would install packages, reach a host your project hasn't approved, write outside the project (`/tmp` aside) or show a secret, or that nh can't parse, stop it before anything runs (exit 2) until you pass `--yes <digest>` (run them; the digest names the cells it listed) or `--skip-flagged` (skip them); your kernel and the notebook file are never touched |
 | `nhctl metrics summarize` | cells per message, undos and rejections, from `.nh/log.jsonl` |
 
 `nhctl` is on Claude Code's Bash PATH while nh is enabled.
@@ -144,6 +175,10 @@ Notebook Harness repository.
 - Blocking shell commands that edit notebooks is best effort. For Claude
   Code's own edit tools, the deny rule `/nh:init` offers makes the block a hard
   permission rule.
+- nh shows the agent secrets from `.env` and the environment as
+  `[redacted:NAME]` (outputs, errors, cell code, nhctl's output); the notebook
+  keeps the real values. It can miss a secret inside an image, an encoded one
+  (base64, URL-encoded) and a short value (under 8 characters).
 
 ## License
 

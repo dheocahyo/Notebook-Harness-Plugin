@@ -47,12 +47,25 @@ repeating it.
 ```
 
 A hard-rule rejection (`E120`, with `L0xx` lines) writes nothing and does not
-use your cell: fix every listed problem and call again. Two rules differ:
+use your cell: fix every listed problem and call again. Four rules differ:
 - `L002` (separators): keep only the first step in this cell, with no
   separators, and propose the rest in your reply.
-- `L009` (a package install): don't call again yet. Ask the user whether to
-  install the package; after a yes, run `uv add <pkg>` (or the project's conda
-  install) with Bash, then write the cell without the install.
+- `L009` (a package install), when `harness.toml` makes it an error: don't call
+  again yet. Ask the user whether to install the package; after a yes, run
+  `uv add <pkg>` with Bash (in a conda project: add it to environment.yml, then
+  `nhctl env sync`), then write the cell without the install.
+- `L012` (the network), when `harness.toml` makes it an error: don't call again
+  yet. Ask the user to download what the cell needs into the project (for
+  example `data/raw/`), then write the cell to read it from there.
+- `L013` (a write outside the project), when `harness.toml` makes it an error:
+  don't call again yet. Write the files inside the project instead (for
+  example `data/processed/` or `reports/`), or tell the user where the cell
+  would write and let them change it themselves.
+
+By default a package install, a cell that writes outside the project, or a
+cell that reaches a host the project hasn't approved, is no rejection: nh asks
+the user first (`E122`, with the question in `Next:`). Ask it, stop, and after
+the user's yes send the exact same call again ([asks.md](asks.md)).
 
 After 3 rejections in one message you get `E121`: stop and tell the user what
 you are trying to write.
@@ -118,7 +131,7 @@ Then:
 |---|---|
 | `nh:` line | machine fields: cell id, `exec`, turn, retries, waits, undos; for nh's cell writer only, also `revisions` (QA revisions used/allowed). Never repeat the id to the user |
 | `--- check this ---` | surprises: rows went to 0, over half the rows removed, rows grew after a merge, an all-null new column, unchanged shape despite a drop. Lead your reply with these |
-| `--- output ---` | the real output (head and tail, at most 2,000 characters; full copy under `.nh/outputs/`) and up to 2 images |
+| `--- output ---` | the real output (head and tail, at most 2,000 characters; full copy under `.nh/outputs/`) and up to 2 images. Both show secrets as `[redacted:NAME]`; never copy a marker into code (E125) |
 | `--- error ---` | the error and the failing code line, when the cell failed |
 | `--- self-check ---` | before → after: frame shapes and nulls, new and removed names |
 | `--- readability hints (advisory) ---` | up to 5 hints quoting the code; offer "tidy" |

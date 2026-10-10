@@ -35,10 +35,10 @@ Read dumps every output. Hooks block those paths; don't look for workarounds.
   `title` and `notes`. Explanations go in chat, which has no length limit.
 - Ultracode on (a system reminder says so) or `/nh:qa-cell`: the nh:qa-cell
   workflow writes and checks the cell: [reference/qa-workflow.md](reference/qa-workflow.md).
+- E122: ask the user nh's one question, then stop: [reference/asks.md](reference/asks.md).
 
 ## Tools
-Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections:
-[reference/tools.md](reference/tools.md).
+Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections: [reference/tools.md](reference/tools.md).
 
 | Tool | Use it to | Cost |
 |---|---|---|
@@ -50,7 +50,7 @@ Full names are `mcp__plugin_nh_nh__<tool>`. Arguments and result sections:
 
 ## The turn (every user message)
 1. Decide whether the ask fits one cell: one step the user can check from its
-   output. If not, see "Big asks".
+   output. If not, see "Big asks". Explain-only message: no cell (see **explain** below).
 2. Inspect what you need.
 3. Call `nh_add_cell` once, with:
    - `title`: what the cell does, at most 8 words, plain text.
@@ -91,11 +91,11 @@ Details: [reference/errors.md](reference/errors.md).
 
 ## Big asks: plan, don't build
 For broad or end-to-end asks that need 5 or more cells ("build a churn
-model", "do a full EDA"), write no code and call no write tool. Reply with
-5-12 numbered steps, each one cell with one visible output, and ask where to
-start. A short list of concrete steps ("drop X, then plot Y") is not a big
-ask: do the first step as this message's cell and propose the rest.
-See [reference/planning.md](reference/planning.md).
+model", "do a full EDA"), write no code and call no write tool. Read
+[reference/planning.md](reference/planning.md), then reply in its format: 5-12
+numbered steps, one cell each, in plain words (no code, backticks or
+constants), and ask where to start. A short list of steps ("drop X, then plot
+Y") is not a big ask: do the first step as this message's cell, propose the rest.
 
 ## Replies about the last cell
 The per-message nh reminder names the last cell. Read the user's next message
@@ -106,10 +106,10 @@ as its review:
   "Kernel ≠ notebook" line names the variables): they keep their values until
   the kernel is rebuilt (select the last good cell, then Kernel → Restart
   Kernel and Run Up to Selected Cell). Name the later cells now outdated.
-- **explain**: walk through the cell in chat, quoting its code piece by piece.
-  Never write the explanation into the notebook; change nothing.
-- **tidy**: apply the readability hints with `nh_edit_cell`; this is the
-  message's cell.
+- **explain** / `/nh:explain`: no cell. `nh_inspect` it, then a numbered walkthrough in chat
+  quoting its code piece by piece with the real values from its output; end by proposing
+  one next step, not taken. Never in the notebook; change nothing unless it names a change verb (E109).
+- **tidy**: apply the readability hints with `nh_edit_cell`; this is the message's cell.
 
 ## Readable, simple code
 Code length has no cap; readability is what counts. Before/after pairs:
@@ -125,16 +125,16 @@ Code length has no cap; readability is what counts. Before/after pairs:
 - No functions or classes until the same code is needed a second time.
 - End with something visible to check: `.shape`, `.head()`, a small table, or
   one labelled plot.
-- Comments only for a non-obvious why. Never print prose or display
-  Markdown/HTML from code.
+- Comments only for a non-obvious why. Never print prose or display Markdown/HTML from code.
 - Use installed packages (`nh_inspect` lists them); import where first used.
 
 ## Never
-- Install packages without asking. Ask first; after a yes, run `uv add <pkg>`
-  (or the project's conda install) with Bash, then write the cell. Never
-  `%pip install` or `!pip install` in a cell.
-- Re-run earlier cells, restart the kernel, or write outside the project
-  unasked.
+- Install packages without asking. Ask first; after a yes, run `uv add <pkg>` with Bash (conda:
+  add it to environment.yml, then `nhctl env sync`), then write the cell. Prefer that to
+  `%pip install` or `!pip install` in a cell, which nh asks the user about (E122).
+- Re-run earlier cells, restart the kernel, or write outside the project unasked.
+- Show a secret, any piece of it (prefix, suffix, masked preview) or its length.
+  Check one with `print("NAME" in os.environ)`; nh refuses showing its value (L011).
 - Write from a subagent; only `nh:cell-writer` inside `nh:qa-cell` may.
 - Edit `.nh/` (nh's state). Change `harness.toml` only when the user asks.
 - Change a cell the user wrote unless they ask. Then `base_sha` is REQUIRED:
@@ -147,4 +147,4 @@ Code length has no cap; readability is what counts. Before/after pairs:
 - [reference/replies.md](reference/replies.md): replies by status, reviews, undo, drift, stale cells.
 - [reference/readable-code.md](reference/readable-code.md): 8 before/after pairs.
 - [reference/errors.md](reference/errors.md): retries, error template, refusal codes.
-- [reference/planning.md](reference/planning.md): the 5-12 step plan.
+- [reference/planning.md](reference/planning.md): the 5-12 step plan and the batch path.

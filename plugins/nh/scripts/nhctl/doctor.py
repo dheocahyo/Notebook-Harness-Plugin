@@ -19,10 +19,9 @@ import lab
 import settings
 from common import Result
 
-from nh_gateway._shared import paths, tomlread
+from nh_gateway._shared import harness_toml, paths, tomlread
 from nh_gateway._shared.scaffold import core
 
-RESERVED_SECTIONS = {"preset", "guardrails", "secrets", "libraries", "comprehension"}
 SKIP_DIRS = {"node_modules", "__pycache__", "site-packages"}
 SCAN_DEPTH = 3
 SCAN_BUDGET = 5000  # directory entries; keeps doctor fast in a huge folder
@@ -190,11 +189,33 @@ def unknown_keys(base: dict, user: dict, prefix: str) -> list[str]:
     for key, value in user.items():
         where = f"{prefix}.{key}" if prefix else key
         if key not in base:
-            if not (not prefix and key in RESERVED_SECTIONS):
+            if not (not prefix and key in harness_toml.RESERVED_SECTIONS):
                 found.append(where)
         elif isinstance(base[key], dict) and isinstance(value, dict):
             found.extend(unknown_keys(base[key], value, where))
     return found
+
+
+# D171 (design §6.9): (message, fix) for a bad level and for a `preset` that isn't a table.
+# Never the value: it is the user's text (as D131's messages).
+BAD_LEVEL = (
+    "harness.toml's [preset] level isn't junior or senior, so nh uses junior.",
+    "Run: nhctl preset junior (or senior), or fix the level line in harness.toml.",
+)
+NOT_A_TABLE = (
+    "harness.toml's preset isn't a [preset] table, so nh uses junior.",
+    "Delete the top-level preset line, then run: nhctl preset junior (or senior).",
+)
+
+
+def preset_level(project: Path) -> tuple[str, tuple[str, str] | None]:
+    """The ``[preset] level`` nh reads, and D171's (message, fix) when it isn't junior or senior
+    (design §6.9). A file that doesn't parse reads as junior here: that is D131's problem."""
+    data = tomlread.load(project / paths.HARNESS_TOML)
+    level, valid = harness_toml.preset_level(data)
+    if valid:
+        return level, None
+    return level, BAD_LEVEL if isinstance(data.get("preset"), dict) else NOT_A_TABLE
 
 
 def check_project(problems: Problems, start: Path, tools: core.Tools) -> tuple[dict, Path | None]:
@@ -203,6 +224,7 @@ def check_project(problems: Problems, start: Path, tools: core.Tools) -> tuple[d
     choice = core.choose_env(project, tools)
     unsafe = found is None and project.resolve() in (Path.home().resolve(), Path(project.anchor))
     data, notebooks = ([], []) if unsafe else scan(project)
+    level, preset_problem = preset_level(project)
     info = {
         "dir": str(project),
         "nh_enabled": found is not None,
@@ -212,6 +234,7 @@ def check_project(problems: Problems, start: Path, tools: core.Tools) -> tuple[d
         "env_file_exists": choice.existing,
         "notebooks": notebooks,
         "data_candidates": data,
+        "preset": level,
     }
     if unsafe:
         problems.add(
@@ -234,6 +257,8 @@ def check_project(problems: Problems, start: Path, tools: core.Tools) -> tuple[d
             "harness.toml has problems: " + "; ".join(config) + ".",
             "Fix or delete those lines; nh uses its defaults meanwhile.",
         )
+    if preset_problem is not None:
+        problems.add("D171", *preset_problem)
     return info, found
 
 
@@ -369,6 +394,8 @@ def check_nbstripout(problems: Problems, project: Path) -> None:
 
 
 def cmd_doctor(args: argparse.Namespace) -> Result:
+    # Installs the project's redactor first: a check's message may echo a .env value (§6.8).
+    common.project_root(getattr(args, "project", None), required=False)
     problems = Problems()
     if sys.platform.startswith(("win", "cygwin")):
         problems.add(
@@ -421,7 +448,7 @@ def doctor_text(data: dict) -> str:
         f"  uv: {data['uv']['version'] or 'not found'}   conda: {data['conda']['version'] or 'not found'}",
         f"  nh runtime: {RUNTIME_STATES[data['runtime'].get('ready')]}",
         f"  project: {project['dir']} ({'nh project' if project['nh_enabled'] else 'not set up yet'}; "
-        f"env: {project['env_manager'] or 'none'})",
+        f"env: {project['env_manager'] or 'none'}; preset: {project['preset']})",
     ]
     if data["lab"]:
         state = f"running at {data['lab']['url']}" if data["lab"]["running"] else "not running"

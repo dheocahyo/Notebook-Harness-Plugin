@@ -6,7 +6,9 @@ update never approaches the server's websocket message limit.
 
 A stream that outgrows its cap keeps its tail. While a cell runs, the saved tail only grows at
 the end (so each flush appends just the new text) until it is ``STREAM_SLACK_CHARS`` over the
-cap; then its head is trimmed back in one rewrite (see :func:`stream_start`).
+cap; then its head is trimmed back in one rewrite (see :func:`stream_start`). A cut is moved
+forward to the next line (or word) start so it doesn't leave the tail of a token or a password
+that no pattern would recognize any more (:func:`snap_cut`, design §6.8).
 """
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from .._shared import secrets
+from .._shared.text import terminal_text
 from ..backend.base import OutputSummary
 
 MAX_SAFE_INT = 2**53 - 1
@@ -21,6 +25,8 @@ STREAM_KEEP_CHARS = 1 << 20
 STREAM_SLACK_CHARS = 1 << 19
 BUNDLE_MAX_CHARS = 5 << 20
 CELL_MAX_CHARS = 8 << 20
+SNAP_MAX_CHARS = 4096  # how far past a cut nh looks for a line or word start
+_SNAP_STOPS = ",;\"'&<>()[]{}"
 IMAGE_MIMES = ("image/png", "image/jpeg", "image/gif", "image/svg+xml")
 
 
@@ -78,6 +84,37 @@ def stream_start(length: int, start: int | None = None) -> int:
     return start
 
 
+def snap_cut(text: str, start: int) -> int:
+    """``start`` moved forward to where a line, else a word, else a value begins.
+
+    A text cut mid-token keeps a piece no redaction pattern matches (``…E3r4T5`` of a GitHub
+    token, the end of a plain-named .env value). Looks at most ``SNAP_MAX_CHARS`` (and half the
+    kept text) past the cut; a stream keeps at least ``STREAM_KEEP_CHARS`` after its start, so
+    that window never changes while the stream grows and each flush still only appends.
+    """
+    if start <= 0 or start >= len(text) or text[start - 1] == "\n":
+        return max(0, start)
+    window = text[start : start + min(SNAP_MAX_CHARS, STREAM_KEEP_CHARS // 2)]
+    for found in (window.find("\n"), _first_space(window), _first_stop(window)):
+        if found != -1:
+            return start + found + 1
+    return start
+
+
+def _first_space(window: str) -> int:
+    for index, char in enumerate(window):
+        if char.isspace():
+            return index
+    return -1
+
+
+def _first_stop(window: str) -> int:
+    for index, char in enumerate(window):
+        if char in _SNAP_STOPS:
+            return index
+    return -1
+
+
 def _cap_one(output: dict[str, Any], start: int | None = None) -> tuple[dict[str, Any], int]:
     kind = output.get("output_type")
     if kind == "stream":
@@ -86,6 +123,7 @@ def _cap_one(output: dict[str, Any], start: int | None = None) -> tuple[dict[str
             text = "".join(text)
         if start is None:
             start = max(0, len(text) - STREAM_KEEP_CHARS)
+        start = snap_cut(text, start)
         if start > 0:
             text = (
                 f"[nh: {start:,} earlier characters of this output were not saved in the notebook]\n"
@@ -98,7 +136,8 @@ def _cap_one(output: dict[str, Any], start: int | None = None) -> tuple[dict[str
         return output, size
     if kind == "error":
         traceback = list(output.get("traceback") or [])[-50:]
-        capped = {**output, "traceback": [line[-4000:] for line in traceback]}
+        cut = [line[snap_cut(line, len(line) - 4000) :] for line in traceback]
+        capped = {**output, "traceback": cut}
         return capped, approx_size(capped)
     note = f"[nh: this output ({size / 2**20:.1f} MB) is too large to save in the notebook]"
     capped = {key: value for key, value in output.items() if key not in ("data", "metadata")}
@@ -162,14 +201,19 @@ def doc_outputs(
 
 
 def output_summary(outputs: list[dict[str, Any]]) -> OutputSummary:
-    """Cheap summary for the outline: types, first error, first text line, image count. No decoding."""
+    """Cheap summary for the outline: types, first error, first text line, image count. No decoding.
+
+    The error and the text head are shown as a terminal shows them, and redacted before they
+    are cut (design §6.8)."""
     summary = OutputSummary(count=len(outputs))
+    redactor = secrets.current()
     for output in outputs:
         kind = str(output.get("output_type") or "")
         if kind and kind not in summary.types:
             summary.types.append(kind)
         if kind == "error" and summary.error is None:
-            summary.error = f"{output.get('ename', '')}: {output.get('evalue', '')}"[:160]
+            error = f"{output.get('ename', '')}: {output.get('evalue', '')}"
+            summary.error = _clean_head(redactor, error, 160, strip=False)
         text = ""
         if kind == "stream":
             text = output.get("text") or ""
@@ -180,5 +224,25 @@ def output_summary(outputs: list[dict[str, Any]]) -> OutputSummary:
         if isinstance(text, list):
             text = "".join(text)
         if text.strip() and not summary.text_head:
-            summary.text_head = text.strip()[:200]
+            summary.text_head = _clean_head(redactor, text, 200, strip=True)
     return summary
+
+
+def _clean_head(redactor: secrets.Redactor, text: str, limit: int, strip: bool) -> str:
+    """The first ``limit`` characters of ``text`` as a terminal shows it (no ANSI escapes, \\r
+    progress or control characters), redacted before the cut: a colour code inside a value hid
+    it from the redactor (review of C3). Only a window is cleaned, grown until its redacted form
+    reaches ``limit`` plus the redactor's margin, as :meth:`Redactor.redact_head` does."""
+    if strip:
+        text = text[len(text) - len(text.lstrip()) :]
+    want = limit + redactor.margin
+    size = want
+    while True:
+        whole = size >= len(text)
+        cleaned = terminal_text(text[:size])
+        if strip:
+            cleaned = cleaned.strip() if whole else cleaned.lstrip()
+        out = redactor.redact(cleaned)
+        if whole or len(out) >= want:
+            return out[:limit]
+        size *= 2

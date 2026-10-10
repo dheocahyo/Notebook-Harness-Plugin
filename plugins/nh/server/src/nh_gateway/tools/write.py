@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import posixpath
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -12,6 +13,7 @@ from fastmcp import Context
 from fastmcp.tools import ToolResult
 
 from .. import dataflow, meta, render
+from .._shared import hosts, secrets
 from .._shared.text import clip, count_words, render_note, split_notes, unescape_markdown
 from .._shared.turn_record import WRITER_AGENT
 from ..backend.base import (
@@ -29,6 +31,7 @@ from ..lint.lint import LintReport, lint_cell
 from ..policy.errors import RETURN_TO_WORKFLOW, NhError, scrub
 from ..policy.turn import TurnContext, TurnState
 from ..state import write_last_cell
+from . import approvals, batch
 from .common import (
     RETRYABLE,
     RunRecord,
@@ -70,8 +73,9 @@ async def snapshot(svc: Services, ref: NotebookRef, outputs: str = "none") -> li
 
 
 def _rebuild_claims(state: TurnState, cells: list[CellView], notebook: str) -> None:
-    """After a gateway restart the ledger may be empty; the document still knows this turn's cell,
-    and how often nh:cell-writer revised it."""
+    """With the ledger lost (its file gone or unreadable) the document still knows this turn's
+    cells, how often nh:cell-writer revised them, and which nh:qa-cell run wrote each one
+    (``metadata.nh.run``, design §6.3)."""
     if state.claims:
         return
     for cell in cells:
@@ -90,14 +94,25 @@ def _rebuild_claims(state: TurnState, cells: list[CellView], notebook: str) -> N
                 done = revision.get("n")
                 if isinstance(done, int) and done > state.revisions.get(uid, 0):
                     state.revisions[uid] = done
+            run = nh.get("run")
+            if isinstance(run, dict) and run.get("turn") == state.prompt_id:
+                owner = run.get("id")
+                if isinstance(owner, str) and owner:
+                    state.writer_runs.setdefault(uid, owner)
 
 
 async def _claimed(
-    svc: Services, ref: NotebookRef, cells: list[CellView], state: TurnState
+    svc: Services,
+    ref: NotebookRef,
+    cells: list[CellView],
+    state: TurnState,
+    *,
+    last: bool = False,
 ) -> tuple[str, CellView | None, str]:
-    """This message's cell: (uid, cell, label). The cell is looked up in its own notebook, which
-    the label names when it isn't ``ref``."""
-    uid = state.claims[0] if state.claims else ""
+    """This message's cell (``last``: its last one, an approved batch's last step): (uid, cell,
+    label). The cell is looked up in its own notebook, which the label names when it isn't
+    ``ref``."""
+    uid = state.claims[-1 if last else 0] if state.claims else ""
     notebook = state.claim_notebooks.get(uid, ref.rel_path)
     where = ""
     if notebook != ref.rel_path:
@@ -157,7 +172,20 @@ def _lint_failure(
     if "L009" in rules:
         next_step = (
             "Don't call again yet: ask the user whether to install the package. After a yes, run "
-            "`uv add <package>` (or `conda install`) with Bash, then write the cell without the install."
+            "`uv add <package>` with Bash (in a conda project, add it to environment.yml and run "
+            "`nhctl env sync`), then write the cell without the install."
+        )
+    elif "L012" in rules:
+        next_step = (
+            "Don't call again yet: this project refuses cells that reach the network. Ask the user "
+            "to download what the cell needs into the project (for example data/raw/), then write "
+            "the cell to read it from there."
+        )
+    elif "L013" in rules:
+        next_step = (
+            "Don't call again yet: this project refuses cells that write outside it. Write the "
+            "files inside the project instead (for example data/processed/ or reports/), or tell "
+            "the user where the cell would write and let them change it themselves."
         )
     elif "L002" in rules:
         next_step = (
@@ -167,14 +195,24 @@ def _lint_failure(
     return NhError("E120", detail="\n".join(lines), next_step=next_step)
 
 
+HIDDEN_ONLY = "\n  (only a hidden [redacted:…] value changed)"
+
+
 def diff_lines(old: str, new: str, limit: int = 6) -> str:
+    """The lines that changed from ``old`` to ``new``, at most ``limit``. Both are redacted
+    before the diff and the cut: a private key cut above its END line would show its body
+    (review of C3). A change only inside a hidden value says so, not an empty diff."""
+    red = secrets.current().redact
+    shown_old, shown_new = red(old), red(new)
     diff = [
         line
-        for line in difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0)
+        for line in difflib.unified_diff(
+            shown_old.splitlines(), shown_new.splitlines(), lineterm="", n=0
+        )
         if not line.startswith(("---", "+++", "@@"))
     ]
     if not diff:
-        return ""
+        return HIDDEN_ONLY if old != new and shown_old == shown_new else ""
     shown = diff[:limit]
     more = f"\n  … {len(diff) - limit} more changed lines" if len(diff) > limit else ""
     return "\n" + "\n".join(f"  {line}" for line in shown) + more
@@ -197,8 +235,13 @@ def user_change(svc: Services, uid: str, ref: NotebookRef, current: str) -> str:
     last = nh_last_source(svc, uid, ref)
     if last is not None:
         return diff_lines(last, current)
-    head = "\n".join(f"  {line}" for line in current.splitlines()[:6])
-    return f"\nThe cell now reads:\n{head}" if head else ""
+    head = head_lines(current)
+    return f"\nThe cell now reads:{head}" if head else ""
+
+
+def head_lines(source: str, limit: int = 6) -> str:
+    """The first ``limit`` lines of ``source``, redacted before the cut (see diff_lines)."""
+    return "".join(f"\n  {line}" for line in secrets.current().redact(source).splitlines()[:limit])
 
 
 def nh_wrote(svc: Services, uid: str, ref: NotebookRef, current: str) -> bool:
@@ -219,19 +262,58 @@ def next_for(turn: TurnContext, main: str | None = None) -> str | None:
     return RETURN_TO_WORKFLOW if is_writer(turn) else main
 
 
+OTHER_RUN_LINE = "- Another nh:qa-cell run owns this message's cell."
+
+
 async def refuse_other_run(
     svc: Services, ref: NotebookRef, cells: list[CellView], state: TurnState, turn: TurnContext
 ) -> None:
-    """The first nh:qa-cell run whose writer wrote owns this message's cell: a second run of the
-    same message (launched in parallel) changes nothing, not even that cell."""
-    if turn.run_id and state.writer_run and state.writer_run != turn.run_id:
+    """A cell another nh:qa-cell run of this message wrote holds this run back (design §6.3,
+    §6.4). With no batch the first run that wrote owns the message's one cell: a second run (two
+    launched in parallel) changes nothing, not even that cell. In an approved batch the next
+    step's run writes only once every earlier step's run reported (no longer open in the run
+    registry), so it builds on a step QA is done with."""
+    if not turn.run_id:
+        return
+    others = [uid for uid in state.claims if state.owner(uid) not in (None, turn.run_id)]
+    if not others:
+        return
+    if not state.batch_total:
         _, _, name = await _claimed(svc, ref, cells, state)
+        raise NhError("E110", OTHER_RUN_LINE, cell=name, next_step=RETURN_TO_WORKFLOW)
+    running = batch.open_runs(svc, turn)
+    busy = [uid for uid in others if state.owner(uid) in running]
+    if busy:
         raise NhError(
             "E110",
-            "- Another nh:qa-cell run owns this message's cell.",
-            cell=name,
+            OTHER_RUN_LINE,
+            head=batch.RUN_OPEN_HEAD,
+            step=str(state.claims.index(busy[-1]) + 1),
             next_step=RETURN_TO_WORKFLOW,
         )
+
+
+def refuse_other_slot(state: TurnState, turn: TurnContext, uid: str, name: str) -> None:
+    """A writer's retry or revision changes only its own run's cell, and in an approved batch
+    only while no later step is written on top of it (design §6.3): a step another run wrote is
+    E110, and so, in a batch, is one the main conversation wrote; one a later step builds on is
+    E112. Outside a batch C5's rule stands: the run may revise the message's cell whoever wrote
+    it."""
+    if not turn.run_id or uid not in state.claims:
+        return
+    step = state.claims.index(uid) + 1
+    owner = state.owner(uid)
+    if owner != turn.run_id and (owner is not None or state.batch_total):
+        raise NhError(
+            "E110",
+            OTHER_RUN_LINE if owner is not None else batch.MAIN_STEP_LINE,
+            head=batch.OTHER_STEP_HEAD,
+            cell=name,
+            step=str(step),
+            next_step=RETURN_TO_WORKFLOW,
+        )
+    if state.batch_total and step < len(state.claims):
+        raise NhError("E112", head=batch.LATER_HEAD, cell=name, next_step=RETURN_TO_WORKFLOW)
 
 
 def refuse_user_code(
@@ -465,8 +547,9 @@ async def report_run(
     harness_ms = int((time.monotonic() - started_at) * 1000) if started_at else None
     result = await _wait(svc, record.execution, turn, cfg, ctx)
     status = effective_status(result, record.execution)
-    state.status[uid] = status
-    svc.ledger.save(state)
+    if not batch.going(state):  # a going batch sets it with its stop (batch.reported)
+        state.status[uid] = status
+        svc.ledger.save(state)
     exec_count = result.execution_count if result else None
     note_last_cell(svc, record, status, exec_count, finished=result is not None)
     if result is not None:
@@ -489,6 +572,8 @@ async def report_run(
     selfcheck, check_this = (
         render.selfcheck(before, after, code=code) if (before and after) else ([], [])
     )
+    # design §6.3: a result that isn't ok, or has a 'check this', stops an approved batch
+    step = batch.reported(svc, turn, state, uid, status, check_this)
     cell_name = render.cell_label(record.title, exec_count, code)
     retries_left = max(0, int(cfg["turn"]["max_retries"]) - state.retries.get(uid, 0))
     waits_left = max(0, int(cfg["turn"]["max_waits"]) - state.waits)
@@ -508,7 +593,7 @@ async def report_run(
     if result is not None and result.note and status not in ("lost", "deleted"):
         notices.append(result.note)
     out.section("notices", notices)
-    out.section("config", config_lines(cfg))
+    out.section("config", config_lines(cfg, svc.layout))
     out.section(
         "next",
         render.next_block(
@@ -517,6 +602,8 @@ async def report_run(
             waits_left=waits_left,
             cell=cell_name,
             audience="writer" if writer else "main",
+            batch=step,
+            check_this=bool(check_this),
         ),
     )
 
@@ -565,8 +652,16 @@ def _error_lines(err: Any, code: str) -> list[str]:
     lines = [render.error_summary(err.ename, err.evalue, 200)]
     source = code.splitlines()
     if err.line and 1 <= err.line <= len(source):
-        lines.append(f"failing code: {source[err.line - 1].strip()}")
+        failing = secrets.current().redact(source[err.line - 1].strip())
+        lines.append(f"failing code: {failing}")
     return lines
+
+
+def refuse_redacted(code: str) -> None:
+    """E125: code holding nh's marker would put the marker, not the secret, in the notebook
+    (design §6.8). The raw value is never restored: Claude never saw it."""
+    if secrets.MARKER in code:
+        raise NhError("E125")
 
 
 def _first_line(
@@ -620,7 +715,11 @@ async def e110(
     turn: TurnContext | None = None,
 ) -> NhError:
     """A second cell was asked for; if this message's cell failed, point at fixing it instead.
-    nh:cell-writer (``turn``) returns the refusal to the workflow either way."""
+    nh:cell-writer (``turn``) returns the refusal to the workflow either way. After an approved
+    batch's last cell (design §6.3) the refusal has the batch's own first line."""
+    if state.batch_total and turn is not None:
+        _, _, last = await _claimed(svc, ref, cells, state, last=True)
+        return batch.full(state, turn, last)
     uid, cell, name = await _claimed(svc, ref, cells, state)
     if turn is not None and is_writer(turn):
         return NhError("E110", cell=name, next_step=RETURN_TO_WORKFLOW)
@@ -654,28 +753,37 @@ async def add_cell(
     windows_guard()
     started = time.monotonic()
     turn = current_turn()
+    try:
+        refuse_redacted(code)
+    except NhError as exc:  # design §6.3: it stops an approved batch, or is E123 after a stop
+        raise await batch.refused_early(svc, turn, exc) from None
     cfg = svc.config()
     ref = await svc.resolve(notebook)
     kernel = await svc.backend.kernel_status(ref)
     lead, kernel_lines = kernel_notes(svc, ref, kernel)
 
-    async with svc.locks.hold(ref.rel_path, turn):
+    async with svc.locks.hold(ref.rel_path, turn), batch.stops(svc, turn):
         state = svc.ledger.get(turn.session_id, turn.prompt_id)
         state.notebook = ref.rel_path
         cells = await snapshot(svc, ref)
         _rebuild_claims(state, cells, ref.rel_path)
         review_earlier_cells(svc, ref, cells, state)
         writer = is_writer(turn)
+        # design §6.3: the message's batch (E123 after its stop, E133 while a step's result
+        # isn't in), then E110's cap
+        batch.enter(svc, turn, state, new_cell=True)
         if writer:
             await refuse_other_run(svc, ref, cells, state, turn)
-        if len(state.claims) >= int(cfg["turn"]["max_code_cells"]):
+            batch.refuse_second_cell(state, turn)
+        if len(state.claims) >= batch.cap(state, cfg):
             raise await e110(svc, ref, cells, state, cfg, turn)
         refuse_if_running(svc, ref, cells)
         if state.lint_rejects >= int(cfg["turn"]["max_lint_rejects"]):
             raise NhError("E121")
 
         index, anchor = _insert_index(cells, after_cell_id)
-        names_above = dataflow.defined_names(code_sources_before(cells, index))
+        code_above = code_sources_before(cells, index)
+        names_above = dataflow.defined_names(code_above)
         report = lint_cell(
             code,
             title=title,
@@ -686,9 +794,15 @@ async def add_cell(
             require_intent=True,
             kernel_python=kernel.python_version,
             names_above=names_above,
+            approved_hosts=hosts.read_approved(svc.layout.approved_hosts),
+            code_above=code_above,
+            project_root=str(svc.project),
+            notebook_dir=posixpath.dirname(ref.rel_path),
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)
+        # FR-12 (design §6.4): a cell the lint asks about waits for the user's yes.
+        approvals.gate_cell(svc, turn, approvals.cell_key(ref.rel_path, "add", code), report.asks)
 
         probe_names = set(report.uses) | set(report.defs)
         before = await probe_before(svc, ref, probe_names)
@@ -708,6 +822,7 @@ async def add_cell(
                 turn_id=turn.prompt_id,
                 source=code,
                 agent=turn.agent_type if writer else None,
+                run_id=turn.run_id if writer else None,  # design §6.3: the step's run
             ),
         }
         note_md = {
@@ -726,16 +841,15 @@ async def add_cell(
         state.claim_notebooks[uid] = ref.rel_path
         state.kinds[uid] = "add"
         state.status[uid] = "running"
-        owner = state.writer_run
-        if writer:
-            state.writer_run = turn.run_id
+        if writer and turn.run_id:  # the step is this run's (design §6.3)
+            state.writer_runs[uid] = turn.run_id
         svc.ledger.save(state)
 
         async def rollback() -> None:
             await svc.backend.delete_cells(ref, [note_uid, uid])
             state.claims.remove(uid)
             state.status.pop(uid, None)
-            state.writer_run = owner
+            state.writer_runs.pop(uid, None)
             svc.ledger.save(state)
 
         history = dict(
@@ -764,6 +878,7 @@ async def add_cell(
             rollback=rollback,
             history=history,
         )
+        approvals.wrote(svc, turn)
         history_notes = record_history(svc, **history)
         stale = await mark_downstream(
             svc, ref, cells, index, set(report.defs), by=uid, turn=turn, reason="upstream-edit"
@@ -814,6 +929,10 @@ async def edit_cell(
     windows_guard()
     started = time.monotonic()
     turn = current_turn()
+    try:
+        refuse_redacted(code)
+    except NhError as exc:  # design §6.3: it stops an approved batch, or is E123 after a stop
+        raise await batch.refused_early(svc, turn, exc, cell_id) from None
     writer = is_writer(turn)
     if writer:
         base_sha = None  # refuse_user_code: nobody in the background can confirm the user's change
@@ -822,12 +941,13 @@ async def edit_cell(
     kernel = await svc.backend.kernel_status(ref)
     lead, kernel_lines = kernel_notes(svc, ref, kernel)
 
-    async with svc.locks.hold(ref.rel_path, turn):
+    async with svc.locks.hold(ref.rel_path, turn), batch.stops(svc, turn) as attempt:
         state = svc.ledger.get(turn.session_id, turn.prompt_id)
         state.notebook = ref.rel_path
         cells = await snapshot(svc, ref)
         _rebuild_claims(state, cells, ref.rel_path)
         review_earlier_cells(svc, ref, cells, state)
+        batch.enter(svc, turn, state, new_cell=False)  # design §6.3: E123 after a stop, E133
         if writer:
             await refuse_other_run(svc, ref, cells, state, turn)
         found = find_cell(cells, cell_id)
@@ -841,12 +961,14 @@ async def edit_cell(
         if target.running:
             raise NhError("E133", detail=f" running {target_label}")
         uid = uid_of(target)
+        attempt.uid = uid
         if writer:
+            refuse_other_slot(state, turn, uid, target_label)
             refuse_user_code(svc, uid, ref, target, target_label)
 
         retry = False
         revision = False  # nh:cell-writer changing its OK cell from QA findings
-        prior, owner = state.status.get(uid), state.writer_run
+        prior, owner = state.status.get(uid), state.writer_runs.get(uid)
         if state.claims:
             if uid not in state.claims:
                 _, _, claimed = await _claimed(svc, ref, cells, state)
@@ -897,7 +1019,7 @@ async def edit_cell(
                 raise NhError(
                     "E141",
                     cell=f"the note above {target_label}",
-                    diff="\n" + "\n".join(f"  {line}" for line in note.source.splitlines()[:6]),
+                    diff=head_lines(note.source),
                     next_step=next_for(
                         turn,
                         "Ask the user; keep their wording in notes= or leave the note alone "
@@ -910,7 +1032,8 @@ async def edit_cell(
                 note_bullets = list(nh.get("rationale") or []) or [
                     line[2:] for line in note.source.splitlines() if line.startswith("- ")
                 ]
-        names_above = dataflow.defined_names(code_sources_before(cells, target.index))
+        code_above = code_sources_before(cells, target.index)
+        names_above = dataflow.defined_names(code_above)
         report = lint_cell(
             code,
             title=note_title if wants_note else None,
@@ -921,9 +1044,16 @@ async def edit_cell(
             require_intent=not nh.get("intent"),
             kernel_python=kernel.python_version,
             names_above=names_above,
+            approved_hosts=hosts.read_approved(svc.layout.approved_hosts),
+            code_above=code_above,
+            project_root=str(svc.project),
+            notebook_dir=posixpath.dirname(ref.rel_path),
         )
         if report.errors:
             raise _lint_failure(svc, state, report, turn)
+        approvals.gate_cell(
+            svc, turn, approvals.cell_key(ref.rel_path, f"edit:{uid}", code), report.asks
+        )
 
         probe_names = set(report.uses) | set(report.defs)
         before_probe = await probe_before(svc, ref, probe_names)
@@ -965,6 +1095,8 @@ async def edit_cell(
             new_nh["rationale"] = bullets
         if writer:
             new_nh["agent"] = turn.agent_type
+            if turn.run_id:  # the cell is this run's now (design §6.3)
+                new_nh["run"] = meta.run_metadata(turn.prompt_id, turn.run_id)
         if revision:
             new_nh["revision"] = {"turn": turn.prompt_id, "n": state.revisions.get(uid, 0) + 1}
         # Outputs and [n] stay until the run starts (it clears them), so a rollback keeps them.
@@ -1017,8 +1149,8 @@ async def edit_cell(
             state.retries[uid] = state.retries.get(uid, 0) + 1
         if revision:
             state.revisions[uid] = state.revisions.get(uid, 0) + 1
-        if writer:
-            state.writer_run = turn.run_id
+        if writer and turn.run_id:  # the cell is this run's now (design §6.3)
+            state.writer_runs[uid] = turn.run_id
         state.status[uid] = "running"
         svc.ledger.save(state)
 
@@ -1050,7 +1182,10 @@ async def edit_cell(
                 state.retries[uid] -= 1
             if revision:
                 state.revisions[uid] -= 1
-            state.writer_run = owner
+            if owner is None:
+                state.writer_runs.pop(uid, None)
+            else:
+                state.writer_runs[uid] = owner
             if writer and prior is not None:  # its OK (or failed) run still stands
                 state.status[uid] = prior
             else:
@@ -1083,6 +1218,7 @@ async def edit_cell(
             rollback=rollback,
             history=history,
         )
+        approvals.wrote(svc, turn)
         history_notes = record_history(svc, **history)
         svc.stale.clear(ref.rel_path, [uid])
         stale = await mark_downstream(

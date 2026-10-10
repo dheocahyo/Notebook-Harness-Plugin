@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
+from nh_gateway._shared import secrets
 from nh_gateway.render import headline, next_block, selfcheck
-from tests.unit.test_render import frame, payload
+from tests.unit.test_render import PASSWORD, frame, payload, scalar
 
 SALES = ["price", "qty", "region"]
 
@@ -104,3 +107,204 @@ def test_changed_values_are_reported():
 def test_next_block_capitalises_an_untitled_label():
     text = next_block("error", retries_left=1, waits_left=2, cell="the cell `x = y` [3]")
     assert text.startswith("The cell `x = y` [3] failed.")
+
+
+# design §6.8: a changed value is reported with both reprs redacted
+@pytest.fixture
+def installed(tmp_path):
+    (tmp_path / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    secrets.install(secrets.Redactor.for_project(tmp_path, {}))
+
+
+def test_a_changed_secret_value_is_redacted_on_both_sides(installed):
+    before = payload(api=scalar("old-value", "str"), key=scalar(PASSWORD, "str"))
+    after = payload(api=scalar(PASSWORD, "str"), key=scalar(PASSWORD + "-rotated", "str"))
+    lines, _ = selfcheck(before, after, code="api = key; key = rotate(key)")
+    assert "api: 'old-value' → '[redacted:DB_PASSWORD]'" in lines
+    assert "key: '[redacted:DB_PASSWORD]' → '[redacted:DB_PASSWORD]-rotated'" in lines
+    assert not any(PASSWORD[:6] in line for line in lines)
+
+
+# design §6.3: the approved batch's machine line and next blocks
+CFG = {
+    "turn": {
+        "max_code_cells": 1,
+        "max_retries": 2,
+        "max_waits": 2,
+        "max_undos": 3,
+        "max_revisions": 2,
+    }
+}
+CELL = '"Total price by region" [5]'
+
+
+def test_machine_line_counts_against_the_batch():
+    from nh_gateway.policy.turn import TurnState
+    from nh_gateway.tools.common import machine_line
+
+    state = TurnState("s1", "p2", 0.0, claims=["nh-1", "nh-2"], batch_total=3)
+    assert machine_line("nh-2", 5, state, CFG) == (
+        "nh: cell=nh-2 exec=5 turn=2/3 batch retries=0/2 waits=0/2 undos=0/3"
+    )
+    assert machine_line("nh-2", 5, state, CFG, writer=True).endswith(
+        " turn=2/3 batch retries=0/2 waits=0/2 undos=0/3 revisions=0/2"
+    )
+    for total in (None, 0):  # undecided, or decided: no batch
+        plain = TurnState("s1", "p2", 0.0, claims=["nh-1"], batch_total=total)
+        assert " turn=1/1 retries=" in machine_line("nh-1", 5, plain, CFG)
+
+
+def _block(status, batch, check_this=False):
+    return next_block(
+        status, retries_left=2, waits_left=2, cell=CELL, batch=batch, check_this=check_this
+    )
+
+
+def test_next_block_goes_on_to_the_next_step():
+    assert _block("ok", (2, 3, 0)) == (
+        f"Step 2 of 3 of the approved batch ran OK. Give the user a short report on {CELL}: what "
+        "it did and the real numbers, surprises first, named by title and [n]. Then write the "
+        "batch's next step (step 3 of 3) with nh_add_cell, without waiting for the user."
+    )
+    # The batch's own count, not the plan's: it names no plan step (C6c review).
+    assert "of the plan" not in _block("ok", (1, 5, 0))
+    assert "the batch's next step (step 2 of 5)" in _block("ok", (1, 5, 0))
+
+
+def test_next_block_closes_the_batch_on_its_last_step():
+    plain = next_block("ok", retries_left=2, waits_left=2, cell=CELL)
+    assert plain.endswith("Do not write a second cell.")
+    assert _block("ok", (3, 3, 0)) == (
+        "That was step 3 of 3, the last of the approved batch. "
+        + plain.replace("Do not write a second cell.", "Do not write another cell.")
+    )
+
+
+def test_next_block_stops_on_check_this():
+    assert _block("ok", (2, 3, 2), check_this=True) == (
+        f"The approved batch stops at step 2 of 3: {CELL} ran, but its result needs a look (see "
+        "'check this'). Reply to the user about it: lead with the 'check this' finding, then "
+        "what the cell did and the real numbers, and say which planned steps did not run. Write "
+        "no other cell and don't change this one in this message; wait for the user."
+    )
+
+
+def test_next_block_stops_on_an_error_with_no_retry():
+    text = _block("error", (2, 3, 2))
+    assert text == (
+        f"The approved batch stops at step 2 of 3: {CELL} failed. Don't fix it in this message: "
+        "a batch has no retries. Explain in plain words: quote the failing code, what Python "
+        "said, the likely cause and one fix; say which planned steps did not run; then wait."
+    )
+    assert "nh_edit_cell" not in text
+
+
+@pytest.mark.parametrize("status", ["running", "queued", "aborted", "timeout", "interrupted"])
+def test_next_block_stops_on_any_other_status(status):
+    plain = next_block(status, retries_left=2, waits_left=2, cell=CELL)
+    assert _block(status, (2, 3, 2)) == (
+        f"{plain} The approved batch stops at step 2 of 3: say which planned steps did not run."
+    )
+
+
+def test_next_block_after_an_earlier_stop():
+    assert _block("ok", (2, 3, 2)) == (  # a wait for the step that stopped it, now OK
+        f"{CELL} ran OK, but the approved batch stopped at step 2 of 3. Report the batch to the "
+        "user: what each step did, then where and why it stopped. Write no other cell; wait "
+        "for the user."
+    )
+    assert _block("ok", (1, 3, 2)).startswith(f"{CELL} ran OK, but the approved batch stopped")
+    plain = next_block("lost", retries_left=2, waits_left=2, cell=CELL)
+    assert _block("lost", (1, 3, 2)) == (
+        f"{plain} The approved batch stopped at step 2 of 3: say which planned steps did not run."
+    )
+
+
+def test_next_block_without_a_batch_is_unchanged():
+    for status in ("ok", "error", "running", "lost"):
+        plain = next_block(status, retries_left=1, waits_left=1, cell=CELL)
+        assert "batch" not in plain
+        assert plain == next_block(
+            status, retries_left=1, waits_left=1, cell=CELL, batch=None, check_this=True
+        )
+
+
+def test_next_block_at_the_last_step_asks_for_no_unrun_steps():
+    """Every planned step ran at step N of N (review C6a)."""
+    assert _block("ok", (3, 3, 3), check_this=True) == (
+        f"The approved batch stops at step 3 of 3: {CELL} ran, but its result needs a look (see "
+        "'check this'). Reply to the user about it: lead with the 'check this' finding, then "
+        "what the cell did and the real numbers. Write no other cell and don't change this one "
+        "in this message; wait for the user."
+    )
+    assert _block("error", (3, 3, 3)) == (
+        f"The approved batch stops at step 3 of 3: {CELL} failed. Don't fix it in this message: "
+        "a batch has no retries. Explain in plain words: quote the failing code, what Python "
+        "said, the likely cause and one fix; then wait."
+    )
+    plain = next_block("timeout", retries_left=2, waits_left=2, cell=CELL)
+    assert _block("timeout", (3, 3, 3)) == f"{plain} The approved batch stops at step 3 of 3."
+
+
+def test_next_block_after_a_stop_elsewhere_offers_no_retry():
+    """A result that comes in after the batch stopped at another step (a parallel E125, an
+    earlier message's cell: step 0) never offers a fix that E123 would refuse (review C6a)."""
+    for step in (1, 0):
+        text = _block("error", (step, 3, 2))
+        assert text == (
+            f"{CELL} failed, and the approved batch stopped at step 2 of 3. Don't fix it in this "
+            "message: a batch has no retries. Explain in plain words: quote the failing code, "
+            "what Python said, the likely cause and one fix; say where and why the batch stopped "
+            "and which planned steps did not run; then wait."
+        )
+        assert "nh_edit_cell" not in text
+    assert _block("ok", (1, 3, 2), check_this=True) == (
+        f"{CELL} ran, but its result needs a look (see 'check this'), and the approved batch "
+        "stopped at step 2 of 3. Reply to the user: lead with the 'check this' finding, then "
+        "what each step did and where and why the batch stopped. Write no other cell and don't "
+        "change this one in this message; wait for the user."
+    )
+
+
+def _writer_block(status, batch, check_this=False):
+    return next_block(
+        status,
+        retries_left=2,
+        waits_left=2,
+        cell=CELL,
+        audience="writer",
+        batch=batch,
+        check_this=check_this,
+    )
+
+
+def test_the_writers_next_block_is_unchanged_while_the_batch_goes():
+    for status in ("ok", "error", "running"):
+        writer = next_block(status, retries_left=2, waits_left=2, cell=CELL, audience="writer")
+        assert writer == _writer_block(status, (1, 3, 0)) == _writer_block(status, None)
+
+
+def test_the_writers_next_block_after_a_stop_has_no_retry_or_revision():
+    back = "Return this whole result to the workflow as your final answer"
+    assert _writer_block("error", (2, 3, 2)) == (
+        f"{CELL} failed, so the approved batch stops here, at step 2 of 3: a batch has no "
+        f"retries. {back} (status error). Don't change it again."
+    )
+    assert _writer_block("error", (1, 3, 2)) == (
+        f"{CELL} failed, and the approved batch stopped at step 2 of 3: a batch has no retries. "
+        f"{back} (status error). Don't change it again."
+    )
+    assert _writer_block("ok", (2, 3, 2), check_this=True) == (
+        f"{CELL} ran, but its result needs a look (see 'check this'), so the approved batch "
+        f"stops here, at step 2 of 3: no revision of it this message. {back} (status ok). "
+        "Don't reply to the user or write a second cell."
+    )
+    assert _writer_block("ok", (1, 3, 2)) == (
+        f"{CELL} ran OK, but the approved batch stopped at step 2 of 3: no revision of it this "
+        f"message. {back} (status ok). Don't reply to the user or write a second cell."
+    )
+    plain = next_block("running", retries_left=2, waits_left=2, cell=CELL, audience="writer")
+    assert _writer_block("running", (2, 3, 2)) == (
+        f"{plain} The approved batch stops at step 2 of 3."
+    )
+    assert "nh_edit_cell" not in _writer_block("error", (2, 3, 2))

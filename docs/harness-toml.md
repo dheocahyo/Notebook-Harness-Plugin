@@ -9,16 +9,18 @@ it. A commented key keeps following nh's built-in default, including when a
 later nh version changes that default.
 
 - **Every key is optional.** A missing key uses the built-in default below.
-- **Precedence:** built-in defaults < `harness.toml` < `NH_*` environment
-  variables.
+- **Precedence:** built-in defaults < the preset's settings (`[preset] level`,
+  below) < keys set in `harness.toml` < `NH_*` environment variables.
 - **Reloads:** nh re-reads the file whenever it changes, before the next tool
-  call. Only `[approval]` needs a restart of the MCP server: in Claude Code, run
-  `/mcp`, pick `plugin:nh:nh` and choose Reconnect.
+  call. Two things reach Claude only when a session starts: the project's goal
+  and the preset's explanation depth (`[preset] level`): start a new session or
+  `/clear` after changing them. Only `[approval]` needs a restart of the MCP
+  server: in Claude Code, run `/mcp`, pick `plugin:nh:nh` and choose Reconnect.
 - **Mistakes:** an unknown key, a key in the wrong section or a value of the
   wrong type is ignored, and every nh result shows it under `--- config ---`
   until it is fixed.
-- **Reserved:** the sections `[preset]`, `[guardrails]`, `[secrets]`,
-  `[libraries]` and `[comprehension]` are accepted and ignored in v0.1.
+- **Reserved:** the sections `[guardrails]`, `[secrets]`, `[libraries]` and
+  `[comprehension]` are accepted and ignored.
 - The agent changes this file only when you ask it to.
 
 ```toml
@@ -50,6 +52,38 @@ What the project is. `/nh:init` fills these in.
 | `data_source` | `""` | Where the data lives: a project-relative path, an absolute path, or a URL without credentials (a credentialed URL is kept in `.env` as `DATA_URL`). |
 | `notebook` | `"notebooks/01_eda.ipynb"` | The notebook nh works in by default, relative to the project root. The agent can switch notebooks within a session. |
 | `env_manager` | `""` | `uv` or `conda`; written by `/nh:init`. |
+
+## `[preset]`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `level` | `"junior"` | `junior` or `senior`. The preset sets `[lint] comment_ratio` (L105): 8 for junior, 16 for senior, so a senior project gets at most one comment line per 16 code lines. A `comment_ratio` you set under `[lint]` wins over the preset at either level. Senior also tells Claude, at the start of each session, to reply after each cell in one short paragraph (what changed and what to check in the output) and not to explain what common pandas methods do; `/nh:explain` keeps its numbered steps, without the definitions. Junior keeps the plain-words default (the reply after a cell covers the reply contract's parts at any length; `/nh:explain` defines each pandas method the first time it appears). The depth is advisory: Claude reads it, nh doesn't check it. Any other value (another word, `""`, a number), or a `preset` that isn't a `[preset]` table, reads as `junior`, shows under `--- config ---` in every nh result, and `nhctl doctor` reports D171 (`/nh:status` shows it too, with the level in use). |
+
+`/nh:init` doesn't ask; the level starts as junior. To change it, run
+`nhctl preset senior` (or `junior`) in the project: from a shell, as
+`! nhctl preset senior` in Claude Code, or by asking the agent, which runs it
+through Bash (Claude Code asks you first, unless your permission settings
+already allow the command). The comment budget applies from nh's next tool
+call, the explanation depth from a new session or `/clear` (a resumed or
+compacted session keeps the senior line it started with, so switching back to
+junior needs one of those).
+
+- **What it edits:** only the `level` line under `[preset]`: it replaces the
+  value of an existing `level = …` (keeping its comment), else uncomments the
+  `# level = "junior"` line `/nh:init` wrote, else adds `level = …` under the
+  `[preset]` header, else appends a `[preset]` section at the end of the file.
+  Comments, blank lines, line endings and every other key stay exactly as they
+  were. Running it again changes nothing.
+- **When it won't (D172):** `harness.toml` is missing, read-only (no write
+  permission) or can't be parsed or written, or sets the preset in another
+  form (`[preset.x]`, a second `level` line, a quoted `"level"`). Set the
+  level by hand then: `level = "senior"` under `[preset]`. A top-level
+  `preset = …` or `preset.level = …` line is the exception: delete it, then
+  rerun `nhctl preset` (a `[preset]` table added beside it would make the file
+  unparseable).
+- `--json` prints `{"ok", "changed", "path", "level", "was", "comment_ratio",
+  "comment_ratio_set_by"}`; `comment_ratio_set_by` is `"harness.toml"` when
+  your own `[lint] comment_ratio` sets the budget instead of the preset.
 
 ## `[jupyter]`
 
@@ -85,6 +119,7 @@ message: it shares the budget of the message it belongs to.
 | `max_waits` | `2` | `nh_run(mode="wait")` calls per message for a cell still running. |
 | `max_undos` | `3` | `nh_undo` calls per message. |
 | `max_lint_rejects` | `3` | Rejected write attempts per message before nh asks the agent to stop and explain to you what it is trying to write. |
+| `max_batch` | `5` | The most steps one approved batch writes: when you ask for several plan steps ("run the next 3") and answer the agent's question with yes, that message may write up to `min(N, max_batch)` cells, stopping at the first step that fails or needs a look. An integer from 2 to 20: a batch is two or more steps, and nh keeps a session's last 20 nh:qa-cell runs, which is how it counts a batch's runs under ultracode; anything else reads as 5 with a config problem. |
 | `stamp_ttl_s` | `1800` | Seconds a hook's turn stamp stays valid. Older stamps are discarded. |
 
 ## `[exec]`
@@ -102,7 +137,7 @@ full output.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_chars` | `2000` | Characters of cell output per result (head and tail; tracebacks keep the tail). The full text is saved under `.nh/outputs/`. |
+| `max_chars` | `2000` | Characters of cell output per result (head and tail; tracebacks keep the tail). The full text is saved under `.nh/outputs/`, with secrets shown as `[redacted:NAME]` as in the result; the notebook keeps the raw output. |
 | `max_images` | `2` | Images per result. |
 | `image_max_px` | `768` | Longest side of an image sent to the agent, in pixels. |
 
@@ -138,8 +173,8 @@ reject the cell; hints arrive with the result, after the run.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `"advise"` | `advise`: hints are advisory. `strict`: every hint is enforced as a hard rule. |
-| `comment_ratio` | `8` | At most one comment per this many code lines (L105). `0` means no comments. |
+| `mode` | `"advise"` | `advise`: hints are advisory. `strict`: every hint is enforced as a hard rule; a rule at `"ask"` still asks. |
+| `comment_ratio` | `8` | At most one comment line per this many code lines (L105), and at least one per cell. `0` means no comments. Unset (the line `/nh:init` writes is commented out), the preset decides: 8 for `junior`, 16 for `senior`. A value here wins over either, so uncommenting `# comment_ratio = 8` pins 8 in a senior project too. Advisory; `mode = "strict"` makes it a hard rule at whichever ratio applies. |
 | `max_line_length` | `99` | Longest line, in characters (L101). |
 | `max_cell_lines` | `40` | Longest cell, in lines (L102). |
 | `max_nesting` | `3` | Deepest nesting of blocks (L103). |
@@ -147,14 +182,27 @@ reject the cell; hints arrive with the result, after the run.
 
 ## `[lint.rules]`
 
-Each rule is `"off"`, `"hint"` or `"error"`. `"error"` rejects the cell before
-it is written; `"hint"` reports it after the run.
+Each rule is `"off"`, `"hint"`, `"error"` or `"ask"`. `"error"` rejects the
+cell before it is written; `"hint"` reports it after the run; `"off"` skips it.
+`"ask"` makes nh ask you in chat before it writes the cell (E122): your yes, on
+its own in your next message, lets that exact cell through once; anything else
+drops it. Strict mode leaves an ask an ask. Only `package_install`, `network`
+and `outside_write` can be `"ask"`: nh has a question for them, and none for
+the other rules. Any other value falls back to the rule's default and shows under
+`--- config ---`. With
+`secret_print` at `"hint"` or `"off"`, a cell can print an env var's value into
+the notebook; nh still hides the values it knows as secrets from Claude
+(`[redacted:NAME]`).
 
 | Key | Rule | Default | Fires on |
 |---|---|---|---|
-| `package_install` | L009 | `"error"` | a package install in a cell: `!pip install`, `%pip install`, `%conda install`, `!uv add` and the like (`%pip list` is fine). The agent asks you and installs with a command you approve instead. |
+| `package_install` | L009 | `"ask"` | a package install (or removal) in a cell: `!pip install`, `%pip install`, `%conda install`, `!uv add` and the like (`%pip list` is fine). nh asks you first, naming the packages, since the next env sync removes a kernel-only install (`uv add <pkg>` keeps it). `"error"` refuses such cells, and the agent asks you and installs with a command you approve instead. |
+| `network` | L012 | `"ask"` | a cell that reaches a host the project hasn't approved: a URL given to a reader or any other call (`pd.read_csv("https://…")`, `s3://`, `gs://`, a name holding one, also from an earlier cell, an f-string or `+` with its host in the code), `requests`, `httpx`, `urllib`, `aiohttp`, `socket`, and `!curl`, `!wget`, `!kaggle`, `!pip download`, `!git clone`, `!scp`, `!rsync host:`, `!ssh` (also in `%%bash`, `os.system` and `subprocess`). nh asks you first, naming the hosts (never the URL). Not network: database URLs (`postgresql://…`), `file://`, `localhost` and `127.0.0.1`, and a URL nh can't see in the code (from the env or `.env` given to a reader, built at run time). The approved hosts are `.nh/state/approved_hosts.json`, a JSON list of host names (`["data.example.org"]`), and of buckets as `s3://<bucket>` (`gs://<bucket>`, `az://<container>`): `/nh:init` adds its data URL's host there, and you can add more by hand. The list lives in `.nh/`, which is git-ignored, so it is local to your clone. A host matches exactly, whatever the URL's case, port or userinfo; a subdomain needs its own entry. When the file isn't a JSON list, or holds entries that aren't host names (a URL, a path), they approve nothing and `nh_inspect`'s status and each write's `--- config ---` lines say so. Your yes to the question approves that one cell, not the host. `"error"` refuses such cells, and the agent asks you to download the data into the project instead. |
+| `outside_write` | L013 | `"ask"` | a cell that writes, creates or removes a file or folder outside the project: a frame's `.to_csv(…)` and the other `.to_*` file writers (not `.to_sql`), polars' `.write_*` and `.sink_*`, `savefig`, `.save(…)`, `open(…, "w")` (also `"a"`, `"x"`, `"+"`), a path's `.write_text`, `.mkdir`, `.touch`, `.unlink`, `.rename`, `shutil.copy`/`move`/`rmtree`, `os.rename`/`remove`/`makedirs`, `joblib.dump`, `np.savez`, `torch.save`, image writers (`plt.imsave`, `cv2.imwrite`), Spark's `.write`, a `logging.FileHandler`, `%%writefile`, and in shell lines (`!`, `%%bash`, `os.system`, `subprocess`) `>`/`>>`, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `curl -o`, `wget -O`, `zip`. Outside is a path that starts with `~`, an absolute path not under the project, or a relative one that climbs above the project with `..`, counted from the notebook's folder, where the kernel runs (from `notebooks/`, `../data/x.csv` is inside and `../../x.csv` is not). nh follows a path through a name (also one from an earlier cell), `Path(…) / …`, `os.path.join`, a function the cell or an earlier cell defines (`export(df, "~/x.csv")` counts where it is called), an f-string's literal parts (each `{…}` read as part of one folder or file name: from `notebooks/`, `f"../../{name}.csv"` is outside, while `f"../data/{name}.csv"` is inside and `f"/home/me/{name}/x.csv"` may be the project `/home/me/proj`, so it doesn't ask), and a `%cd`, `os.chdir`, `with contextlib.chdir(…)` or shell `cd` earlier in the same cell (not one inside a function the cell calls). `/dev` (`/dev/null`) and the system temp folders `/tmp` and `/var/tmp` (`/private/tmp` and `/private/var/tmp` on macOS) never ask. nh asks you first, naming the paths. Every `~` path asks, also one that leads back into the project (`~/proj/data/x.csv` with the project at `~/proj`), and the question then calls it outside. It misses a path it can't read in the code (from the env, a function's result, an attribute, a loop, a path given to a method), writers it doesn't know (a database file, `h5py`, a library's own cache, a script the cell runs), an earlier cell's `%cd`, and a later cell's call to a function from a cell above whose path needs no argument (it asked where the function was defined). `"error"` refuses such cells, and the agent writes inside the project instead. |
 | `notebook_write` | L008 | `"error"` | a cell that writes an `.ipynb` file |
 | `markdown_output` | L010 | `"error"` | `%%markdown`, `%%html`, or `Markdown()`/`HTML()`/`Latex()` showing prose |
+| `secret_print` | L011 | `"error"` | code that would show an env var's value, secret or not (nh can't tell which values are secrets): `print(os.environ["API_KEY"])`, `os.getenv("API_KEY")` as the last line, a variable holding one, `os.environ.keys()` shown (its repr holds every value), `%env`, `!env`, `!printenv`, `!echo $API_KEY`, `!cat .env`, a `.env` file read in Python and shown. Checking is fine: `print("API_KEY" in os.environ)`, `print(bool(os.getenv("API_KEY")))`, `sorted(os.environ)`, `len(key)`, passing it on (`create_engine(url)`), or an env var the cell set to a literal (`os.environ["MODE"] = "dev"`) |
+| `secret_name` | L014 | `"hint"` | showing a name that says it holds a secret, such as `print(api_key)` or `print(db_password)` (not `tokens`, `tokenizer`, `max_tokens`, `token_counts`, `eos_token`, `has_api_key`, `author`) |
 | `long_line` | L101 | `"hint"` | a line over `max_line_length` |
 | `long_cell` | L102 | `"hint"` | a cell over `max_cell_lines` |
 | `deep_nesting` | L103 | `"hint"` | nesting deeper than `max_nesting` |
@@ -198,4 +246,4 @@ as `# %%`), L003 (title), L004 (bullets), L005 (missing intent) and L007
 |---|---|
 | `NH_JUPYTER_URL` | Overrides `[jupyter].url`. The only way to use a JupyterLab on another host. |
 | `NH_JUPYTER_TOKEN` | Token for the server at `NH_JUPYTER_URL` or `[jupyter].url`. |
-| `NH_HEADLESS=1` | Forces `approve_before_run = false`, for runs with nobody to answer prompts. |
+| `NH_HEADLESS=1` | Forces `approve_before_run = false`, for runs with nobody to answer prompts (set it for an unattended `claude -p` run: nh doesn't treat `-p` as headless by itself, since a `-p` run can still carry the user's next message). A cell nh would ask about (a rule at `"ask"`, E122) is refused, since no yes can arrive. Without it, nh treats a `claude -p` run as interactive: a "yes" sent as the next message (stream-json input, or `claude -p "yes" --resume <session>`) has that exact cell written once. |

@@ -17,14 +17,16 @@ from . import rest  # first: it sets NO_PROXY before websockets is imported
 
 import asyncio
 import difflib
+import json
 import logging
 import time
 from typing import Any, Literal, cast
 
 import nbformat
 from jupyter_nbmodel_client import NbModelClient
-from pycrdt import Array, Awareness, Map, Text, YMessageType
+from pycrdt import Array, Awareness, Decoder, Encoder, Map, Text, YMessageType
 from pycrdt import read_message as _read_message
+from websockets.exceptions import ConnectionClosedOK
 
 from ..exec.docsafe import output_summary, safe_text, sanitize_for_doc
 from ..meta import normalize_source
@@ -51,16 +53,126 @@ PRESENCE = {
     "color": "#6d28d9",
 }
 WriteState = Literal["ok", "unsynced", "missing"]
+RAW_MESSAGE = 2  # jupyter-collaboration's message type for requests such as "save"
+
+
+def save_message(request_id: int) -> bytes:
+    """The room message that saves the notebook now: what JupyterLab sends for File → Save in a
+    collaborative session. jupyter-collaboration handles it at once, with no save delay (and even
+    when its ``document_save_delay`` is None, which turns only its autosave off)."""
+    encoder = Encoder()
+    encoder.write_var_uint(RAW_MESSAGE)
+    encoder.write_var_string("save")
+    encoder.write_var_uint(request_id)
+    return encoder.to_bytes()
+
+
+def save_reply(message: bytes) -> dict[str, Any] | None:
+    """The room's answer to a save request, ``{"type": "save", "responseTo", "status"}`` with status
+    "success", "skipped" (the room was loading the file) or "failed"; None for anything else."""
+    try:
+        decoder = Decoder(message)
+        if decoder.read_var_uint() != RAW_MESSAGE:
+            return None
+        reply = json.loads(decoder.read_var_string())
+    except Exception:  # not a JSON RAW message
+        return None
+    return reply if isinstance(reply, dict) and reply.get("type") == "save" else None
+
+
+def send_queue(awareness: Any) -> asyncio.Queue[bytes] | None:
+    """The queue ``NbModelClient.run()`` sends the room's messages from, in order, or None.
+
+    run() keeps it in a local variable; the one place it is reachable is the awareness callback
+    run() registers, a ``partial`` bound to it (jupyter-nbmodel-client 1.5's ``_on_awareness_event``
+    in pycrdt's ``Awareness._subscriptions``). ``tests/unit/test_rtc_save.py`` pins this against
+    the installed versions; the drift job against their latest releases.
+    """
+    subscriptions = getattr(awareness, "_subscriptions", None)
+    if not isinstance(subscriptions, dict):
+        return None
+    for callback in subscriptions.values():
+        for arg in getattr(callback, "args", ()):
+            if isinstance(arg, asyncio.Queue):
+                return arg
+    return None
+
+
+class RoomClosed(ConnectionError):
+    """The room server closed nh's room connection normally (close code 1000, 1001 or 1005)."""
+
+
+def end_run_on_clean_close(websocket: Any) -> None:
+    """Have a normal close of this room connection end ``NbModelClient.run()``, as a dropped one does.
+
+    jupyter-nbmodel-client's listener is ``while True: async for message in websocket``. websockets
+    ends that iteration quietly on a normal close, and every later one ends at once without
+    yielding: the listener would spin and freeze the gateway's event loop. The iteration calls the
+    connection's ``recv()`` (as websockets documents), so this connection's ``recv`` raises
+    :class:`RoomClosed` in place of ``ConnectionClosedOK``: run() ends, ``RtcDocument.synced``
+    turns False and the next write reconnects.
+    """
+    recv = websocket.recv
+
+    async def recv_or_raise(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await recv(*args, **kwargs)
+        except ConnectionClosedOK as exc:
+            raise RoomClosed(f"the room closed the connection ({exc})") from exc
+
+    websocket.recv = recv_or_raise
+
+
+_no_queue_logged = False
 
 
 class NhNbModelClient(NbModelClient):
-    """``NbModelClient`` that also applies peers' awareness, so presence works both ways.
+    """``NbModelClient`` that also applies peers' awareness, so presence works both ways, can ask
+    the room to save, and ends its run when the room closes the connection normally.
 
     The room server only relays awareness, and clients renew theirs every 15 s; nh re-announces
     itself when a new peer appears, so a tab opened after nh connected shows nh right away.
     """
 
+    _connection: Any = None  # the room connection, known from the first message it delivers
+    _send_queue: asyncio.Queue[bytes] | None = None  # run()'s, found at that first message
+    _save_requests = 0
+
+    def request_save(self) -> bool:
+        """Queue a save request (:func:`save_message`) behind the messages already queued, so the
+        room has read every write nh made before it; never waits on the network. False before the
+        room answered, or when run()'s queue wasn't found (logged once, at connect)."""
+        queue = self._send_queue
+        if queue is None:
+            return False
+        self._save_requests += 1
+        queue.put_nowait(save_message(self._save_requests))
+        return True
+
+    def _connected(self, websocket: Any) -> None:
+        """The room's first message on a connection: run() has registered its callbacks by now."""
+        global _no_queue_logged
+        self._connection = websocket
+        end_run_on_clean_close(websocket)
+        self._send_queue = send_queue(self._doc.awareness)
+        if self._send_queue is None and not _no_queue_logged:
+            _no_queue_logged = True
+            log.warning(
+                "nh can't ask the room to save: jupyter-nbmodel-client's send queue was not found "
+                "(its internals changed). JupyterLab's autosave still runs."
+            )
+
     async def _on_message(self, websocket: Any, message: bytes) -> None:
+        if websocket is not self._connection:
+            self._connected(websocket)
+        if message and message[0] == RAW_MESSAGE:
+            reply = save_reply(message)
+            if reply is not None and reply.get("status") != "success":
+                # warning: gateway.log keeps WARNING and up, and an unsaved write is what a
+                # restart loses ("skipped": the room was loading the file; "failed": no write).
+                # A save that a change to the document cancelled answers "success" too (save())
+                log.warning("the room did not save %s: %s", self.path, reply.get("status"))
+            return
         if message and message[0] == YMessageType.AWARENESS:
             awareness = cast(Awareness, self._doc.awareness)
             try:
@@ -363,6 +475,28 @@ class RtcDocument:
         """Let the sender task pick up what a write queued."""
         await asyncio.sleep(0)
         await asyncio.sleep(0)
+
+    async def save(self) -> None:
+        """Ask the room to write the notebook to disk now, after one of nh's writes (design §6.13).
+
+        jupyter-collaboration saves only after ``document_save_delay`` with no change, so while a
+        cell prints (nh flushes its outputs every 200 ms) nothing reaches the file, and it doesn't
+        save on shutdown; a room rebuilt after a JupyterLab restart then takes the file over its
+        YStore, and whatever was never saved is gone. The request goes out after the write's
+        update, through the same queue, and never waits on the network. The room saves on request
+        even when its ``document_save_delay`` is None (autosave off): nh can't read that setting.
+
+        Not a guarantee: while autosave is on, any change to the document before the room writes
+        (a peer's keystroke, or nh's own next output flush on a notebook whose save takes longer
+        than ``flusher.PERIOD_S``) cancels this save, and the room still answers "success"
+        (jupyter-server-ydoc 3.0.4), so nothing is logged. The write then reaches the file at the
+        next save that runs to its end (design §6.13, Known gaps).
+        """
+        nb = self.nb
+        if not self.synced or nb is None:
+            return
+        nb.request_save()
+        await self.settle()  # the sender picks up the write's update and the request
 
     def _client(self) -> NhNbModelClient:
         if not self.synced or self.nb is None:

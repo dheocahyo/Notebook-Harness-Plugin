@@ -17,6 +17,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent
 
 from .. import dataflow, meta, render
+from .._shared import hosts, secrets
 from .._shared.paths import Layout, atomic_write_json, read_json
 from .._shared.text import normalize_title
 from ..backend.base import (
@@ -282,12 +283,18 @@ def note_last_cell(
 
 
 def record_finish(svc: Services, record: RunRecord, result: ExecResult) -> None:
-    """Bookkeeping when a run ends, whether or not a tool call is still waiting for it."""
+    """Bookkeeping when a run ends, whether or not a tool call is still waiting for it.
+
+    A going approved batch's step keeps reading ``running`` here: its report sets the status
+    together with the stop once its "check this" is known (``batch.reported``, design §6.3),
+    so a call sent in parallel can't see the step OK before its check."""
     record.result = result
     status = effective_status(result, record.execution)
     state = svc.ledger.get(record.session_id, record.prompt_id)
-    state.status[record.uid] = status
-    svc.ledger.save(state)
+    batch_going = bool(state.batch_total) and not state.batch_stop
+    if not (batch_going and record.uid in state.claims):
+        state.status[record.uid] = status
+        svc.ledger.save(state)
     note_last_cell(svc, record, status, result.execution_count, finished=True)
     svc.runs.pop(record.uid, None)
     if not record.reported:
@@ -328,7 +335,9 @@ def text_result(
     status: str | None = None,
     cell_id: str | None = None,
 ) -> ToolResult:
-    content: list[Any] = [TextContent(type="text", text=text)]
+    """Every tool result's text passes the installed redactor here, the last safety net
+    (design §6.8): each site has already redacted before cutting; this catches the rest."""
+    content: list[Any] = [TextContent(type="text", text=secrets.current().redact(text))]
     content.extend(images or [])
     meta: dict[str, Any] = {"nh/v": 1}
     if status is not None:
@@ -347,11 +356,13 @@ def status_word(result: ExecResult | None) -> str:
 def machine_line(
     uid: str, exec_count: int | None, state: TurnState, cfg: Config, *, writer: bool = False
 ) -> str:
-    """``writer``: nh:cell-writer's results also count its revisions (the workflow reads them)."""
+    """``writer``: nh:cell-writer's results also count its revisions (the workflow reads them).
+    An approved batch (design §6.3) counts against its own size: ``turn=k/N batch``."""
     turn = cfg["turn"]
+    limit = f"{state.batch_total} batch" if state.batch_total else str(turn["max_code_cells"])
     line = (
         f"nh: cell={uid} exec={exec_count if exec_count is not None else '-'} "
-        f"turn={len(state.claims)}/{turn['max_code_cells']} "
+        f"turn={len(state.claims)}/{limit} "
         f"retries={state.retries.get(uid, 0)}/{turn['max_retries']} "
         f"waits={state.waits}/{turn['max_waits']} undos={state.undos}/{turn['max_undos']}"
     )
@@ -360,8 +371,10 @@ def machine_line(
     return line
 
 
-def config_lines(cfg: Config) -> list[str]:
-    return [f"harness.toml: {problem}" for problem in cfg.problems]
+def config_lines(cfg: Config, layout: Layout | None = None) -> list[str]:
+    """``harness.toml``'s problems, then the approved hosts list's (design §6.4)."""
+    found = [f"harness.toml: {problem}" for problem in cfg.problems]
+    return found + (hosts.problems(layout.approved_hosts) if layout is not None else [])
 
 
 def windows_guard() -> None:

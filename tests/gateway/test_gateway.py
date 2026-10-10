@@ -161,6 +161,132 @@ async def test_stamp_from_an_earlier_message_is_refused(nh: Harness) -> None:
     assert "nh: E102" in text(result)
 
 
+# --- D1: a message nh missed fails closed (design §6.1) -------------------------------------
+
+MISSED = "- nh missed this message; send it again."
+MISSED_NEXT = (
+    "Next: Tell the user nh missed their last message and ask them to send it again; write "
+    "nothing until they do."
+)
+
+
+async def test_a_message_nh_missed_is_refused(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    # p2's UserPromptSubmit hook never ran (failed or timed out): its call is newer than p1's.
+    result = await nh.call("nh_add_cell", "p2", **LOAD)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body, body
+    assert body.splitlines()[:4] == [
+        "This call belongs to an earlier message, so nh wrote nothing.",
+        "nh: E102",
+        MISSED,
+        MISSED_NEXT,  # the user must resend, so the model must say so (not just wait)
+    ]
+    assert not nh_cells(nh)
+    nh.turns.prompt("p2")  # sent again: the hook records it
+    assert not (await nh.call("nh_add_cell", "p2", **LOAD)).is_error
+
+
+async def test_a_missed_message_cannot_wait_either(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    result = await nh.call("nh_run", "p9", mode="wait")
+    assert result.is_error and MISSED in text(result)
+
+
+async def test_no_turn_record_is_allowed(nh: Harness) -> None:
+    # The /nh:init message: its hook ran before .nh/ existed, so there is no record.
+    result = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert not result.is_error, text(result)
+
+
+async def test_known_ids_pass_d1(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    nh.turns.notification("note-1")
+    result = await nh.call("nh_add_cell", "note-1", **LOAD)  # an alias of p1
+    assert not result.is_error, text(result)
+    nh.turns.prompt("p2", text="yes")
+    nh.turns.notification("note-2")
+    # Typed mid-turn: absorbed, still p2. No mode: an explain one would now be E109 (§6.2).
+    nh.turns.prompt("p2", text="also keep the region column")
+    result = await nh.call("nh_add_cell", "note-2", **DROP)
+    assert not result.is_error, text(result)
+    later = await nh.call("nh_add_cell", "note-1", **dict(DROP, title="Late"))  # earlier alias
+    assert later.is_error and "nh: E110" in text(later)  # p1's budget, not D1
+    assert MISSED not in text(later)
+
+
+async def test_a_message_typed_into_a_notifications_turn_gets_no_budget(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error
+    nh.turns.notification("note-1")
+    # Typed while Claude handles note-1: Claude Code resubmits note-1, an alias of p1.
+    nh.turns.prompt("note-1", text="yes, add the drop step too")
+    result = await nh.call("nh_add_cell", "note-1", **DROP)
+    assert result.is_error and "nh: E110" in text(result)  # still p1's one cell
+    assert MISSED not in text(result)
+
+
+def _stamp_and_record_ts(nh: Harness, offset: float) -> None:
+    """Set the turn record's ts to the one waiting stamp's ts + ``offset``."""
+    (stamp_file,) = (nh.project / ".nh" / "state" / "stamps").glob("*--*.json")
+    stamp_ts = json.loads(stamp_file.read_text())["ts"]
+    turn_file = nh.project / ".nh" / "state" / "turns" / "sess-1.json"
+    record = json.loads(turn_file.read_text())
+    turn_file.write_text(json.dumps(dict(record, ts=stamp_ts + offset)))
+
+
+@pytest.mark.parametrize(("offset", "missed"), [(0.0, True), (0.001, False)])
+async def test_d1_starts_at_the_records_own_time(nh: Harness, offset: float, missed: bool) -> None:
+    """A stamp exactly as new as the record is a missed message; a hair older is v0.1's
+    earlier-message E102."""
+    nh.turns.prompt("p1")
+    nh.turns.stamp("nh_add_cell", LOAD, "p2")
+    _stamp_and_record_ts(nh, offset)
+    result = await nh.client.call_tool("nh_add_cell", LOAD, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body, body
+    assert (MISSED in body, MISSED_NEXT in body) == (missed, missed)
+
+
+# v0.1's E102 (not D1): an unknown id older than the record is an earlier message's call.
+
+
+async def test_v01_an_old_unknown_call_gets_the_plain_e102(nh: Harness) -> None:
+    nh.turns.stamp("nh_add_cell", LOAD, "p0")  # stamped before any message was recorded
+    await asyncio.sleep(0.05)
+    nh.turns.prompt("p1")
+    result = await nh.client.call_tool("nh_add_cell", LOAD, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body and MISSED not in body
+
+
+async def test_v01_a_call_from_two_messages_back_gets_the_plain_e102(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    nh.turns.stamp("nh_add_cell", LOAD, "p1")
+    await asyncio.sleep(0.05)
+    nh.turns.prompt("p2")
+    nh.turns.prompt("p3")  # p1 is neither the turn nor the previous one
+    result = await nh.client.call_tool("nh_add_cell", LOAD, raise_on_error=False)
+    body = text(result)
+    assert result.is_error and "nh: E102" in body and MISSED not in body
+
+
+async def test_after_an_orphan_an_unknown_call_keeps_v01s_rule(nh: Harness) -> None:
+    # A background task can finish during the /nh:init message: the record is an orphan.
+    nh.turns.notification("note-1")
+    result = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert not result.is_error, text(result)
+
+
+async def test_the_writers_calls_skip_d1(nh: Harness) -> None:
+    nh.turns.prompt("p1")
+    nh.turns.workflow_launched("p1")
+    # A workflow agent's stamp may carry a prompt id the turn record never saw.
+    result = await nh.turns.writer_call(nh.client, "w-1", "wf_run-1", "nh_add_cell", LOAD, "p-w1")
+    assert not result.is_error, text(result)
+    assert nh_cells(nh)[-1]["metadata"]["nh"]["turn_id"] == "p1"
+
+
 async def test_error_retry_then_done(nh: Harness) -> None:
     nh.turns.prompt("p1")
     broken = dict(
@@ -303,3 +429,96 @@ async def test_markdown_and_install_smuggling_rejected(nh: Harness) -> None:
     ):
         result = await nh.call("nh_add_cell", "p1", **dict(LOAD, code=code))
         assert result.is_error and rule in text(result), text(result)
+
+
+# --- the approved batch (design §6.3) ----------------------------------------------------------
+
+TOTALS = dict(
+    title="Total price by region",
+    notes=["Sums the price per region.", "Shows which region sells the most."],
+    intent="total price by region",
+    code="totals = df.groupby('region')['price'].sum()\ntotals",
+)
+
+
+def batch_message(nh: Harness, n: int = 3) -> None:
+    """p1 asks for the batch; p2, the user's yes, may write ``n`` cells."""
+    nh.turns.prompt("p1", text=f"run the next {n}")
+    nh.turns.prompt("p2", text="yes")
+
+
+def first_lines(result) -> list[str]:
+    return text(result).splitlines()
+
+
+async def test_without_a_batch_the_cap_is_max_code_cells(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="yes")  # a yes with no batch asked before it
+    first = await nh.call("nh_add_cell", "p1", **LOAD)
+    assert "turn=1/1 retries" in text(first)
+    second = await nh.call("nh_add_cell", "p1", **DROP)
+    assert "nh: E110" in text(second) and "batch" not in text(second)
+
+
+async def test_a_batch_raises_e110s_cap_to_its_size(nh: Harness) -> None:
+    batch_message(nh, 2)
+    one = await nh.call("nh_add_cell", "p2", **LOAD)
+    two = await nh.call("nh_add_cell", "p2", **DROP)
+    assert "turn=1/2 batch retries=0/2" in text(one) and "turn=2/2 batch retries=0/2" in text(two)
+    three = await nh.call("nh_add_cell", "p2", **TOTALS)
+    assert first_lines(three) == [  # its own first line: not "one new cell per message"
+        "Not written (by design): the approved batch's 2 cells are written; the last is "
+        '"Drop rows with missing price" [2].',
+        "nh: E110",
+        "- The rest of the plan waits for the user's next message.",
+        "Next: Don't write more cells. Reply with the remaining steps as a numbered list and ask "
+        "which to do next.",
+    ]
+    assert len([c for c in nh_cells(nh) if c["cell_type"] == "code"]) == 2
+
+
+async def test_a_lint_refusal_stops_the_batch_and_says_not_to_call_again(nh: Harness) -> None:
+    batch_message(nh)
+    assert not (await nh.call("nh_add_cell", "p2", **LOAD)).is_error
+    refused = await nh.call("nh_add_cell", "p2", **dict(DROP, notes=["Only one bullet."]))
+    body = first_lines(refused)
+    assert body[:2] == ["Not written: the cell broke nh's hard rules.", "nh: E120"]
+    assert body[-2:] == [
+        "- The approved batch stops here, at step 2 of 3: nh changes nothing more this message.",
+        "Next: Don't call again: the approved batch stops here. Tell the user what each step "
+        "did, which step nh refused and why, and what you would change; then wait.",
+    ]
+    fixed = await nh.call("nh_add_cell", "p2", **DROP)
+    assert first_lines(fixed)[:2] == [
+        "Not written: the approved batch stopped at step 2 of 3; nh changes nothing more this "
+        "message.",
+        "nh: E123",
+    ]
+    assert first_lines(fixed)[-1] == (
+        "Next: Report the batch to the user: what each step did, then where and why it stopped "
+        "(the error, the 'check this' finding or nh's question). No retry and no new cell this "
+        "message; wait for the user."
+    )
+
+
+async def test_e125_as_the_first_call_decides_and_stops_the_batch(nh: Harness) -> None:
+    """E125 comes before the notebook is resolved (design §6.8); in a batch it still stops it,
+    under the turn's lock, and decides the batch when it is the message's first gated call."""
+    batch_message(nh)
+    marked = await nh.call("nh_add_cell", "p2", **dict(LOAD, code="key = '[redacted:API_KEY]'"))
+    body = first_lines(marked)
+    assert body[1] == "nh: E125"
+    assert body[-2:] == [
+        "- The approved batch stops here, at step 1 of 3: nh changes nothing more this message.",
+        "Next: Don't call again: the approved batch stops here. Tell the user what each step "
+        "did, which step nh refused and why, and what you would change; then wait.",
+    ]
+    after = await nh.call("nh_add_cell", "p2", **LOAD)
+    assert "nh: E123" in text(after) and "step 1 of 3" in text(after)
+    assert not nh_cells(nh)
+
+
+async def test_e125_outside_a_batch_is_unchanged(nh: Harness) -> None:
+    nh.turns.prompt("p1", text="load it")
+    marked = await nh.call("nh_add_cell", "p1", **dict(LOAD, code="key = '[redacted:API_KEY]'"))
+    assert "batch" not in text(marked) and first_lines(marked)[-1].startswith("Next: Read the")
+    assert not (await nh.call("nh_add_cell", "p1", **LOAD)).is_error

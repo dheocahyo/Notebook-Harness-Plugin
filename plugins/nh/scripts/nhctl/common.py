@@ -12,11 +12,12 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from nh_gateway._shared import paths, tomlread
+from nh_gateway._shared import paths, secrets, tomlread
 from nh_gateway._shared.scaffold import core
 
 HERE = Path(os.path.realpath(__file__)).parent
@@ -27,8 +28,6 @@ MIN_CLAUDE = (2, 1, 282)
 MIN_UV = (0, 10)
 MIN_JUPYTERLAB = (4, 6)
 MIN_COLLABORATION = (5,)
-
-_TOKEN = re.compile(r"(token=|\"token\"\s*:\s*\"|Authorization:\s*token\s+)[^&\s\"']+", re.I)
 
 
 class NhctlError(Exception):
@@ -55,7 +54,8 @@ class Result:
 
 
 def scrub(text: str) -> str:
-    return _TOKEN.sub(lambda m: m.group(1) + "***", text)
+    """The installed redactor (design §6.8): the project's once ``project_root`` found it."""
+    return secrets.current().redact(text)
 
 
 # ------------------------------------------------------------------------ locations
@@ -94,6 +94,8 @@ def project_root(explicit: str | None, required: bool = True) -> Path | None:
     """The nh project containing --project (or the cwd)."""
     start = os.path.abspath(explicit or os.getcwd())
     found = paths.find_project(start)
+    if found is not None:  # what nhctl prints is redacted with the project's values (§6.8)
+        secrets.install(secrets.Redactor.for_project(found))
     if found is None and required:
         raise NhctlError(
             "D105",
@@ -137,6 +139,25 @@ def resolve_notebook(project: Path, value: str | None) -> Path:
     return candidate.resolve()
 
 
+def write_keeping_mode(path: Path, text: str) -> None:
+    """Atomic replace that keeps an existing file's permissions (0644 for a new one): a temp file
+    in the same folder, written as UTF-8 bytes (line endings as given), fsynced, then renamed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def read_env_json(layout: paths.Layout) -> dict:
     data = paths.read_json(layout.env_json, {})
     return data if isinstance(data, dict) else {}
@@ -162,6 +183,23 @@ def runtime_venv(data: Path) -> Path | None:
     except OSError:
         return None
     return data / f"venv-{digest}"
+
+
+def runtime_python(data: Path, needed_for: str) -> Path:
+    """The ready runtime venv's Python, as libexec/nh-mcp's ``ready()`` checks it: the venv's
+    ``.nh-ready`` marker and an executable ``bin/python``. A located data dir whose venv isn't
+    ready is D120 (spike V8; D121 stays "can't locate the data dir")."""
+    venv = runtime_venv(data)
+    python = venv / "bin" / "python" if venv is not None else None
+    if python is None or not (python.parent.parent / ".nh-ready").is_file():
+        python = None
+    if python is None or not os.access(str(python), os.X_OK):
+        raise NhctlError(
+            "D120",
+            f"nh's own Python runtime isn't installed yet, so {needed_for}.",
+            'Run: nhctl runtime sync --plugin-data "${CLAUDE_PLUGIN_DATA}", then rerun.',
+        )
+    return python
 
 
 # ---------------------------------------------------------------------- processes
@@ -248,11 +286,32 @@ def now_stamp() -> str:
 # -------------------------------------------------------------------------- output
 
 
+def scrub_data(value: Any) -> Any:
+    """``value`` with every string in it redacted, keys too, before JSON escapes a value's
+    quotes and backslashes out of the redactor's sight. Other objects become their redacted
+    ``str``, as ``json.dumps(default=str)`` would print them."""
+    if isinstance(value, str):
+        return scrub(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {
+            (scrub(key) if isinstance(key, str) else key): scrub_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [scrub_data(item) for item in value]
+    return scrub(str(value))
+
+
 def print_result(result: Result, as_json: bool) -> None:
+    """Everything nhctl prints passes the redactor (design §6.8): --json's strings before they
+    are escaped, then the whole line."""
     if as_json:
-        sys.stdout.write(json.dumps(result.data, ensure_ascii=False, default=str) + "\n")
+        line = json.dumps(scrub_data(result.data), ensure_ascii=False, default=str)
+        sys.stdout.write(scrub(line) + "\n")
     elif result.text:
-        sys.stdout.write(result.text.rstrip("\n") + "\n")
+        sys.stdout.write(scrub(result.text.rstrip("\n")) + "\n")
 
 
 def error_result(exc: NhctlError) -> Result:

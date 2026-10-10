@@ -1,4 +1,5 @@
-"""Effective configuration: packaged defaults < <project>/harness.toml < NH_* environment."""
+"""Effective configuration: packaged defaults < the preset's overlay < <project>/harness.toml <
+NH_* environment (design §6.9)."""
 
 from __future__ import annotations
 
@@ -10,7 +11,15 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-RESERVED_SECTIONS = {"preset", "guardrails", "secrets", "libraries", "comprehension"}
+from ._shared import harness_toml, turn_record
+
+# Accepted and ignored at the top level; one definition, shared with nhctl's doctor (§6.9).
+RESERVED_SECTIONS = harness_toml.RESERVED_SECTIONS
+# A [lint.rules] level; "ask" holds the cell for the user's yes (design §6.4).
+RULE_LEVELS = ("off", "hint", "error", "ask")
+# The rules that can ask: each one's finding carries the user's question (design §6.4).
+ASK_RULES = frozenset({"package_install", "network", "outside_write"})
+HEADLESS_ENV = "NH_HEADLESS"
 
 
 def _packaged_defaults() -> dict[str, Any]:
@@ -68,27 +77,63 @@ def load(project: Path | None) -> Config:
     data = copy.deepcopy(DEFAULTS)
     problems: list[str] = []
     mtime = None
+    # Bound for every project, None too: the preset is read from it below (design §6.9).
+    user: dict[str, Any] = {}
     if project is not None:
         path = project / "harness.toml"
         try:
             mtime = path.stat().st_mtime
             user = tomllib.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            user = {}
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            user = {}
+            pass
+        except (OSError, ValueError) as exc:  # a TOML error, or a file that isn't UTF-8
             problems.append(f"harness.toml unreadable: {exc}")
-        _merge(data, user, "", problems)
+    # defaults < the preset's overlay < the user's own keys < NH_* (design §6.9).
+    level, valid = harness_toml.preset_level(user)
+    _merge(data, harness_toml.PRESET_OVERLAY[level], "", problems)
+    _merge(data, _without_level(user), "", problems)
+    data["preset"]["level"] = level
+    if not valid and isinstance(user.get("preset"), dict):
+        problems.append(f"preset.level must be {'|'.join(harness_toml.PRESET_LEVELS)}")
     _apply_env(data)
     for key, value in data["lint"]["rules"].items():
-        if value not in ("off", "hint", "error"):
-            problems.append(f"lint.rules.{key} must be off|hint|error")
+        levels = rule_levels(key)
+        if value not in levels:
+            problems.append(f"lint.rules.{key} must be {'|'.join(levels)}")
             data["lint"]["rules"][key] = DEFAULTS["lint"]["rules"].get(key, "hint")
+    # The most steps one approved batch writes (design §6.3): an integer from 2 to 20.
+    if not turn_record.valid_max_batch(data["turn"]["max_batch"]):
+        least, most = turn_record.MAX_BATCH_RANGE
+        problems.append(f"turn.max_batch must be an integer from {least} to {most}")
+        data["turn"]["max_batch"] = DEFAULTS["turn"]["max_batch"]
     return Config(data=data, problems=problems, source_mtime=mtime)
 
 
+def _without_level(user: dict[str, Any]) -> dict[str, Any]:
+    """``user`` without ``[preset] level``: ``load`` reads the level itself, so a bad one gets
+    one problem ("must be junior|senior"), not ``_merge``'s "must be str" too."""
+    table = user.get("preset")
+    if not isinstance(table, dict) or "level" not in table:
+        return user
+    return {**user, "preset": {k: v for k, v in table.items() if k != "level"}}
+
+
+def rule_levels(key: str) -> tuple[str, ...]:
+    """The levels a [lint.rules] key takes: "ask" only for a rule that can ask (design §6.4)."""
+    return RULE_LEVELS if key in ASK_RULES else tuple(v for v in RULE_LEVELS if v != "ask")
+
+
+def headless() -> bool:
+    """``NH_HEADLESS=1``: a run with nobody to answer. Set it for an unattended ``claude -p``
+    run: nothing sets it for you, and nh doesn't treat ``-p`` as headless by itself, since a
+    print-mode run can still carry the user's next message (design §6.4, spike V13). No approval
+    prompt, and no yes can arrive for a question nh asks, so E122 stands (design §6.4).
+    ``.mcp.json`` forwards it; unset, it arrives as "", which isn't headless."""
+    return os.environ.get(HEADLESS_ENV) == "1"
+
+
 def _apply_env(data: dict[str, Any]) -> None:
-    if os.environ.get("NH_HEADLESS") == "1":
+    if headless():
         data["approval"]["approve_before_run"] = False
     if url := os.environ.get("NH_JUPYTER_URL"):
         data["jupyter"]["url"] = url

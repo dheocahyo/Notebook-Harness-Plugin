@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -65,6 +66,17 @@ needs_system_python = pytest.mark.skipif(
     SYSTEM_VERSION is None or SYSTEM_VERSION < (3, 9),
     reason="needs /usr/bin/python3 >= 3.9 (the hooks' floor)",
 )
+
+
+def p95(samples: list[float]) -> float:
+    ordered = sorted(samples)
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def hook_time_factor() -> float:
+    """The margin over the 150 ms hook budget: x1.5, x2 when CI is set, absorbs a busy machine;
+    NH_HOOK_TIME_FACTOR=1 checks the bare budget."""
+    return float(os.environ.get("NH_HOOK_TIME_FACTOR", "2" if os.environ.get("CI") else "1.5"))
 
 
 def lock_hash(root: Path = PLUGIN) -> str:

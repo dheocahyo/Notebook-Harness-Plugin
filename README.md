@@ -11,7 +11,9 @@ your files.
 
 - **One cell per message.** The agent adds one code cell, runs it in your
   kernel and reports the real output. Your next message reviews it. Big asks
-  get a numbered plan, not a notebook full of code.
+  get a numbered plan, not a notebook full of code (`/nh:plan <goal>` asks for
+  one), and "run the next 3" writes several of its steps in one reply, after
+  one question and your yes.
 - **Notes.** Above each cell: a title of at most 8 words and 2-5 bullets on
   what the cell does and why. Your ask is kept in the cell's metadata, so the
   notebook carries its own intent trail.
@@ -24,8 +26,20 @@ your files.
   code, real output and kernel variables without running anything. The
   writer may fix the cell from QA's findings (twice by default) before
   Claude replies. It is still one cell per message, and one undo removes it.
-- **Guardrails.** No package installs from cells, no raw `.ipynb` edits, no
-  writes from subagents except nh's own cell writer inside `/nh:qa-cell`.
+  A cell nh asks you about first comes back to Claude, which asks you and,
+  after your yes, writes it itself without a QA check.
+- **Review.** `/nh:review` runs a copy of the notebook top to bottom in a
+  separate kernel and reports the cells that fail, hidden state (a name a cell
+  reads before the cell that defines it, cells run out of order), long cells
+  to move to `src/`, and each cell's intent by heading. Your kernel and the
+  notebook stay as they are. Cells that would install packages, reach a host
+  your project hasn't approved, write outside the project (`/tmp` aside) or
+  show a secret, or that nh can't parse, run there only after your
+  `/nh:review yes`.
+- **Guardrails.** No raw `.ipynb` edits, no cells that print an env var's
+  value, no writes from subagents except nh's own cell writer inside
+  `/nh:qa-cell`, and a cell that installs packages, reaches a host your
+  project hasn't approved, or writes outside the project, waits for your yes.
   nh's server enforces every rule and refuses what it can't verify.
 
 ## Requirements
@@ -89,10 +103,18 @@ each column's type, nulls and distinct values. On the uv path this takes under
    different, the real numbers (surprises first), any failed attempts, and one
    proposed next cell.
 5. You review: **go** (the proposed cell), **edit …**, **undo**, **explain**
-   (a walkthrough in chat) or **tidy** (apply the readability hints).
+   (a numbered walkthrough in chat, also as `/nh:explain`; nh blocks notebook
+   changes in that message unless it also names one, such as "fix" or "add")
+   or **tidy** (apply the readability hints).
 
 If a cell fails, the agent fixes it in place, at most twice, then explains the
 error in plain words.
+
+After a plan, **run the next 3** gets one question, "Run steps 1-3 in one
+reply?", and no cell. Your whole-message **yes** (or **go**) then writes those
+steps in order, one cell each with a short report after each, and the batch
+stops at the first error, "check this" finding or nh question. Any other answer
+gets no batch (at most one cell).
 
 ## Settings
 
@@ -120,6 +142,10 @@ work, run `/nh:status` and see [docs/troubleshooting.md](docs/troubleshooting.md
 - Blocking shell commands that edit notebooks is best effort. For Claude
   Code's own edit tools, the deny rule `/nh:init` offers makes the block a hard
   permission rule.
+- nh shows the agent secrets from `.env` and the environment as
+  `[redacted:NAME]` (outputs, errors, cell code, nhctl's output); the notebook
+  keeps the real values. It can miss a secret inside an image, an encoded one
+  (base64, URL-encoded) and a short value (under 8 characters).
 
 ## Repository layout
 
@@ -200,6 +226,21 @@ The MCP tools are mocked from `evals/mocks/nh/` (and a case's own `mocks/`).
 The mock results follow the gateway's real output: `tests/unit/test_skill_files.py`
 replays each mocked call on the eval fixture with the fake backend and fails
 when a mock's shape (lead lines, first line, `nh:` line, sections) drifts.
+`error-retry` uses `type: agent` mocks instead, so a run can fail, retry and
+fix its cell: a model plays the gateway from the templates, rules and data
+facts in `error-retry/mocks/nh/fixtures/nh-server.md`. The same test file
+replays the states `AGENT_SCENARIOS` lists and fails when a template
+(placeholders aside) drifts from the gateway's text in one of them, when the
+"Which template" rule for a state stops naming its template, or when one of
+the placeholder rules it checks (run numbers, retry and undo counts, cell
+names, self-check forms and order, variable lines, error summary, cut output)
+no longer holds. The file states pandas 2.2.3's error texts and dtypes;
+`test_nh_server_pandas_facts` checks them only where pandas 2.2.3 is
+installed. What the mock model plays is close to the gateway, not identical:
+its self-check lines and headlines can differ (no grader reads them), it
+never shows readability hints, and its tracebacks show only the cell's own
+frame, as the test backend's do. Refusals start with `ERROR: `, which
+`claude plugin eval` turns into a tool error, as the gateway returns them.
 `_tools.json` is a saved copy of the server's tool list, generated by
 `scripts/dump_tools.py`; regenerate it when a tool's parameters or description
 change.

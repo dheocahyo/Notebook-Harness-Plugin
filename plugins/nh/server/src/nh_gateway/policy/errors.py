@@ -5,11 +5,9 @@ The first line is written for the human (Claude Code shows it in red); ``Next:``
 
 from __future__ import annotations
 
-import re
-
 from fastmcp.exceptions import ToolError
 
-_TOKEN = re.compile(r"(token=)[^&\s\"']+", re.IGNORECASE)
+from .._shared import secrets
 
 # The Next line of nh:cell-writer's refusals: its final answer goes to the nh:qa-cell workflow.
 RETURN_TO_WORKFLOW = (
@@ -17,6 +15,12 @@ RETURN_TO_WORKFLOW = (
 )
 # Added after Next: to a refusal of a writer's tool call (E120 excepted: fix and call again).
 WRITER_LINE = "Writer: return this refusal to the workflow; don't retry or reply to the user."
+# E109's Next line, by the turn's mode (design §6.2): what to do in chat instead of writing.
+E109_NEXT = {
+    "explain": "Answer in chat with a numbered walkthrough; write nothing this message.",
+    "plan": "Reply with the numbered plan; write nothing this message.",
+    "ask": "Ask the user the one question; write nothing until they reply.",
+}
 
 CATALOGUE: dict[str, tuple[str, str]] = {
     # code: (first line, next step)
@@ -54,6 +58,10 @@ CATALOGUE: dict[str, tuple[str, str]] = {
         "Not {verb}: the nh:qa-cell workflow is writing this message's cell.",
         "Tell the user it is still writing and checking the cell; reply when its report arrives. "
         "To change course, stop it first.",
+    ),
+    "E109": (
+        "Not {verb}: no notebook change in an explain, plan or ask message.",
+        E109_NEXT["explain"],
     ),
     "E110": (
         "Not written (by design): one new cell per message, and this message's cell is {cell}.",
@@ -96,6 +104,23 @@ CATALOGUE: dict[str, tuple[str, str]] = {
     "E121": (
         "Not written: too many rejected attempts this message.",
         "Explain to the user what you are trying to write and ask how to proceed.",
+    ),
+    "E122": (
+        "Not {verb}: this needs the user's yes first.",
+        "Ask the user nh's question, then stop. After a yes, send the same call again.",
+    ),
+    "E123": (
+        "Not {verb}: the approved {what} stopped at step {step}; nh changes nothing more this "
+        "message.",
+        "Report the batch to the user: what each step did, then where and why it stopped (the "
+        "error, the 'check this' finding or nh's question). No retry and no new cell this "
+        "message; wait for the user.",
+    ),
+    "E125": (
+        "Not written: the code holds nh's [redacted:…] marker, not the real value.",
+        # nh doesn't load .env into the kernel: os.environ alone misses a .env value (C3 review)
+        "Read the value from the environment or the project's .env without printing it, "
+        "or ask the user to edit that line in JupyterLab.",
     ),
     "E130": (
         "nh can't find this project's JupyterLab.",
@@ -165,18 +190,27 @@ CATALOGUE: dict[str, tuple[str, str]] = {
 
 
 def scrub(text: str) -> str:
-    return _TOKEN.sub(r"\1***", text)
+    """The installed redactor (design §6.8): every refusal, log line and error text."""
+    return secrets.current().redact(text)
 
 
 class NhError(ToolError):
     """A refusal. ``detail`` fills a ``{detail}`` slot in the first line, or else gets its own
-    line; ``next_step`` replaces the catalogue's Next line; ``cell_id`` goes on the machine line."""
+    line; ``next_step`` replaces the catalogue's Next line; ``head`` replaces its first line (a
+    template filled like it); ``cell_id`` goes on the machine line."""
 
     def __init__(
-        self, code: str, detail: str = "", *, next_step: str | None = None, **fields: object
+        self,
+        code: str,
+        detail: str = "",
+        *,
+        next_step: str | None = None,
+        head: str | None = None,
+        **fields: object,
     ) -> None:
         self.code = code
-        head, nxt = CATALOGUE[code]
+        default_head, nxt = CATALOGUE[code]
+        head = head or default_head
         defaults: dict[str, object] = {
             "verb": "written",
             "detail": "",
@@ -189,6 +223,8 @@ class NhError(ToolError):
             "url": "",
             "cell_id": "",
             "previous": "none",
+            "what": "batch",
+            "step": "k",
         }
         defaults.update({k: v for k, v in fields.items() if v is not None})
         inline = "{detail}" in head

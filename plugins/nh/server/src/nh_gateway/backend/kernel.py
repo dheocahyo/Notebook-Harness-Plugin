@@ -11,7 +11,10 @@ from . import rest  # first: it sets NO_PROXY before websocket-client is importe
 
 # isort: split
 
+import codecs
 import contextlib
+import importlib
+import logging
 import queue
 import re
 import threading
@@ -24,6 +27,98 @@ from jupyter_kernel_client import JupyterKernelClient
 
 from ..policy.errors import NhError, scrub
 from .base import ServerInfo
+
+log = logging.getLogger("nh_gateway.kernel")
+
+
+def _no_check(*args: Any, **kwargs: Any) -> bool:
+    raise TypeError("websocket-client's own UTF-8 check was not found")
+
+
+_upstream_utf8: Callable[..., bool] = _no_check  # websocket-client's own check, once replaced
+_unknown_call_logged = False
+# A lead byte's second byte where it is narrower than 80-BF (RFC 3629): no overlong form, no
+# surrogate, nothing past U+10FFFF.
+_SECOND_BYTE = {0xE0: (0xA0, 0xBF), 0xED: (0x80, 0x9F), 0xF0: (0x90, 0xBF), 0xF4: (0x80, 0x8F)}
+
+
+def _plain_text(data: Any) -> bool:
+    """bytes, bytearray, str, or a plain byte memoryview: what websocket-client passes."""
+    if isinstance(data, memoryview):
+        return data.format == "B" and data.c_contiguous
+    return isinstance(data, (bytes, bytearray, str))
+
+
+def validate_utf8(data: Any, *args: Any, **kwargs: Any) -> bool:
+    """websocket-client's UTF-8 check of each text frame and close reason nh's kernel clients
+    receive, by the C decoder.
+
+    Its own is a pure-Python loop over every byte unless ``wsaccel`` is installed: ~0.2 s per MB
+    on the gateway's receive thread, holding the GIL (a 50 MB stream took ~10 s more than the
+    kernel did; design §6.13). This answers as it does: False from the first byte that can't
+    continue UTF-8 (an overlong form, a surrogate, past U+10FFFF, a stray continuation byte),
+    True for valid text and for a sequence cut at the end (which ``WebSocketApp``'s decode of a
+    text frame then refuses, and its close-reason decode replaces, as before). A call this
+    doesn't know (other arguments or types) goes to websocket-client's own check.
+    """
+    global _unknown_call_logged
+    if args or kwargs or not _plain_text(data):
+        if not _unknown_call_logged:
+            _unknown_call_logged = True
+            log.warning("websocket-client called nh's UTF-8 check in a new way; its own is used")
+        return _upstream_utf8(data, *args, **kwargs)
+    if isinstance(data, str):  # as websocket-client's own: lone surrogates fail
+        data = data.encode("utf-8", "surrogatepass")
+    try:
+        _, done = codecs.utf_8_decode(data, "strict", False)  # final=False: a cut end is no error
+    except UnicodeDecodeError:
+        return False
+    tail = bytes(data[done:])  # a sequence cut at the end, at most 3 bytes: can it still be one?
+    if len(tail) > 1:  # (CPython's decoder lets a cut surrogate, ED A0-BF, through)
+        low, high = _SECOND_BYTE.get(tail[0], (0x80, 0xBF))
+        return low <= tail[1] <= high and all(0x80 <= byte <= 0xBF for byte in tail[2:])
+    return True
+
+
+def install_utf8_check() -> str | None:
+    """Put :func:`validate_utf8` where websocket-client's frame reader calls it: the name
+    ``websocket._abnf`` imports from ``websocket._utils`` (``continuous_frame.extract`` for text
+    frames, ``ABNF.validate`` for close frames). Both are private, so only when they are as
+    expected; else the reason, and the gateway keeps websocket-client's own check (only slower,
+    noted once by :func:`note_utf8_check`). ``tests/unit/test_kernel_utf8.py`` pins the reader.
+    """
+    global _upstream_utf8
+    try:
+        abnf = importlib.import_module("websocket._abnf")
+        utils = importlib.import_module("websocket._utils")
+    except Exception as exc:  # gone, renamed, or failing to import: never the gateway's import
+        return f"websocket-client's modules changed ({type(exc).__name__}: {exc})"
+    current = getattr(abnf, "validate_utf8", None)
+    if current is validate_utf8:
+        return None
+    if current is None or current is not getattr(utils, "validate_utf8", None):
+        return "websocket-client's frame reader no longer calls websocket._utils.validate_utf8"
+    _upstream_utf8 = current
+    abnf.validate_utf8 = validate_utf8  # type: ignore[attr-defined]
+    return None
+
+
+UTF8_CHECK_NOTE = install_utf8_check()
+_utf8_noted = False
+
+
+def note_utf8_check() -> None:
+    """Log once, at the first kernel connection (gateway.log is open by then), when
+    :func:`install_utf8_check` left websocket-client's own check in place."""
+    global _utf8_noted
+    if UTF8_CHECK_NOTE and not _utf8_noted:
+        _utf8_noted = True
+        log.warning(
+            "nh's fast UTF-8 check for kernel messages is not installed (%s): kernel output of "
+            "many MB is received more slowly",
+            UTF8_CHECK_NOTE,
+        )
+
 
 PumpState = Literal["idle", "timeout", "abort", "lost"]
 UUID_NAME = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -335,8 +430,18 @@ def attach_session(
 # ---------------------------------------------------------------------------- clients
 
 
-def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> JupyterKernelClient:
-    """Connect a websocket client to an existing kernel. Never starts or owns a kernel."""
+CONNECT_SETTLE_S = 0.02  # nothing is sent on a new connection sooner (design §6.13)
+RETRY_SETTLE_S = 0.1  # the same for a connection that replaces an unanswered one
+CHECK_TIMEOUT_S = 0.5  # an idle kernel's first answer to the check came within ~5-50 ms here
+CHECK_POLL_S = 0.002  # how often the check reads the connection's queues
+CONNECT_ATTEMPTS = 3
+STARTING_WAIT_S = 10.0  # how long a new kernel's "starting" is waited out before the check
+STARTING_POLL_S = 0.05
+_unanswered_logged = False
+
+
+def _connect(server: ServerInfo, kernel_id: str, timeout: float) -> JupyterKernelClient:
+    """One websocket client for an existing kernel, unchecked."""
     try:
         kc = JupyterKernelClient(
             server_url=server.url.rstrip("/"),
@@ -356,6 +461,155 @@ def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> Ju
         close_client(kc)
         raise NhError("E134", detail=" (couldn't open the kernel's websocket)")
     return kc
+
+
+def _idle(server: ServerInfo, kernel_id: str) -> bool:
+    """nh's own GET of the kernel model says ``idle``. Any other state, a 404 or an error is no.
+
+    A new kernel reads ``starting`` until its first other status, which the server's nudge of
+    each new connection brings about once the kernel is up: that is waited out, polling every
+    ``STARTING_POLL_S`` for at most ``STARTING_WAIT_S`` (design §6.13: connections to a kernel
+    just started were dead as often as others, and went unchecked)."""
+    until = time.monotonic() + STARTING_WAIT_S
+    while True:
+        try:
+            model = rest.Rest(server).kernel(kernel_id)
+        except Exception as exc:  # RestError, ServerGone, a body that isn't JSON: unknown
+            log.debug("kernel %s: no state for the connection check (%s)", kernel_id, exc)
+            return False
+        state = model.get("execution_state") if model else None
+        if state != "starting" or time.monotonic() >= until:
+            return state == "idle"
+        time.sleep(STARTING_POLL_S)
+
+
+def ask(client: Any) -> str | None:
+    """Send the connection check, a ``kernel_info_request`` on the shell channel: its msg_id, or
+    None when the socket closed under us (that check is never answered)."""
+    try:
+        return client.kernel_info()
+    except Exception as exc:
+        log.debug("kernel_info_request not sent: %s", exc)
+        return None
+
+
+def heard(client: Any, msg_id: str | None) -> str | None:
+    """The type of the first queued message whose parent is the check ``msg_id``, or None.
+
+    Its busy status on iopub or its reply on shell: either shows the kernel took the request,
+    and a dead connection shows neither. Doesn't wait. The messages read before it are dropped
+    (``KernelRequest.send()`` drops whatever is queued anyway); the ones after it stay queued.
+    """
+    if msg_id is None:
+        return None
+    for channel in (client.iopub_channel, client.shell_channel):
+        while True:
+            try:
+                msg = channel.get_msg(timeout=0)
+            except queue.Empty:
+                break
+            if (msg.get("parent_header") or {}).get("msg_id") == msg_id:
+                return str((msg.get("header") or {}).get("msg_type") or msg.get("msg_type"))
+    return None
+
+
+def answered(client: Any, msg_id: str | None, timeout: float) -> str | None:
+    """The type of the websocket client's first answer to its check ``msg_id`` within
+    ``timeout``, or None at the timeout, or once it isn't connected."""
+    until = time.monotonic() + timeout
+    while True:
+        kind = heard(client, msg_id)
+        if kind is not None:
+            return kind
+        left = until - time.monotonic()
+        if left <= 0 or not client.connection_ready.is_set():
+            return None
+        time.sleep(min(left, CHECK_POLL_S))
+
+
+def open_client(server: ServerInfo, kernel_id: str, timeout: float = 10.0) -> JupyterKernelClient:
+    """Connect a websocket client to an existing kernel. Never starts or owns a kernel.
+
+    A new kernel websocket whose first request comes right after the handshake is sometimes
+    stuck: the kernel doesn't run its requests until another connection to it opens (design
+    §6.13: ipykernel 7.3.0 behind jupyter_server 2.21.1). Nothing is sent on it for
+    ``CONNECT_SETTLE_S``, and when nh's own GET says the kernel is idle, it must answer a
+    ``kernel_info_request`` (its busy or its reply) within ``CHECK_TIMEOUT_S``. Else nh connects
+    again, settling ``RETRY_SETTLE_S``, at most ``CONNECT_ATTEMPTS`` connections in all, and
+    uses the first that answers its own check in time. An unanswered one's later answer passes
+    no check (a stuck one answers once the next connection opens, and used then, it sometimes
+    missed the request after: design §6.13; a slow kernel answers the newer one's check right
+    after the earlier one's). It counts only when none answers in time: then the newest still
+    open that answered since is used, else the last (as before the check). The others are
+    closed in a thread once nh has its connection (a stuck one's close can take ~10 s), never
+    the kernel. A new kernel's ``starting`` is waited out first (``_idle``); a kernel that isn't
+    idle then is not checked: a busy one would answer only after its running cell.
+    """
+    global _unanswered_logged
+    note_utf8_check()
+    began = time.monotonic()
+    clients = [_connect(server, kernel_id, timeout)]
+    checks: list[str | None] = []  # each checked connection's msg_id, in order
+    kept: JupyterKernelClient | None = None
+    try:
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            if attempt > 1:
+                log.info(
+                    "kernel %s: no answer to a new connection's kernel_info_request in %.1fs; "
+                    "connecting again (attempt %d of %d)",
+                    kernel_id,
+                    CHECK_TIMEOUT_S,
+                    attempt,
+                    CONNECT_ATTEMPTS,
+                )
+                clients.append(_connect(server, kernel_id, timeout))
+            kc = clients[-1]
+            settled = time.monotonic() + (CONNECT_SETTLE_S if attempt == 1 else RETRY_SETTLE_S)
+            idle = _idle(server, kernel_id)
+            time.sleep(max(0.0, settled - time.monotonic()))
+            if not idle:
+                kept = kc
+                return kc
+            sent = time.monotonic()
+            checks.append(ask(kc._manager.client))
+            kind = answered(kc._manager.client, checks[-1], CHECK_TIMEOUT_S)
+            if kind is not None:
+                log.debug("connection check answered (%s) in %.3fs", kind, time.monotonic() - sent)
+                kept = kc
+                return kc
+        late = [  # answered since, and still open; nothing here waits
+            c
+            for c, msg_id in zip(clients, checks, strict=True)
+            if c._manager.client.connection_ready.is_set()
+            and heard(c._manager.client, msg_id) is not None
+        ]
+        kept = late[-1] if late else clients[-1]
+        log.info(
+            "kernel %s: no new connection answered nh's kernel_info_request in its window; "
+            "nh keeps connection %d of %d, %s",
+            kernel_id,
+            clients.index(kept) + 1,
+            len(clients),
+            "which answered after its window"
+            if late
+            else "the last, as none still open answered after its window",
+        )
+        if not _unanswered_logged:
+            _unanswered_logged = True
+            log.warning(
+                "kernel %s: none of %d new connections answered nh's kernel_info_request in "
+                "%.1fs (stuck connections, or a kernel too slow to answer); nh uses the newest "
+                "that answered since and is still open, else the last one, and a probe or run on "
+                "it may wait for its timeout",
+                kernel_id,
+                CONNECT_ATTEMPTS,
+                time.monotonic() - began,
+            )
+        return kept
+    finally:
+        for other in clients:
+            if other is not kept:
+                close_client_later(other)
 
 
 def close_client(kc: JupyterKernelClient | None) -> None:
@@ -388,6 +642,7 @@ class KernelHandle:
     prefix: str | None = None
     executable: str | None = None
     incarnation: str | None = None  # the kernel process (pid and start), from the attach probe
+    retire_probe: bool = False  # a run started during a probe: it retires its client at its end
 
     def client(self, role: Literal["exec", "probe"], server: ServerInfo) -> Any:
         """The connected websocket client for ``role``, reconnecting if its socket dropped. Blocking."""

@@ -35,6 +35,9 @@ the diff. If the notebook already loads data, the loader cell is skipped.
 
 - `harness.toml`: project settings; commit it. Every key is optional.
 - `.claude/settings.json`: the optional deny rule from step 4.
-- `.nh/state/`: turns, stamps, last cell, env and JupyterLab records.
+- `.nh/state/`: turns, stamps, last cell, env and JupyterLab records, and
+  `approved_hosts.json`: the hosts a cell may reach without nh asking first
+  (the data URL's, from `/nh:init`, and any you add by hand). `.nh/` is
+  git-ignored, so this list is local to this clone.
 - `.nh/history/`: each nh cell's previous versions, used by undo.
 - `.nh/logs/`: gateway, hook and JupyterLab logs.

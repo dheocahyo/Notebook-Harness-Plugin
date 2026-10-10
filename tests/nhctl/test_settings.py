@@ -67,3 +67,23 @@ def test_invalid_json_is_left_alone(env, nh_project):
 def test_needs_an_nh_project(env, project):
     report = env.json("settings", "apply", "--yes", cwd=project, expect=1)
     assert report["error"]["code"] == "D105"
+
+
+def test_what_it_prints_is_redacted_and_the_file_keeps_the_values(env, nh_project):
+    """Everything nhctl prints passes the project's redactor (design §6.8); files stay raw."""
+    password = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; also in the project's .env
+    github = "ghp_" + "Qw3rTy8uIoP1aSdF" + "gH5jKl0ZxCvBnM2qWeRt"  # fake; matches a pattern
+    (nh_project / ".env").write_text(f"DB_PASSWORD={password}\n")
+    settings = nh_project / ".claude/settings.json"
+    settings.parent.mkdir()
+    original = {"env": {"DB_PASSWORD": password, "GH_TOKEN": github}, "permissions": {}}
+    settings.write_text(json.dumps(original, indent=2))
+    report = env.json("settings", "apply", cwd=nh_project, expect=2)
+    assert '"DB_PASSWORD": "[redacted:DB_PASSWORD]",' in report["diff"]
+    assert '"GH_TOKEN": "[redacted:github-token]"' in report["diff"]
+    human = env.run("settings", "apply", cwd=nh_project)
+    assert '"DB_PASSWORD": "[redacted:DB_PASSWORD]",' in human.stdout
+    for out in (json.dumps(report), human.stdout, human.stderr):
+        assert password not in out and github not in out
+    env.json("settings", "apply", "--yes", cwd=nh_project)
+    assert json.loads(settings.read_text())["env"] == original["env"]

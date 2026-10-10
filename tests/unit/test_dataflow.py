@@ -153,6 +153,58 @@ def test_comprehension_first_iterable_is_read_outside() -> None:
     assert uses("pairs = [(a, b) for a in left for b in right if a < b]") == {"left", "right"}
 
 
+# now and later (/nh:review, design §6.10) --------------------------------------------------------
+@pytest.mark.parametrize(
+    ("source", "now", "later"),
+    [
+        ("df = df.dropna()", {"df"}, set()),  # read before the cell's own binding: uses has it too
+        ("counter += 1", {"counter"}, set()),
+        ("print(total)\ntotal = 1", {"print", "total"}, set()),
+        ("x = 1\nprint(x)", {"print"}, set()),
+        ("for i in range(3):\n    total = i\ntotal", {"range"}, set()),  # a branch's binding
+        ("if c:\n    y = 1\nprint(y)", {"c", "print"}, set()),
+        ("def plot():\n    return df_clean.head()", set(), {"df_clean"}),
+        ("def f():\n    return later\nlater = 1\nf()", set(), {"later"}),
+        ("g = lambda: later2", set(), {"later2"}),
+        ("sorted(xs, key=lambda x: weights[x])", {"sorted", "xs"}, {"weights"}),
+        (
+            "class A(Base):\n    k = K\n    def m(self):\n        return later",
+            {"Base", "K"},
+            {"later"},
+        ),
+        ("@deco\ndef f(a=default):\n    return body", {"deco", "default"}, {"body"}),
+        ("[x * k for x in xs]", {"k", "xs"}, set()),
+        ("[lambda: y for _ in xs]", {"xs"}, {"y"}),
+        ("del gone", {"gone"}, set()),
+    ],
+)
+def test_now_and_later_reads(source: str, now: set[str], later: set[str]) -> None:
+    flow = analyze(source)
+    assert (set(flow.now), set(flow.later)) == (now, later)
+    assert set(flow.now) <= set(flow.uses)  # uses (L120, stale marking) is unchanged
+
+
+def test_now_is_everything_when_nh_cant_read_the_cell() -> None:
+    for source in ("x = (", "%%time\nz = compute(a)"):
+        assert set(analyze(source).now) == {EVERYTHING}
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("try:\n    pass\nexcept Exception as e:\n    class A:\n        def m(self): return e", {"Exception"}),
+        ("try:\n    pass\nexcept Exception as e:\n    fs = [lambda: e for _ in range(2)]", {"Exception", "range"}),
+    ],
+)  # fmt: skip
+def test_later_reads_leave_uses_as_it_was(source: str, expected: set[str]) -> None:
+    """A method's or a comprehension lambda's free names join Flow.later only: uses, which L120
+    and stale marking read, stays what it was before /nh:review (an except handler's name in
+    scope isn't a use)."""
+    flow = analyze(source)
+    assert uses(source) == expected
+    assert "e" in flow.later and "e" not in flow.now
+
+
 # magics and unparsable cells --------------------------------------------------------------------
 def test_unparsable_cell_uses_everything() -> None:
     assert defs_uses("x = (") == (set(), {EVERYTHING}, False)

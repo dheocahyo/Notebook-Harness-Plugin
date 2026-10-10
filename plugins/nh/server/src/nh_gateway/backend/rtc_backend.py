@@ -22,6 +22,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, TypeVar
 
+from .._shared import secrets
 from .._shared.paths import Layout, atomic_write_json, read_json, safe_name
 from ..config import ConfigCache
 from ..exec import probes
@@ -114,6 +115,7 @@ class RtcBackend:
         self._notices: dict[str, list[str]] = {}
         self._disk = DiskReadBackend(layout.project, cfg_cache)
         self._janitor: asyncio.Task[None] | None = None
+        self._saves: set[asyncio.Future[None]] = set()  # save requests after runs, kept alive
 
     async def _retry(self, op: Callable[[], Awaitable[T]]) -> T:
         """Run ``op``; when the server went away or changed its token, rediscover it and run it once more.
@@ -164,6 +166,7 @@ class RtcBackend:
                 info = await asyncio.get_running_loop().run_in_executor(
                     self._pool, partial(discovery.discover, self.layout.project, cfg)
                 )
+                secrets.add_value("JUPYTER_TOKEN", info.token)  # redacted from now on (§6.8)
                 self._env_gate()
                 self._api = rest.Rest(info, self._pool)
                 if self._janitor is None or self._janitor.done():
@@ -293,7 +296,7 @@ class RtcBackend:
             with contextlib.suppress(OSError):
                 self._running_file(cell_id).unlink()
         if stuck:
-            await doc.settle()
+            await doc.save()
             self._note(
                 ref,
                 f"{len(stuck)} nh cell(s) were still marked running from an earlier nh session; "
@@ -376,25 +379,25 @@ class RtcBackend:
         doc = await self._retry(lambda: self._doc(ref))
         doc.set_meta(key, value)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
 
     async def insert_cells(self, ref: NotebookRef, index: int, cells: list[NewCell]) -> None:
         doc = await self._retry(lambda: self._doc(ref))
         doc.insert(index, cells)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
 
     async def update_cells(self, ref: NotebookRef, patches: list[CellPatch]) -> None:
         doc = await self._retry(lambda: self._doc(ref))
         doc.update(patches)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
 
     async def delete_cells(self, ref: NotebookRef, ids: list[str]) -> list[CellView]:
         doc = await self._retry(lambda: self._doc(ref))
         deleted = doc.delete(ids)
         self._after_write(ref, doc)
-        await doc.settle()
+        await doc.save()
         return deleted
 
     # ------------------------------------------------------------------ kernel
@@ -479,15 +482,23 @@ class RtcBackend:
         timeout: float,
     ) -> dict[str, Any]:
         def work() -> dict[str, Any]:
-            client = handle.client("probe", api.server)
-            return probes.run_probe(
-                client,
-                name,
-                args,
-                timeout,
-                lock=handle.probe_lock,
-                interrupt=lambda: api.interrupt(handle.kernel_id),  # only ever stops nh's own probe
-            )
+            # The lock covers the connect too: a run starting now sees this probe (design §6.13).
+            if not handle.probe_lock.acquire(timeout=timeout):
+                return {"error": "KernelBusy: another probe is still running"}
+            try:
+                client = handle.client("probe", api.server)
+                return probes.run_probe(
+                    client,
+                    name,
+                    args,
+                    timeout,
+                    interrupt=lambda: api.interrupt(handle.kernel_id),  # only nh's own probe
+                )
+            finally:
+                if handle.retire_probe:  # a run started meanwhile: don't decode the rest of it
+                    handle.retire_probe = False
+                    handle.retire("probe")
+                handle.probe_lock.release()
 
         return await in_daemon_thread(work, name="nh-probe")
 
@@ -559,9 +570,13 @@ class RtcBackend:
     def _running_file(self, cell_id: str) -> Path:
         return self.layout.running / f"{safe_name(cell_id)}.json"
 
-    def _run_done(self, cell_id: str) -> None:
+    def _run_done(self, cell_id: str, doc: RtcDocument) -> None:
+        """A run ended: drop its record and have the room save its outputs (design §6.13)."""
         with contextlib.suppress(OSError):
             self._running_file(cell_id).unlink()
+        task = asyncio.ensure_future(doc.save())
+        self._saves.add(task)
+        task.add_done_callback(self._saves.discard)
 
     def _marked_running(self, ref: NotebookRef) -> set[str] | None:
         """Ids of the cells the notebook marks running; None when nh has no synced copy of it."""
@@ -632,7 +647,9 @@ class RtcBackend:
             return doc, handle
 
         doc, handle = await self._retry(prepare)
-        if not handle.probe_lock.locked():
+        if handle.probe_lock.locked():  # a probe is connecting or running: it retires its client
+            handle.retire_probe = True
+        else:
             handle.retire("probe")  # its socket would decode every message of this run again
         client = await in_daemon_thread(handle.client, "exec", doc.api.server, name="nh-connect")
         await doc.ensure()  # the room may have dropped while the kernel client connected
@@ -649,7 +666,7 @@ class RtcBackend:
             api=doc.api,
             kernel_id=handle.kernel_id,
             hard_timeout=hard_timeout,
-            on_done=lambda _result: self._run_done(resolved),
+            on_done=lambda _result: self._run_done(resolved, doc),
             on_lost=lambda: handle.retire("exec"),
         )
         execution = runner.start()

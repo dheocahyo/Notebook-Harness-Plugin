@@ -21,8 +21,9 @@ Read-only: change nothing, start nothing, install nothing.
    errors, report that first: the fix is /mcp, pick plugin:nh:nh, Reconnect
    (the first start after installing can take about a minute while nh builds
    its runtime).
-3. Print one line per check, `OK` or `FAIL`, and after each FAIL its fix
-   (from the doctor's `problems[]` or the status view):
+3. Print one line per check, `OK` or `FAIL` (the Preset row prints the
+   level instead), and after each FAIL its fix (from the doctor's
+   `problems[]` or the status view):
 
 | Check | OK when |
 |---|---|
@@ -31,6 +32,7 @@ Read-only: change nothing, start nothing, install nothing.
 | nh runtime | its Python environment is ready |
 | MCP server | `nh_inspect` answered |
 | Project | a `.nh/` folder and `harness.toml` exist here (else: run /nh:init) |
+| Preset | always: print the level, `junior` or `senior` (the doctor's `project.preset`), instead of OK; if `problems[]` has D171, or D131 saying harness.toml can't be parsed (nh then reads junior), print its message and fix |
 | Project env | JupyterLab 4.6+ and jupyter-collaboration 5+ in the project env |
 | JupyterLab | running from the project env, reachable (else: `nhctl lab start`) |
 | Kernel | attached, Python, running from the project env |

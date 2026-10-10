@@ -1,0 +1,8 @@
+---
+type: regex
+target: mock_calls
+pattern: '"tool":\s*"mcp__plugin_nh_nh__(?:nh_add_cell|nh_edit_cell|nh_run|nh_undo|nh_inspect)"'
+match: not_contains
+weight: 15
+arm: both
+---

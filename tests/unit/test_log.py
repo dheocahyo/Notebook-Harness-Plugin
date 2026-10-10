@@ -65,8 +65,12 @@ def test_tokens_are_scrubbed_everywhere(layout: Layout) -> None:
     for secret in ("abc123", "s3cret", "zzz", "kkk"):
         assert secret not in text
     [record] = lines(layout.log_file)  # a token next to a quote still leaves valid JSON
-    assert record["url"].endswith("token=***&y=1")
-    assert record["err"] == 'connect failed: token=***"; retry'
+    assert record["url"].endswith("token=[redacted:token]&y=1")
+    assert record["err"] == 'connect failed: token=[redacted:token]"; retry'
+    assert record["nested"] == {
+        "urls": ["http://h/?TOKEN=[redacted:token]"],
+        "token=[redacted:token]": 1,
+    }
 
 
 def test_code_and_outputs_are_never_stored(layout: Layout) -> None:

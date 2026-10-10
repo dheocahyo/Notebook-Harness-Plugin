@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import importlib.util
+import itertools
 import json
-import math
-import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 from hookenv import (
@@ -20,7 +23,9 @@ from hookenv import (
     Sandbox,
     command_line,
     hook_entries,
+    hook_time_factor,
     needs_system_python,
+    p95,
 )
 
 pytestmark = needs_system_python
@@ -98,6 +103,54 @@ def test_hooks_log_starts_over_past_256_kb(sandbox: Sandbox) -> None:
     sandbox.run_argv(command_line(edit), "[ipynb")
     assert log.stat().st_size < 20 * 1024
     assert "pre-tool file" in log.read_text()
+
+
+PASSWORD = "Sup3r" + "S3cret-Passw0rd-2026"  # fake; under DB_PASSWORD in the project's .env
+
+
+@pytest.fixture
+def hook_main(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """The hook's main module, in process (it prepends its own paths to sys.path)."""
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    path = PLUGIN / "hooks" / "nh_hooks" / "main.py"
+    spec = importlib.util.spec_from_file_location("nh_hook_main_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fail_and_log(sandbox: Sandbox, hook_main: ModuleType) -> str:
+    try:
+        raise RuntimeError(f"connect failed for app:{PASSWORD} via http://h/?token=abc123def")
+    except RuntimeError:
+        hook_main.log_failure(sandbox.project, "pre-tool", "nh")
+    return (sandbox.nh / "logs" / "hooks.log").read_text()
+
+
+def test_the_hooks_log_is_redacted(sandbox: Sandbox, hook_main: ModuleType) -> None:
+    (sandbox.project / ".env").write_text(f"DB_PASSWORD={PASSWORD}\n")
+    log = fail_and_log(sandbox, hook_main)
+    assert (
+        "RuntimeError: connect failed for app:[redacted:DB_PASSWORD] "
+        "via http://h/?token=[redacted:token]"
+    ) in log
+    assert PASSWORD not in log and "abc123def" not in log
+
+
+def test_a_failing_redactor_still_masks_the_token(
+    sandbox: Sandbox, hook_main: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nh_gateway._shared import secrets
+
+    def broken(project: Path) -> secrets.Redactor:
+        raise OSError("unreadable .env")
+
+    monkeypatch.setattr(secrets.Redactor, "for_project", broken)
+    log = fail_and_log(sandbox, hook_main)
+    assert "via http://h/?token=[redacted:token]" in log and "abc123def" not in log
+    assert "pre-tool nh" in log
 
 
 def test_unusable_python_fails_open(sandbox: Sandbox) -> None:
@@ -291,11 +344,6 @@ def test_hooks_import_only_stdlib_and_shared(sandbox, event, variant, tool) -> N
     assert not (sandbox.nh / "logs" / "hooks.log").exists()
 
 
-def p95(samples: list[float]) -> float:
-    ordered = sorted(samples)
-    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
-
-
 @pytest.mark.slow
 def test_hook_latency_p95(sandbox: Sandbox) -> None:
     """p95 < 150 ms per hook on the system 3.9, as users run before the runtime is ready.
@@ -306,7 +354,7 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
     set) absorbs a busy machine; NH_HOOK_TIME_FACTOR=1 checks the bare budget. Measured on
     an M-series Mac: 35-56 ms idle, 80-135 ms at load average 7.
     """
-    factor = float(os.environ.get("NH_HOOK_TIME_FACTOR", "2" if os.environ.get("CI") else "1.5"))
+    factor = hook_time_factor()
     sandbox.ready_runtime()
     env = {k: v for k, v in sandbox.env.items() if k != "NH_PYTHON"}
     (sandbox.project / "harness.toml").write_text('[project]\ngoal = "g"\n')
@@ -329,6 +377,21 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
     def recorded(run: HookRun) -> bool:
         return run.stdout == "" and (sandbox.nh / "state" / "workflows" / "sess-2.json").is_file()
 
+    messages = itertools.count(1)
+
+    def batch_payloads() -> Iterator[dict[str, Any]]:
+        for n in itertools.count(1):
+            for text in ("run the next 3 steps of the plan", "yes"):
+                yield sandbox.payload(
+                    "UserPromptSubmit", prompt_id=f"batch-{n}-{text}", prompt=text
+                )
+
+    batch_messages = batch_payloads()
+    batch_parts = itertools.cycle(("[nh] Ask, don't write", "[nh] Approved batch"))
+
+    def asked_or_approved(run: HookRun) -> bool:
+        return next(batch_parts) in run.context
+
     launch = {"name": "nh:qa-cell", "args": "go"}
     launched = {
         "status": "async_launched",
@@ -343,8 +406,20 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
         "prompt-submit": (
             "UserPromptSubmit",
             None,
-            sandbox.payload("UserPromptSubmit"),
+            # A new message each run: the same prompt id again is one typed mid-turn.
+            lambda: sandbox.payload(
+                "UserPromptSubmit",
+                prompt_id=f"prompt-{next(messages)}",
+                prompt="Load the sales data, then run the next 3 steps of the plan.",
+            ),
             has_context,
+        ),
+        # A batch ask, then its yes (C6b): each reads the turn record and harness.toml.
+        "prompt-submit-batch": (
+            "UserPromptSubmit",
+            None,
+            lambda: next(batch_messages),
+            asked_or_approved,
         ),
         "file": ("PreToolUse", "Edit", sandbox.tool_payload("Edit", {"file_path": nb}), denied),
         "file-skip": (
@@ -388,9 +463,13 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
     report = {}
     for name, (event, tool, payload, check) in cases.items():
         argv = command_line(sandbox.handlers(event, tool)[0])
+
+        def run(argv=argv, payload=payload) -> HookRun:
+            return sandbox.run_argv(argv, payload() if callable(payload) else payload, env)
+
         for _ in range(3):  # warm the bytecode cache and the OS file cache
-            assert check(sandbox.run_argv(argv, payload, env)), name
-        samples = [sandbox.run_argv(argv, payload, env).seconds for _ in range(20)]
+            assert check(run()), name
+        samples = [run().seconds for _ in range(20)]
         report[name] = round(p95(samples) * 1000)
     print("hook p95 ms:", report)
     assert not (sandbox.nh / "logs" / "hooks.log").exists()

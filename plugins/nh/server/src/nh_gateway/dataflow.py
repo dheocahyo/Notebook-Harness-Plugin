@@ -17,7 +17,7 @@ from nh_gateway.lint.magics import Masked, lines_of, mask
 EVERYTHING = "*"
 
 # Cell magics whose body runs as Python in the user namespace.
-_NAMESPACE_CELL_MAGICS = frozenset({"time", "capture", "prun", "debug"})
+NAMESPACE_CELL_MAGICS = frozenset({"time", "capture", "prun", "debug"})
 _SCRIPT_OUTPUT = re.compile(r"--(?:out|err|proc)\s+([A-Za-z_]\w*)")
 _OPEN_MAGIC = re.compile(r"^\s*%(?:run|store\s+-r)\b")
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
@@ -55,9 +55,18 @@ class Flow:
     fresh: frozenset[str]  # names bound unconditionally at top level
     parsed: bool
     open: bool  # may bind names nh can't see: star import, %run, exec, unparsable code
+    # /nh:review (design §6.10); ``uses`` above is what L120 and stale marking read.
+    # Names read when the cell runs, before any binding of them earlier in the cell (a branch's
+    # included): module level, class bodies, decorators, defaults, comprehensions.
+    now: frozenset[str] = frozenset()
+    # Free names of the cell's function, lambda and method bodies: read when called.
+    later: frozenset[str] = frozenset()
 
 
-_UNPARSED = Flow(frozenset(), frozenset({EVERYTHING}), frozenset(), frozenset(), False, True)
+_UNPARSED = Flow(
+    frozenset(), frozenset({EVERYTHING}), frozenset(), frozenset(), False, True,
+    frozenset({EVERYTHING}), frozenset(),
+)  # fmt: skip
 
 
 def defs_uses(source: str) -> tuple[set[str], set[str], bool]:
@@ -126,6 +135,8 @@ def flow_of(source: str, masked: Masked, tree: ast.Module | None) -> Flow:
         frozenset(walker.fresh),
         True,
         walker.open or open_magic,
+        frozenset(walker.now),
+        frozenset(walker.deferred | walker.later),
     )
 
 
@@ -136,7 +147,7 @@ def _cell_magic_flow(name: str, header: str, tree: ast.Module | None, open_magic
         if args and _IDENTIFIER.match(args[0]):
             extra.add(args[0])
     defs, bound, is_open = set(extra), set(extra), open_magic
-    if name in _NAMESPACE_CELL_MAGICS:
+    if name in NAMESPACE_CELL_MAGICS:
         if tree is None:
             is_open = True
         else:
@@ -149,8 +160,9 @@ def _cell_magic_flow(name: str, header: str, tree: ast.Module | None, open_magic
             except RecursionError:
                 is_open = True
     return Flow(
-        frozenset(defs), frozenset({EVERYTHING}), frozenset(bound), frozenset(), False, is_open
-    )
+        frozenset(defs), frozenset({EVERYTHING}), frozenset(bound), frozenset(), False, is_open,
+        frozenset({EVERYTHING}), frozenset(),
+    )  # fmt: skip
 
 
 def base_name(node: ast.AST) -> str | None:
@@ -169,6 +181,10 @@ class _Walker:
         self.bound: set[str] = set()
         self.fresh: set[str] = set()
         self.deferred: set[str] = set()  # free names of function bodies: read when called
+        # a class's methods' and a comprehension's lambdas' free names: in Flow.later only, so
+        # uses (L120, stale marking) stays as it was
+        self.later: set[str] = set()
+        self.now: set[str] = set()  # read before any binding of them in the cell (Flow.now)
         self.open = False
 
     def run(self, tree: ast.Module) -> None:
@@ -181,9 +197,11 @@ class _Walker:
         self.bound.add(name)
         scope.add(name)
 
-    def read(self, name: str, scope: set[str]) -> None:
+    def read(self, name: str, scope: set[str], now: bool = True) -> None:
         if name not in scope:
             self.uses.add(name)
+            if now and name not in self.bound:
+                self.now.add(name)
 
     def mutate(self, node: ast.AST) -> None:
         name = base_name(node)
@@ -191,7 +209,7 @@ class _Walker:
             self.defs.add(name)
 
     def nested(self, node: _Scope) -> None:
-        free, global_defs, _ = _free(node)
+        free, global_defs, _, _ = _free(node)
         self.deferred |= free
         self.defs |= global_defs
         self.bound |= global_defs
@@ -212,9 +230,10 @@ class _Walker:
             self.bind(node.name, scope)
         elif isinstance(node, ast.ClassDef):
             self.exprs(_outer_parts(node), scope | _type_params(node))
-            free, global_defs, _ = _free(node)  # a class body runs now
+            free, global_defs, _, later = _free(node)  # a class body runs now, its methods later
             for name in free:
-                self.read(name, scope)
+                self.read(name, scope, now=name not in later)
+            self.later |= later
             self.defs |= global_defs
             self.bound |= global_defs
             self.bind(node.name, scope)
@@ -363,11 +382,12 @@ class _Walker:
                 self.nested(node)
             elif isinstance(node, _COMPS):
                 self.exprs(_outer_parts(node), scope)
-                free, global_defs, escaped = _free(node)
+                free, global_defs, escaped, later = _free(node)
                 for name in escaped:  # walrus inside a comprehension binds out here
                     self.bind(name, scope)
                 for name in free:
-                    self.read(name, scope)
+                    self.read(name, scope, now=name not in later)
+                self.later |= later
                 self.defs |= global_defs
             else:
                 if isinstance(node, ast.Call):
@@ -427,10 +447,12 @@ def _param_names(args: ast.arguments) -> set[str]:
     return {p.arg for p in params if p is not None}
 
 
-def _free(scope: _Scope) -> tuple[set[str], set[str], set[str]]:
-    """(free names, names assigned through ``global``, walrus names escaping a comprehension)."""
+def _free(scope: _Scope) -> tuple[set[str], set[str], set[str], set[str]]:
+    """(free names, names assigned through ``global``, walrus names escaping a comprehension, the
+    free names only a nested function or lambda body reads: read when it is called)."""
     local: set[str] = set()
     loads: set[str] = set()
+    now: set[str] = set()  # loads when the scope itself runs
     declared: set[str] = set()
     global_defs: set[str] = set()
     escaped: set[str] = set()
@@ -453,14 +475,22 @@ def _free(scope: _Scope) -> tuple[set[str], set[str], set[str]]:
     while stack:
         node = stack.pop()
         if isinstance(node, ast.Name):
-            (loads if isinstance(node.ctx, ast.Load) else local).add(node.id)
+            if isinstance(node.ctx, ast.Load):
+                loads.add(node.id)
+                now.add(node.id)
+            else:
+                local.add(node.id)
             continue
         if isinstance(node, (*_FUNCS, ast.ClassDef, ast.Lambda, *_COMPS)):
             if isinstance(node, (*_FUNCS, ast.ClassDef)):
                 local.add(node.name)
             stack.extend(_outer_parts(node))
-            inner_free, inner_globals, inner_escaped = _free(node)
+            inner_free, inner_globals, inner_escaped, inner_later = _free(node)
             loads |= inner_free
+            if not isinstance(
+                node, (*_FUNCS, ast.Lambda)
+            ):  # a class body or comprehension runs now
+                now |= inner_free - inner_later
             global_defs |= inner_globals
             (escaped if is_comp else local).update(inner_escaped)
             continue
@@ -481,4 +511,4 @@ def _free(scope: _Scope) -> tuple[set[str], set[str], set[str]]:
             local.add(node.rest)
         stack.extend(ast.iter_child_nodes(node))
     local -= declared
-    return loads - local, global_defs, escaped
+    return loads - local, global_defs, escaped, (loads - now) - local

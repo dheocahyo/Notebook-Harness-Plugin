@@ -6,9 +6,12 @@ Cells are named by title and ``[n]`` everywhere here, never by nh- id or line nu
 from __future__ import annotations
 
 import ast
+import functools
 import re
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
 
+from ._shared import secrets
 from ._shared.text import clip, normalize_title
 
 LABEL_CHARS = 40
@@ -60,12 +63,15 @@ _INPLACE_LINE = re.compile(r"(?m)^[ \t]*([A-Za-z_]\w*)\s*\..*\binplace\s*=\s*Tru
 def cell_label(title: str | None, execution_count: int | None, source: str = "") -> str:
     """'"Drop rows with missing price" [14]'; without a title, 'the cell `df = load()` [14]' with
     the first code line (≤ 40 chars). Untitled labels start lowercase: don't open a sentence with one.
+    Both are redacted before the cut (design §6.8).
     """
-    name = " ".join(normalize_title(title or "").split())
+    redact = secrets.current().redact
+    name = " ".join(redact(normalize_title(title or "")).split())
     if name:
         label = f'"{name}"'
     else:
         line = next((ln.strip() for ln in source.splitlines() if ln.strip()), "")
+        line = redact(line)
         line = line if len(line) <= LABEL_CHARS else line[: LABEL_CHARS - 1].rstrip() + "…"
         label = f"the cell `{line}`" if line else "an empty cell"
     return label if execution_count is None else f"{label} [{execution_count}]"
@@ -559,6 +565,22 @@ def _brief(value: dict) -> str:
     return _size(value) if value.get("kind") == "DataFrame" else f"len {_rows(value) or 0:,}"
 
 
+_Summary = TypeVar("_Summary", bound=Callable[..., Any])
+
+
+def _redacted(func: _Summary) -> _Summary:
+    """A summary line with its names and values redacted (design §6.8); scalar reprs are
+    already redacted before ``_short`` cuts them."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> str | None:
+        text = func(*args, **kwargs)
+        return secrets.current().redact(text) if text else text
+
+    return cast(_Summary, wrapper)
+
+
+@_redacted
 def _describe(value: dict, origin: str = "") -> str:
     """One name's summary; ``origin`` (' (from df 10×2)') follows the size of a frame or series."""
     kind = value.get("kind")
@@ -582,6 +604,7 @@ def _describe(value: dict, origin: str = "") -> str:
     return str(kind or "?")
 
 
+@_redacted
 def _diff(old: dict, new: dict) -> str | None:
     """What changed between two summaries of one name; None when nothing visible did."""
     kind = new.get("kind")
@@ -691,7 +714,7 @@ def _names(items: list[str], limit: int = MAX_NAMES) -> str:
 
 
 def _short(value: Any, limit: int = 40) -> str:
-    text = " ".join(str(value).split())
+    text = " ".join(secrets.current().redact(str(value)).split())  # redacted before the cut
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -703,15 +726,136 @@ def _plural(count: int, word: str, plural: str) -> str:
 
 
 def next_block(
-    status: str, *, retries_left: int, waits_left: int, cell: str, audience: str = "main"
+    status: str,
+    *,
+    retries_left: int,
+    waits_left: int,
+    cell: str,
+    audience: str = "main",
+    batch: tuple[int, int, int] | None = None,
+    check_this: bool = False,
 ) -> str:
     """The reply contract for the agent, by run status (plan §4.2).
 
     ``audience="writer"``: nh:cell-writer's texts. Its final answer goes to the nh:qa-cell
     workflow, never to the user, so each says to return the whole result there.
+
+    ``batch``: (step, total, stopped_at) for a cell of the message's approved batch (design
+    §6.3; ``stopped_at`` 0 while it goes), with ``check_this`` when the result has that section.
     """
     if audience == "writer":
-        return _writer_next(status, retries_left=retries_left, waits_left=waits_left, cell=cell)
+        plain = _writer_next(status, retries_left=retries_left, waits_left=waits_left, cell=cell)
+        if batch is None or not batch[2]:  # a going batch: each step's run returns its result
+            return plain
+        return _writer_batch_next(status, plain, cell=cell, batch=batch, check_this=check_this)
+    plain = _main_next(status, retries_left=retries_left, waits_left=waits_left, cell=cell)
+    if batch is None:
+        return plain
+    return _batch_next(status, plain, cell=cell, batch=batch, check_this=check_this)
+
+
+BATCH_LAST = "That was step {total} of {total}, the last of the approved batch. "
+NO_RETRY = (
+    "Don't fix it in this message: a batch has no retries. Explain in plain words: quote the "
+    "failing code, what Python said, the likely cause and one fix; "
+)
+
+
+def _batch_next(
+    status: str, plain: str, *, cell: str, batch: tuple[int, int, int], check_this: bool
+) -> str:
+    """The next block of a cell in an approved batch (design §6.3): go on to the next step,
+    or stop there and report. Steps count the batch's own cells (1 to N), not the plan's: a
+    batch may start after plan step 1. At the batch's last step every planned step ran, so a
+    stop there doesn't ask which did not."""
+    step, total, stop = batch
+    subject = cell[:1].upper() + cell[1:]
+    if not stop:
+        if status != "ok":  # a result that isn't ok always stops the batch
+            return plain
+        if step < total:
+            return (
+                f"Step {step} of {total} of the approved batch ran OK. Give the user a short "
+                f"report on {cell}: what it did and the real numbers, surprises first, named by "
+                f"title and [n]. Then write the batch's next step (step {step + 1} of {total}) "
+                "with nh_add_cell, without waiting for the user."
+            )
+        last = plain.replace("Do not write a second cell.", "Do not write another cell.")
+        return BATCH_LAST.format(total=total) + last
+    here = stop == step
+    rest = not here or step < total  # some planned step did not run
+    if status == "ok" and check_this and here:
+        unrun = ", and say which planned steps did not run" if rest else ""
+        return (
+            f"The approved batch stops at step {step} of {total}: {cell} ran, but its result "
+            "needs a look (see 'check this'). Reply to the user about it: lead with the 'check "
+            f"this' finding, then what the cell did and the real numbers{unrun}. Write no other "
+            "cell and don't change this one in this message; wait for the user."
+        )
+    if status == "ok" and check_this:
+        return (
+            f"{subject} ran, but its result needs a look (see 'check this'), and the approved "
+            f"batch stopped at step {stop} of {total}. Reply to the user: lead with the 'check "
+            "this' finding, then what each step did and where and why the batch stopped. Write "
+            "no other cell and don't change this one in this message; wait for the user."
+        )
+    if status == "ok":
+        return (
+            f"{subject} ran OK, but the approved batch stopped at step {stop} of {total}. Report "
+            "the batch to the user: what each step did, then where and why it stopped. Write no "
+            "other cell; wait for the user."
+        )
+    if status == "error" and here:
+        unrun = "say which planned steps did not run; " if rest else ""
+        return (
+            f"The approved batch stops at step {step} of {total}: {subject} failed. "
+            f"{NO_RETRY}{unrun}then wait."
+        )
+    if status == "error":
+        return (
+            f"{subject} failed, and the approved batch stopped at step {stop} of {total}. "
+            f"{NO_RETRY}say where and why the batch stopped and which planned steps did not run; "
+            "then wait."
+        )
+    verb = "stops" if here else "stopped"
+    unrun = ": say which planned steps did not run" if rest else ""
+    return f"{plain} The approved batch {verb} at step {stop} of {total}{unrun}."
+
+
+def _writer_batch_next(
+    status: str, plain: str, *, cell: str, batch: tuple[int, int, int], check_this: bool
+) -> str:
+    """nh:cell-writer's next block once the approved batch has stopped (design §6.3): nothing
+    more changes this message, so no retry and no revision; the result goes to the workflow."""
+    step, total, stop = batch
+    subject = cell[:1].upper() + cell[1:]
+    back = f"{_TO_WORKFLOW[:1].upper()}{_TO_WORKFLOW[1:]} (status {status})"
+    here = stop == step
+    if status == "error":
+        how = (
+            f"so the approved batch stops here, at step {step} of {total}"
+            if here
+            else f"and the approved batch stopped at step {stop} of {total}"
+        )
+        return f"{subject} failed, {how}: a batch has no retries. {back}. Don't change it again."
+    if status == "ok":
+        if check_this and here:
+            why = (
+                f"{subject} ran, but its result needs a look (see 'check this'), so the approved "
+                f"batch stops here, at step {step} of {total}"
+            )
+        else:
+            why = f"{subject} ran OK, but the approved batch stopped at step {stop} of {total}"
+        return (
+            f"{why}: no revision of it this message. {back}. Don't reply to the user or write a "
+            "second cell."
+        )
+    verb = "stops" if here else "stopped"
+    return f"{plain} The approved batch {verb} at step {stop} of {total}."
+
+
+def _main_next(status: str, *, retries_left: int, waits_left: int, cell: str) -> str:
+    """The main conversation's reply contract for one cell's result."""
     subject = cell[:1].upper() + cell[1:]  # opens a sentence; untitled labels read "the cell `…`"
     if status == "ok":
         return (
@@ -846,6 +990,7 @@ def error_summary(ename: str, evalue: str, limit: int = ERROR_CHARS) -> str:
     """
     lines = [line.strip() for line in (evalue or "").splitlines() if line.strip()]
     text = f"{ename}: {lines[0]}" if lines else (ename or "Error")
+    text = secrets.current().redact_head(text, limit)  # before the cut (design §6.8)
     if len(text) > limit:
         return clip(text, limit)
     return text.rstrip(" ,;:-") + "…" if len(lines) > 1 else text

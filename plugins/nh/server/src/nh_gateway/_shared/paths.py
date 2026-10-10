@@ -61,6 +61,7 @@ class Layout:
         self.outputs = self.nh / "outputs"
         self.logs = self.nh / "logs"
         self.tmp = self.nh / "tmp"
+        self.reviews = self.nh / "reviews"  # /nh:review's reports (design §6.10)
         self.log_file = self.nh / "log.jsonl"
         self.harness_toml = project / HARNESS_TOML
         self.last_cell = self.state / "last_cell.json"
@@ -68,6 +69,7 @@ class Layout:
         self.lab_json = self.state / "lab.json"
         self.stale_json = self.state / "stale.json"
         self.drift_json = self.state / "kernel_drift.json"
+        self.approved_hosts = self.state / "approved_hosts.json"  # nhctl scaffold writes it
 
     def turn_file(self, session_id: str) -> Path:
         return self.turns / f"{safe_name(session_id)}.json"

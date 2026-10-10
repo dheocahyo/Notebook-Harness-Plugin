@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from nh_gateway._shared import intent
 from nh_gateway._shared import turn_record as tr
 from nh_gateway._shared.paths import Layout, atomic_write_json
 from tests.fakes.turns import notification_prompt
@@ -68,6 +69,11 @@ def test_opened_record_round_trips(layout: Layout) -> None:
         "ts": 100.0,
         "alias_ts": None,
         "earlier": {},
+        "mode": None,
+        "request": None,
+        "answer": None,
+        "prev_turn_id": None,
+        "prev_request": None,
     }
 
 
@@ -149,6 +155,194 @@ def test_an_orphan_has_no_turn() -> None:
     assert tr.canonical(record, "n1") is None
     later = tr.aliased(record, "n2", 6.0)
     assert (tr.canonical(later, "n1"), tr.canonical(later, "n2"), later["ts"]) == (None, None, 5.0)
+
+
+# --- v0.2 fields: intent, previous turn, mid-turn messages (design §6.1) -----------------
+
+BATCH3 = {"batch": True, "n": 3}
+STALE = {"rerun_stale": True}
+
+
+def classified(mode=None, request=None, answer=None) -> dict:
+    return {"mode": mode, "request": request, "answer": answer}
+
+
+def intent_fields(record: dict) -> tuple:
+    return tuple(record[name] for name in tr.INTENT_FIELDS)
+
+
+def test_opened_takes_the_message_intent_and_the_previous_turn(layout: Layout) -> None:
+    first = tr.opened(SESSION, "p1", 1.0, None, classified("ask", BATCH3))
+    assert intent_fields(first) == ("ask", BATCH3, None, None, None)
+    second = tr.opened(SESSION, "p2", 2.0, first, classified(answer="yes"))
+    assert intent_fields(second) == (None, None, "yes", "p1", BATCH3)
+    atomic_write_json(layout.turn_file(SESSION), second)
+    record = tr.read(layout, SESSION)
+    assert record is not None and intent_fields(record) == (None, None, "yes", "p1", BATCH3)
+    # The turn before last is forgotten: only the previous turn's request carries over.
+    third = tr.opened(SESSION, "p3", 3.0, second, classified("explain"))
+    assert intent_fields(third) == ("explain", None, None, "p2", None)
+
+
+def test_opened_after_an_orphan_has_no_previous_turn() -> None:
+    record = tr.opened(SESSION, "p1", 2.0, tr.orphan(SESSION, "n1", 1.0), classified(answer="yes"))
+    assert intent_fields(record) == (None, None, "yes", None, None)
+
+
+def test_opened_ignores_an_invalid_classification() -> None:
+    bad = {"mode": "shout", "request": {"batch": True, "n": 1}, "answer": "maybe"}
+    assert intent_fields(tr.opened(SESSION, "p1", 1.0, None, bad)) == (None,) * 5
+    assert intent_fields(tr.opened(SESSION, "p1", 1.0, None, "yes")) == (None,) * 5  # type: ignore[arg-type]
+
+
+def test_a_v1_record_has_no_intent(layout: Layout) -> None:
+    write_record(
+        layout,
+        {"v": 1, "prompt_id": "p1", "ts": 1.0, "mode": "plan", "answer": "yes", "request": STALE},
+    )
+    record = tr.read(layout, SESSION)
+    assert record is not None and intent_fields(record) == (None,) * 5
+
+
+def test_read_whitelists_the_intent_fields(layout: Layout) -> None:
+    base = {"v": 2, "prompt_id": "p2", "turn_id": "p2"}
+    good = {
+        "mode": "ask",
+        "request": {"batch": True, "n": 4},
+        "answer": "no",
+        "prev_turn_id": "p1",
+        "prev_request": STALE,
+    }
+    write_record(layout, {**base, **good})
+    record = tr.read(layout, SESSION)
+    assert record is not None and intent_fields(record) == tuple(good.values())
+    bad = {
+        "mode": "EXPLAIN",
+        "request": {"batch": True, "n": 3, "cells": ["a"]},
+        "answer": True,
+        "prev_turn_id": 7,
+        "prev_request": {"batch": True, "n": False},
+    }
+    write_record(layout, {**base, **bad})
+    record = tr.read(layout, SESSION)
+    assert record is not None and intent_fields(record) == (None,) * 5
+    write_record(layout, {**base, "prev_turn_id": "", "request": "batch", "answer": "yes "})
+    record = tr.read(layout, SESSION)
+    assert record is not None and intent_fields(record) == (None,) * 5
+
+
+def test_aliased_keeps_the_intent_fields() -> None:
+    record = tr.opened(SESSION, "p2", 2.0, tr.opened(SESSION, "p1", 1.0), classified("ask", STALE))
+    later = tr.aliased(record, "n1", 3.0)
+    assert intent_fields(later) == ("ask", STALE, None, "p1", None)
+
+
+def test_orphan_clears_the_intent_fields() -> None:
+    record = tr.orphan(SESSION, "n1", 1.0)
+    assert all(name in record for name in tr.INTENT_FIELDS)
+    assert intent_fields(record) == (None,) * 5
+
+
+def test_known_ids() -> None:
+    record = tr.opened(SESSION, "p1", 1.0)
+    record = tr.aliased(tr.opened(SESSION, "p2", 2.0, tr.aliased(record, "n1", 1.5)), "n2", 3.0)
+    assert [tr.known(record, pid) for pid in ("p2", "n2", "n1", "p1")] == [True] * 4
+    assert not tr.known(record, "p0")  # older than the previous turn, never seen
+    assert not tr.known(record, "p3")
+    assert not tr.known(record, "") and not tr.known(record, None)
+    assert not tr.known(None, "p2")
+
+
+def test_no_write_mode_is_the_records_mode_for_its_own_turn_only(layout: Layout) -> None:
+    """E109's key (design §6.2): the gateway and the workflow guard pass the call's canonical
+    turn; only the record's own turn gets its mode."""
+    for mode in intent.MODES:
+        record = tr.opened(SESSION, "p2", 2.0, tr.opened(SESSION, "p1", 1.0), classified(mode))
+        assert tr.no_write_mode(record, "p2") == mode
+        assert tr.no_write_mode(record, "p1") is None  # an earlier turn: not this mode
+        assert tr.no_write_mode(record, "p3") is None
+        assert tr.no_write_mode(record, "") is None and tr.no_write_mode(record, None) is None
+        # An alias is passed as its canonical turn, never as itself.
+        record = tr.aliased(record, "n1", 2.5)
+        assert tr.no_write_mode(record, tr.canonical(record, "n1")) == mode
+        assert tr.no_write_mode(record, "n1") is None
+    assert (
+        tr.no_write_mode(tr.opened(SESSION, "p1", 1.0, None, classified(answer="yes")), "p1")
+        is None
+    )
+    assert tr.no_write_mode(None, "p1") is None
+    assert tr.no_write_mode({"turn_id": "p1", "mode": "shout"}, "p1") is None
+    # An orphan's turn is None: no turn to match, whatever mode was typed into it.
+    orphan = tr.absorbed(tr.orphan(SESSION, "o1", 1.0), "o1", classified("explain"))
+    assert (
+        orphan["mode"] == "explain" and tr.no_write_mode(orphan, tr.canonical(orphan, "o1")) is None
+    )
+    # A v1 record has no mode.
+    write_record(layout, {"v": 1, "prompt_id": "p1", "ts": 1.0, "mode": "explain"})
+    assert tr.no_write_mode(tr.read(layout, SESSION), "p1") is None
+
+
+@pytest.mark.parametrize(
+    ("mid", "expected"),
+    [
+        # (mode, request, answer) typed mid-turn -> the turn's (mode, request, answer)
+        (classified(), ("ask", BATCH3, "yes")),
+        (classified(answer="no"), ("ask", BATCH3, "yes")),  # never an answer
+        (classified("explain"), ("explain", BATCH3, "yes")),
+        (classified("plan"), ("plan", BATCH3, "yes")),
+        (classified("ask", STALE), ("ask", STALE, "yes")),
+        (classified("ask", {"batch": True, "n": 5}), ("ask", {"batch": True, "n": 5}, "yes")),
+    ],
+)
+def test_absorbed_only_tightens(mid: dict, expected: tuple) -> None:
+    previous = tr.opened(SESSION, "p1", 1.0, None, classified("ask", STALE))
+    record = tr.opened(SESSION, "p2", 2.0, previous, classified("ask", BATCH3, "yes"))
+    record = tr.aliased(record, "n1", 2.5)
+    after = tr.absorbed(record, "p2", mid)
+    assert (after["mode"], after["request"], after["answer"]) == expected
+    assert (after["prev_turn_id"], after["prev_request"]) == ("p1", STALE)
+    kept = ("turn_id", "aliases", "earlier", "ts", "alias_ts", "human", "session_id")
+    assert {k: after[k] for k in kept} == {k: record[k] for k in kept}
+    assert after["prompt_id"] == "p2"
+
+
+def test_absorbed_without_a_mode_keeps_an_empty_turn() -> None:
+    record = tr.opened(SESSION, "p1", 1.0, None, classified(answer="yes"))
+    after = tr.absorbed(record, "p1", classified(answer="yes"))
+    assert intent_fields(after) == (None, None, "yes", None, None)
+    after = tr.absorbed(tr.opened(SESSION, "p1", 1.0), "p1", classified(answer="yes"))
+    assert after["answer"] is None  # a mid-turn yes doesn't answer anything
+
+
+def test_running_is_the_human_turn_or_an_alias() -> None:
+    record = tr.aliased(tr.opened(SESSION, "p1", 1.0), "n1", 1.5)
+    later = tr.aliased(tr.opened(SESSION, "p2", 2.0, record), "n2", 2.5)
+    assert [tr.running(later, pid) for pid in ("p2", "n2")] == [True, True]
+    # An earlier turn, its alias or an unknown id is not the running turn: a new message.
+    assert [tr.running(later, pid) for pid in ("p1", "n1", "p3", "", None)] == [False] * 5
+    assert not tr.running(None, "p2")
+    # A turn a notification started with no human turn open: its alias, not its None turn.
+    orphan = tr.aliased(tr.orphan(SESSION, "o1", 1.0), "o2", 1.5)
+    assert [tr.running(orphan, pid) for pid in ("o1", "o2", "p1")] == [True, True, False]
+    # A non-human record's turn_id is no human turn to resubmit.
+    assert not tr.running(dict(tr.opened(SESSION, "p1", 1.0), human=False), "p1")
+
+
+def test_absorbed_into_a_notifications_turn() -> None:
+    record = tr.opened(SESSION, "p1", 1.0, None, classified("ask", BATCH3))
+    record = tr.aliased(record, "n1", 1.5)
+    after = tr.absorbed(record, "n1", classified("explain", answer="yes"))
+    assert (after["turn_id"], after["prompt_id"], after["aliases"]) == ("p1", "n1", ["n1"])
+    assert (after["mode"], after["request"], after["answer"]) == ("explain", BATCH3, None)
+    assert (after["ts"], after["alias_ts"]) == (1.0, 1.5)
+
+
+def test_absorbed_into_an_orphan_stays_an_orphan() -> None:
+    record = tr.orphan(SESSION, "o1", 1.0)
+    after = tr.absorbed(record, "o1", classified("ask", BATCH3, "yes"))
+    assert (after["turn_id"], after["human"], after["aliases"]) == (None, False, ["o1"])
+    assert (after["mode"], after["request"], after["answer"]) == ("ask", BATCH3, None)
+    assert tr.canonical(after, "o1") is None  # still no budget: the orphan's E102
 
 
 # --- task notifications ------------------------------------------------------------------
@@ -264,6 +458,20 @@ def test_mark_done_by_tool_use_id_or_task_id(layout: Layout) -> None:
     assert done == {"wf_1": 2000.0, "wf_2": 2001.0, "wf_3": None}
 
 
+def test_mark_done_keeps_the_turn_the_report_reached(layout: Layout) -> None:
+    """``done_turn``: the human turn the notification is an alias of (design §6.4, C5d3); the
+    first mark wins, as for ``done_ts``."""
+    for run_id in ("wf_1", "wf_2"):
+        tr.record_run(layout, SESSION, run(run_id))
+    tr.mark_done(layout, SESSION, "toolu-wf_1", status="completed", now=2000.0, turn_id="p1")
+    tr.mark_done(layout, SESSION, "toolu-wf_1", status="completed", now=3000.0, turn_id="p2")
+    tr.mark_done(layout, SESSION, "toolu-wf_2", status="killed", now=2001.0)  # TaskStop
+    # a later notification doesn't fill in a first mark that kept no turn
+    tr.mark_done(layout, SESSION, "toolu-wf_2", status="completed", now=3001.0, turn_id="p1")
+    done = {r["run_id"]: r.get("done_turn", "missing") for r in tr.find_runs(layout, SESSION)}
+    assert done == {"wf_1": "p1", "wf_2": None}
+
+
 def test_open_runs_are_this_turns_own_unreported_runs_for_an_hour(layout: Layout) -> None:
     tr.record_run(layout, SESSION, run("wf_open"))
     tr.record_run(layout, SESSION, run("wf_done", done_ts=1500.0))
@@ -372,3 +580,63 @@ def test_run_for_agent_gives_up_after_the_wait(layout: Layout) -> None:
 
     assert tr.run_for_agent(layout, SESSION, "a1", sleep=sleep, clock=lambda: clock[0]) is None
     assert sum(slept) == pytest.approx(tr.META_WAIT_S)
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (2, True),
+        (5, True),
+        (20, True),
+        (1, False),  # a batch is two or more steps
+        (21, False),  # past the run registry's MAX_RUNS
+        (0, False),
+        (-3, False),
+        (True, False),
+        (2.0, False),
+        ("5", False),
+        (None, False),
+    ],
+)
+def test_valid_max_batch_is_2_to_the_registrys_size(value: object, valid: bool) -> None:
+    """``[turn] max_batch`` as both the gateway and the hooks take it (design §6.3, C6b)."""
+    assert tr.MAX_BATCH_RANGE == (2, tr.MAX_RUNS) == (2, 20)
+    assert tr.valid_max_batch(value) is valid
+
+
+def test_tomlread_reads_a_file_that_isnt_utf8_as_none(tmp_path: Path) -> None:
+    """The hooks' and nhctl's reader: a file that isn't UTF-8 is no file, never an exception
+    (C6b review: the prompt hook lost its whole reminder to a ``UnicodeDecodeError``)."""
+    from nh_gateway._shared import tomlread
+
+    path = tmp_path / "harness.toml"
+    path.write_bytes(b"[turn]\nmax_batch = 2\n# \xff\n")
+    assert tomlread.load(path) == {}
+    path.write_text("[turn]\nmax_batch = 2\n")
+    assert tomlread.load(path) == {"turn": {"max_batch": 2}}
+    assert tomlread.load(tmp_path / "missing.toml") == {}
+
+
+def test_approved_batch_is_the_previous_requests_n_in_a_yes_turn(layout: Layout) -> None:
+    """The batch grant's record part (design §6.3): a yes message right after a batch request,
+    for the record's own turn (an alias passed as its canonical turn)."""
+    asked = tr.opened(SESSION, "p1", 1.0, None, classified("ask", BATCH3))
+    assert tr.approved_batch(asked, "p1") is None  # the ask message itself
+    yes = tr.opened(SESSION, "p2", 2.0, asked, classified(answer="yes"))
+    assert tr.approved_batch(yes, "p2") == 3
+    assert tr.approved_batch(yes, "p1") is None and tr.approved_batch(yes, None) is None
+    alias = tr.aliased(yes, "n1", 2.5)
+    assert tr.approved_batch(alias, tr.canonical(alias, "n1")) == 3
+    absorbed = tr.absorbed(yes, "p2", classified(answer="no"))  # never an answer mid-turn
+    assert tr.approved_batch(absorbed, "p2") == 3
+    for answer in ("no", None):
+        other = tr.opened(SESSION, "p2", 2.0, asked, classified(answer=answer))
+        assert tr.approved_batch(other, "p2") is None
+    later = tr.opened(SESSION, "p3", 3.0, yes, classified(answer="yes"))
+    assert tr.approved_batch(later, "p3") is None  # two messages later: the yes had no request
+    stale = tr.opened(SESSION, "p1", 1.0, None, classified("ask", {"rerun_stale": True}))
+    rerun_yes = tr.opened(SESSION, "p2", 2.0, stale, classified(answer="yes"))
+    assert tr.approved_batch(rerun_yes, "p2") is None  # C7's request, not a batch
+    assert tr.approved_batch(None, "p2") is None
+    write_record(layout, {"v": 1, "prompt_id": "p2", "ts": 2.0, "answer": "yes"})
+    assert tr.approved_batch(tr.read(layout, SESSION), "p2") is None  # a v1 record

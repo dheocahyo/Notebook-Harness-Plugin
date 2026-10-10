@@ -62,7 +62,13 @@ def log_failure(project: Path | None, event: str, variant: str) -> None:
             mode = "w" if os.path.getsize(path) > LOG_MAX_BYTES else "a"
         except OSError:
             mode = "a"
-        text = re.sub(r"(token=)[^&\s\"']+", r"\1<redacted>", traceback.format_exc(), flags=re.I)
+        text = traceback.format_exc()
+        try:  # the project's redactor (design §6.8)
+            from nh_gateway._shared import secrets
+
+            text = secrets.Redactor.for_project(Path(where)).redact(text)
+        except BaseException:  # the redactor itself failed: at least the token pattern
+            text = re.sub(r"(token=)[^&\s\"']+", r"\1[redacted:token]", text, flags=re.I)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         with open(path, mode, encoding="utf-8", errors="replace") as handle:
             handle.write(f"{stamp} pid={os.getpid()} {event} {variant}\n{text}\n")

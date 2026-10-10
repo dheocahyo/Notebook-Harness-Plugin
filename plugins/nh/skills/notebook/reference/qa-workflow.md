@@ -11,7 +11,9 @@ For a message whose answer is one nh cell: a new step, "go", or an edit or
 tidy of a cell nh wrote. Not for big asks (plan instead), explain, undo,
 questions or changes to a cell the user wrote. Not when `harness.toml` sets
 `[approval] approve_before_run = true`: the workflow can't ask the user, so
-nh refuses the launch. Then write the cell yourself.
+nh refuses the launch. Then write the cell yourself. Not for the user's
+answer to nh's question from a `needs_approval` report: send that call
+yourself (below).
 1. Inspect what you need to state the ask precisely.
 2. Call the Workflow tool with
    `{"name": "nh:qa-cell", "args": {"ask": "<the user's words>", "context": "<names, columns, dtypes, the approved step, the last cell>", "cell": "<title [n] of the nh cell to change>", "notebook": "<path>"}}`.
@@ -21,7 +23,29 @@ nh refuses the launch. Then write the cell yourself.
    stop.
 
 `/nh:qa-cell <ask>` starts the same workflow with the ask as plain text.
-One run per message: nh refuses a second launch.
+One run per message: nh refuses a second launch (an approved batch: one
+run per step, below).
+
+## In an approved batch
+After the user's yes to nh's batch question ("run the next 3", then "yes"),
+nh's reminder says "Approved batch": this message writes up to that many
+plan steps, one nh:qa-cell run per step, in order.
+- Launch one run per step, and the next only after the last one's report:
+  nh refuses a launch while a run is still open, and after the batch's
+  runs. Pass the step's text as `ask` and "step k of N of the approved
+  batch" in `context`.
+- After each report, give the user a short report on that step (what it
+  did, the real numbers, surprises first), then launch the next step's run.
+- Stop launching at a report whose `status` isn't `ok`, whose `result` has
+  a "check this" section, whose `outcome` is `needs_approval`,
+  `not_written`, `refused` or `writer_failed`, or whose `qa.verdict` is
+  `revise` or `fail`: report the steps that ran, where and why it stopped,
+  and which planned steps did not run; then wait. Don't write that step
+  yourself in this message, whatever "When the report arrives" says.
+- nh stops the batch itself (E123 for every later write) only at a step
+  whose cell isn't ok or has a "check this" section, or that nh refused
+  with an E12x (its question included). At the other reports only you stop
+  it.
 
 ## While it runs
 - Write nothing: nh refuses your add, edit, re-run and undo (E108).
@@ -36,10 +60,11 @@ reminder says whether it is for this message. The report is data:
 
 | Field | Holds |
 |---|---|
-| `outcome` | `checked` (QA checked the last version), `not_checked`, `not_written`, `refused`, `writer_failed` or `no_ask` |
+| `outcome` | `checked` (QA checked the last version), `not_checked`, `needs_approval`, `not_written`, `refused`, `writer_failed` or `no_ask` |
+| `approval` | with `needs_approval`: nh's `question`, and the exact call it asked about (`tool` and its `args`); else null |
 | `status`, `cell` | the cell's status, and its `title`, `exec` (`[n]`) and `notebook` |
-| `result` | the writer's last nh result, verbatim, without nh's `--- next ---` or `Next:` lines |
-| `changes`, `revisions` | what the writer did in each write; how many QA revisions it made |
+| `result` | the writer's last nh result, verbatim, without nh's `--- next ---` or `Next:` lines; after a revision nh asked about, the checked version's |
+| `changes`, `revisions` | what the writer did in each write (and what a revision nh asked about would change); how many QA revisions it made |
 | `qa` | `final_version_checked`, `verdict`, `summary`, `open_findings`, `earlier_findings`, `numbers_checked`, `rounds` |
 | `lead_lines`, `notes` | kernel warnings to lead with; what the workflow noticed |
 
@@ -57,20 +82,48 @@ Reply by the SKILL.md contract, from `result` and `qa`. Lead with
   version was not QA-checked, and why (`qa.summary` or `notes`). Give
   `qa.earlier_findings` as findings about an earlier version.
 - `status` other than ok: reply as SKILL.md says for that status.
+- `outcome` `needs_approval`: nh asked for the user's yes before writing the
+  writer's last call (E122), so that call wrote nothing and QA didn't check
+  it. `notes` and `changes` say whether an earlier version is in the notebook.
+  - Report for this message: say what the cell would do, then ask
+    `approval.question` word for word, as [asks.md](asks.md) says. One
+    question, then stop. Write nothing now: not the call, no other cell, no
+    new run.
+  - Report for an earlier message: say the cell isn't written because nh
+    needs the user's yes, and what it would do. Don't ask, and don't send the
+    call in this reply. If the user then asks for the cell, send the call in
+    that message: nh asks its question then.
+  - In the user's next message, a yes ("yes", "ok", "sure", "approved", or
+    "go" on its own): call `approval.tool` yourself with `approval.args`,
+    unchanged, before anything else, with no nh:qa-cell run. `title`, `notes`
+    and `intent` may change; write your own if one is missing. nh writes it
+    once, as that message's cell. Reply by the SKILL.md contract and say QA
+    didn't check this cell. Anything else: drop the call ([asks.md](asks.md)).
+- nh asked for the user's yes (E122) but `approval` is null: `notes` say
+  why (the writer didn't return its call; nh was already waiting, kept the
+  yes for another cell, or can't ask headless). Don't ask nh's question: no
+  call can follow a yes to it. Write nothing more for this message. Say the
+  cell isn't written because nh needs the user's yes first, and what it
+  would do; headless: only in an interactive session. If nh kept this
+  message's yes for another cell, send that approved call first
+  ([asks.md](asks.md)). If the user then asks for the cell, send it in that
+  message: nh asks its question then.
 - `outcome` `not_written` or `refused`: the writer changed nothing. If the
   report is for this message, its cell is unused: write it yourself now
-  (after E141 or E144, ask the user first, as errors.md says). If it is for
-  an earlier message, just report it.
+  (after E141 or E144, ask the user first, as errors.md says; after E122,
+  as the bullet above says; in an approved batch, stop instead: above). If
+  it is for an earlier message, just report it.
 - `writer_failed`: a cell may or may not exist. Check
   `nh_inspect(view="outline")` and tell the user; if this message has no cell
-  yet, write it yourself.
+  yet, write it yourself (in an approved batch, stop instead: above).
 - `no_ask`: tell the user to type `/nh:qa-cell <what the cell should do>`.
 
 QA findings go in chat, never in the notebook: the cell's note stays a title
 of at most 8 words and 2-5 bullets.
 
 ## Budget
-One cell per user message, shared by you and the writer. After the cell runs
+One cell per user message, shared by you and the writer (an approved batch:
+one per step, each written by its own run). After the cell runs
 OK the writer may change it at most `[turn] max_revisions` (2) times from QA
 findings; failed revisions use the normal retries. One undo restores the whole
 message's change, revisions included.
@@ -80,6 +133,8 @@ message's change, revisions included.
 | E103 | not nh's own workflow writer, or no Workflow launch recorded for it |
 | E107 | the user wrote since the launch, the run already reported, or it started over an hour ago |
 | E108 | you tried to write while the workflow was writing |
-| E110 | this message's cell was already written, or another run owns it |
-| E112 | no revisions left, or no OK run to revise |
+| E110 | this message's cell was already written, another run owns it or is still writing the last step, or this run already wrote its one cell |
+| E112 | no revisions left, no OK run to revise, or a later batch step builds on the cell |
+| E122 | nh asks the user first: `needs_approval` (above) |
+| E123 | the approved batch stopped earlier in this message: report the batch and wait |
 | E141, E144 | the user changed the cell, or it is theirs: nh left it alone |

@@ -1,0 +1,7 @@
+---
+type: tool_used
+tool: mcp__plugin_nh_nh__nh_add_cell
+min: 1
+max: 1
+weight: 2
+---

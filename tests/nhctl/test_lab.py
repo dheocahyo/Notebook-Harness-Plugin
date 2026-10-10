@@ -213,6 +213,7 @@ def test_start_status_stop(env, lab_project):
     assert started["url"].startswith("http://127.0.0.1:") and "token" not in started["url"]
     assert started["notebook"] == "notebooks/01_eda.ipynb"
     assert started["session"] == {"created": True, "kernel": "python3"}
+    assert started["log"] == "nhctl lab status --log"  # never the raw file (design §6.8)
 
     lab = json.loads((lab_project / ".nh/state/lab.json").read_text())
     token = json.loads(Path(lab["runtime_file"]).read_text())["token"]
@@ -293,6 +294,7 @@ def test_startup_failure_reports_log(env, lab_project):
     env.vars["FAKE_LAB_FAIL"] = "1"
     report = env.json("lab", "start", cwd=lab_project, expect=1)
     assert report["error"]["code"] == "D145"
+    assert report["error"]["fix"] == "See nhctl lab status --log."
     assert "boom: address already in use" in report["log_tail"]
     assert not (lab_project / ".nh/state/lab.json").exists()
 
@@ -322,9 +324,29 @@ def test_old_log_is_scrubbed_and_made_private(env, lab_project):
     log.write_text("[I ServerApp] http://127.0.0.1:8888/lab?token=0ld5ecret0ld5ecret\n")
     log.chmod(0o644)
     env.json("lab", "start", "--no-browser", cwd=lab_project)
-    assert "0ld5ecret" not in log.read_text() and "token=***" in log.read_text()
+    assert "0ld5ecret" not in log.read_text() and "token=[redacted:token]" in log.read_text()
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     env.json("lab", "stop", cwd=lab_project)
+
+
+def test_status_log_shows_the_logs_tail_redacted(env, lab_project):
+    """Kernels write fd-level output (subprocess, os.system) into the log raw, so nh reads it
+    through `lab status --log`, redacted with the project's .env (design §6.8; review of C3)."""
+    secret = "Sup3rS3cret-" + "Passw0rd-2026"  # fake
+    with open(lab_project / ".env", "a") as handle:
+        handle.write(f"\nDB_PASSWORD={secret}\n")
+    log = lab_project / ".nh/logs/jupyterlab.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("".join(f"line {n}\n" for n in range(60)) + f"subprocess sees {secret}\n")
+    report = env.json("lab", "status", "--log", cwd=lab_project)
+    lines = report["log_tail"].splitlines()
+    assert len(lines) == 40 and lines[0] == "line 21"
+    assert lines[-1] == "subprocess sees [redacted:DB_PASSWORD]"
+    human = env.run("lab", "status", "--log", cwd=lab_project)
+    assert "--- .nh/logs/jupyterlab.log, last 40 lines ---" in human.stdout
+    assert "subprocess sees [redacted:DB_PASSWORD]" in human.stdout
+    assert secret not in json.dumps(report) + human.stdout + human.stderr
+    assert "log_tail" not in env.json("lab", "status", cwd=lab_project)
 
 
 # ------------------------------------------------ a JupyterLab the user started (finding 10)

@@ -320,14 +320,21 @@ async def test_twenty_reconnects_leave_no_duplicate_ids(backend: RtcBackend, pro
 
 async def test_source_patches_handle_non_ascii(backend: RtcBackend, helpers):
     ref = await backend.resolve_notebook(helpers.NB)
-    await backend.insert_cells(ref, -1, pair("nh-0000000009", "label = 'café 😀'\nprint(label)"))
+    old = "label = 'café 😀'\nprint(label)"
+    await backend.insert_cells(ref, -1, pair("nh-0000000009", old))
     new = "label = 'crème brûlée 😀🎉'\nprint(label, 'ok')"
-    await backend.update_cells(
-        ref,
-        [CellPatch(id="nh-0000000009", source=new, base_source="label = 'café 😀'\nprint(label)")],
-    )
+    await backend.update_cells(ref, [CellPatch(id="nh-0000000009", source=new, base_source=old)])
     async with helpers.observer(ref.api_path) as user:
+        # The room reads nh's patch only after the save nh asked for after the insert (design
+        # §6.13): wait until the patch arrived, then check what it made.
         cell = await helpers.eventually(
-            lambda: next((c for c in helpers.cells_of(user) if c["id"] == "nh-0000000009"), None)
+            lambda: next(
+                (
+                    c
+                    for c in helpers.cells_of(user)
+                    if c["id"] == "nh-0000000009" and c["source"] != old
+                ),
+                None,
+            )
         )
         assert cell["source"] == new

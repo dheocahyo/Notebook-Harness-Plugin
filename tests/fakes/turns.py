@@ -46,7 +46,11 @@ class Turns:
         out = proc.stdout.decode().strip()
         return json.loads(out) if out else None
 
-    def prompt(self, prompt_id: str, session_id: str | None = None) -> dict[str, Any] | None:
+    def prompt(
+        self, prompt_id: str, session_id: str | None = None, text: str = "…"
+    ) -> dict[str, Any] | None:
+        """A human message ``text``; the same ``prompt_id`` as the open turn is one typed
+        mid-turn (spike V16)."""
         return self._hook(
             "prompt-submit",
             payload={
@@ -55,7 +59,7 @@ class Turns:
                 "cwd": str(self.project),
                 "hook_event_name": "UserPromptSubmit",
                 "permission_mode": "default",
-                "prompt": "…",
+                "prompt": text,
             },
         )
 
@@ -166,6 +170,30 @@ class Turns:
             payload["agent_type"] = "general-purpose"
         self._hook("post-tool", "workflow", payload=payload)
         return folder
+
+    def workflow_launch(
+        self,
+        prompt_id: str,
+        args: Any = "drop rows with missing price",
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """PreToolUse of an ``nh:qa-cell`` launch by name (the launch guard): None when it
+        passes, else the hook's deny."""
+        return self._hook(
+            "pre-tool",
+            "workflow",
+            payload={
+                "session_id": session_id or self.session_id,
+                "prompt_id": prompt_id,
+                "cwd": str(self.project),
+                "hook_event_name": "PreToolUse",
+                "permission_mode": "default",
+                "tool_name": "Workflow",
+                "tool_input": {"name": "nh:qa-cell", "args": args},
+                "tool_use_id": f"toolu_guard_{prompt_id}",
+            },
+        )
 
     def task_stopped(
         self,
