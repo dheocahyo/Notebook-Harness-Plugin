@@ -1,0 +1,5 @@
+# Spike V15's stand-in for nh's settings file: Claude's edits of it should ask.
+version = 1
+
+[project]
+goal = "Spike V15: does the desktop app show nh's ask dialog?"
