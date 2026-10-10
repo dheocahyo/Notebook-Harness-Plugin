@@ -10,11 +10,22 @@ from typing import Any
 
 from common import PLUGIN_ROOT, Payload, context, setting, settings
 
-from nh_gateway._shared import secrets
+from nh_gateway._shared import harness_toml, secrets
 from nh_gateway._shared.paths import Layout, read_json
 
 GOAL_MAX_CHARS = 200
 SERVER_FILE = re.compile(r"jpserver-\d+\.json")
+# The senior preset's explanation depth (design §6.9): SessionStart context only, never the
+# per-turn reminder. Junior gets no line: it is the depth the skills default to. It names the
+# reply contract, which comes later and says more, so the contract shrinks rather than wins.
+SENIOR_LINE = (
+    "Preset: senior. Keep explanations short. After a cell runs, answer the reply contract in a "
+    "single short paragraph of a few plain sentences, not a paragraph per part, without headings, "
+    "labels or bullet lists: what changed, what to check in the output (the numbers that matter, "
+    "surprises first) and the proposed next cell; skip a part with nothing to say. Don't explain "
+    "what common pandas methods do; /nh:explain still walks through every part in numbered steps, "
+    "without defining methods."
+)
 LAB_NOT_FOUND = (
     "JupyterLab: no running server found for this project. Before notebook work, call "
     'mcp__plugin_nh_nh__nh_inspect(view="status"); only if it reports no JupyterLab (E130), '
@@ -39,6 +50,7 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
         "Notebook Harness (nh) is active in this project: the notebook grows by one reviewed "
         "cell per user message.",
         " ".join(facts),
+        SENIOR_LINE if harness_toml.preset_level(config)[0] == "senior" else None,
         "Before any notebook work, load the skill nh:notebook, and call "
         "mcp__plugin_nh_nh__nh_inspect before your first write.",
         lab_status(read_json(layout.lab_json), str(layout.project)),

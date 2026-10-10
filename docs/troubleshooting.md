@@ -86,10 +86,12 @@ Find the code below.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **D171** "harness.toml's [preset] level isn't junior or senior" (`nhctl doctor`) | `harness.toml`'s `[preset] level` is another word, empty, or not a string (`level = "Senior"`, `level = 1`), so nh uses junior; every result's `--- config ---` says `preset.level must be junior\|senior` | `nhctl preset senior` (or `junior`), or fix the line by hand: `level = "senior"` under `[preset]` |
-| **D171** "harness.toml's preset isn't a [preset] table" (`nhctl doctor`) | a top-level line such as `preset = "senior"`, so nh uses junior; every result's `--- config ---` says `preset must be a table` | delete that line, then run `nhctl preset senior` (or `junior`) |
+| **D171** "harness.toml's [preset] level isn't junior or senior" (`nhctl doctor`, `/nh:status`) | `harness.toml`'s `[preset] level` is another word, empty, or not a string (`level = "Senior"`, `level = 1`), so nh uses junior; every result's `--- config ---` says `preset.level must be junior\|senior` | `nhctl preset senior` (or `junior`), or fix the line by hand: `level = "senior"` under `[preset]` |
+| **D171** "harness.toml's preset isn't a [preset] table" (`nhctl doctor`, `/nh:status`) | a top-level line such as `preset = "senior"`, so nh uses junior; every result's `--- config ---` says `preset must be a table` | delete that line, then run `nhctl preset senior` (or `junior`) |
 | **D172** `nhctl preset` didn't change harness.toml | `harness.toml` is missing, isn't a plain UTF-8 file (a folder, a symlink), is read-only, doesn't parse, can't be written (a read-only folder, a full disk), changed while nh edited it, or sets the preset in a form nh doesn't edit (`[preset.x]`, a second `level` line, a quoted `"level"`); nothing was written | missing: run `/nh:init`. Read-only: `chmod u+w harness.toml`. A top-level `preset = …` or `preset.level = …` line: delete it and rerun. Otherwise fix the file, or set the level by hand: `level = "senior"` under `[preset]` |
 | After `nhctl preset senior` the comment hints didn't change | `harness.toml` sets `[lint] comment_ratio` itself, which wins over the preset (`nhctl preset` says so) | delete or comment out that line to let the preset decide |
+| After `nhctl preset senior` Claude still explains at length | the explanation depth reaches Claude when a session starts, not in a running one, and it is advisory: replies after a cell still cover nh's report parts, in a short paragraph; a level that isn't exactly `senior` reads as junior (D171) | `/clear` or start a new session; `/nh:status` shows the level nh reads |
+| After `nhctl preset junior` Claude still keeps explanations short | junior adds no line, and a running, resumed (`--resume`, `--continue`) or compacted conversation still holds the senior line it was given | `/clear` or start a new session |
 
 ## Logs and state
 

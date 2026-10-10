@@ -279,8 +279,9 @@ def test_preset_text_output(env, project):
     harness(project, scaffolded())
     proc = env.run("preset", "senior", cwd=project)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == (
-        "Preset: senior (was junior). harness.toml updated; nh uses it from its next tool call.\n"
+    assert proc.stdout == (  # design §6.9 (C9b): the budget now, the depth from a new session
+        "Preset: senior (was junior). harness.toml updated: the comment budget applies from nh's "
+        "next tool call, the explanation depth from a new session or /clear.\n"
         "Comment budget: 1 comment line per 16 code lines.\n"
     )
     proc = env.run("preset", "senior", cwd=project)
@@ -288,6 +289,13 @@ def test_preset_text_output(env, project):
     assert proc.stdout == (
         "Preset: senior already; harness.toml unchanged.\n"
         "Comment budget: 1 comment line per 16 code lines.\n"
+    )
+    proc = env.run("preset", "junior", cwd=project)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == (
+        "Preset: junior (was senior). harness.toml updated: the comment budget applies from nh's "
+        "next tool call, the explanation depth from a new session or /clear.\n"
+        "Comment budget: 1 comment line per 8 code lines.\n"
     )
 
 
@@ -546,7 +554,22 @@ def test_preset_reports_an_explicit_comment_ratio(env, project):
     assert (report["comment_ratio"], report["comment_ratio_set_by"]) == (8, "harness.toml")
     assert path.read_text() == '[preset]\nlevel = "senior"\n[lint]\ncomment_ratio = 8\n'
     proc = env.run("preset", "junior", cwd=project)
-    assert proc.stdout.endswith(
+    assert proc.returncode == 0, proc.stderr
+    # design §6.9 (C9b): the preset doesn't set the budget, so the first line names only the depth
+    assert proc.stdout == (
+        "Preset: junior (was senior). harness.toml updated: the explanation depth applies from a "
+        "new session or /clear.\n"
+        "Comment budget: harness.toml's [lint] comment_ratio = 8 sets it, not the preset.\n"
+    )
+    proc = env.run("preset", "senior", cwd=project)
+    assert proc.stdout == (
+        "Preset: senior (was junior). harness.toml updated: the explanation depth applies from a "
+        "new session or /clear.\n"
+        "Comment budget: harness.toml's [lint] comment_ratio = 8 sets it, not the preset.\n"
+    )
+    proc = env.run("preset", "senior", cwd=project)
+    assert proc.stdout == (
+        "Preset: senior already; harness.toml unchanged.\n"
         "Comment budget: harness.toml's [lint] comment_ratio = 8 sets it, not the preset.\n"
     )
 

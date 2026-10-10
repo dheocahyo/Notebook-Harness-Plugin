@@ -5,8 +5,6 @@ from __future__ import annotations
 import importlib.util
 import itertools
 import json
-import math
-import os
 import shutil
 import subprocess
 import sys
@@ -25,7 +23,9 @@ from hookenv import (
     Sandbox,
     command_line,
     hook_entries,
+    hook_time_factor,
     needs_system_python,
+    p95,
 )
 
 pytestmark = needs_system_python
@@ -344,11 +344,6 @@ def test_hooks_import_only_stdlib_and_shared(sandbox, event, variant, tool) -> N
     assert not (sandbox.nh / "logs" / "hooks.log").exists()
 
 
-def p95(samples: list[float]) -> float:
-    ordered = sorted(samples)
-    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
-
-
 @pytest.mark.slow
 def test_hook_latency_p95(sandbox: Sandbox) -> None:
     """p95 < 150 ms per hook on the system 3.9, as users run before the runtime is ready.
@@ -359,7 +354,7 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
     set) absorbs a busy machine; NH_HOOK_TIME_FACTOR=1 checks the bare budget. Measured on
     an M-series Mac: 35-56 ms idle, 80-135 ms at load average 7.
     """
-    factor = float(os.environ.get("NH_HOOK_TIME_FACTOR", "2" if os.environ.get("CI") else "1.5"))
+    factor = hook_time_factor()
     sandbox.ready_runtime()
     env = {k: v for k, v in sandbox.env.items() if k != "NH_PYTHON"}
     (sandbox.project / "harness.toml").write_text('[project]\ngoal = "g"\n')

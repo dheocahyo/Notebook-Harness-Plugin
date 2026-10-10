@@ -12,8 +12,10 @@ later nh version changes that default.
 - **Precedence:** built-in defaults < the preset's settings (`[preset] level`,
   below) < keys set in `harness.toml` < `NH_*` environment variables.
 - **Reloads:** nh re-reads the file whenever it changes, before the next tool
-  call. Only `[approval]` needs a restart of the MCP server: in Claude Code, run
-  `/mcp`, pick `plugin:nh:nh` and choose Reconnect.
+  call. Two things reach Claude only when a session starts: the project's goal
+  and the preset's explanation depth (`[preset] level`): start a new session or
+  `/clear` after changing them. Only `[approval]` needs a restart of the MCP
+  server: in Claude Code, run `/mcp`, pick `plugin:nh:nh` and choose Reconnect.
 - **Mistakes:** an unknown key, a key in the wrong section or a value of the
   wrong type is ignored, and every nh result shows it under `--- config ---`
   until it is fixed.
@@ -55,13 +57,16 @@ What the project is. `/nh:init` fills these in.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `level` | `"junior"` | `junior` or `senior`. The preset sets `[lint] comment_ratio` (L105): 8 for junior, 16 for senior, so a senior project gets at most one comment line per 16 code lines. A `comment_ratio` you set under `[lint]` wins over the preset at either level. Any other value (another word, `""`, a number), or a `preset` that isn't a `[preset]` table, reads as `junior`, shows under `--- config ---` in every nh result, and `nhctl doctor` reports D171. |
+| `level` | `"junior"` | `junior` or `senior`. The preset sets `[lint] comment_ratio` (L105): 8 for junior, 16 for senior, so a senior project gets at most one comment line per 16 code lines. A `comment_ratio` you set under `[lint]` wins over the preset at either level. Senior also tells Claude, at the start of each session, to reply after each cell in one short paragraph (what changed and what to check in the output) and not to explain what common pandas methods do; `/nh:explain` keeps its numbered steps, without the definitions. Junior keeps the plain-words default (the reply after a cell covers the reply contract's parts at any length; `/nh:explain` defines each pandas method the first time it appears). The depth is advisory: Claude reads it, nh doesn't check it. Any other value (another word, `""`, a number), or a `preset` that isn't a `[preset]` table, reads as `junior`, shows under `--- config ---` in every nh result, and `nhctl doctor` reports D171 (`/nh:status` shows it too, with the level in use). |
 
 `/nh:init` doesn't ask; the level starts as junior. To change it, run
 `nhctl preset senior` (or `junior`) in the project: from a shell, as
 `! nhctl preset senior` in Claude Code, or by asking the agent, which runs it
 through Bash (Claude Code asks you first, unless your permission settings
-already allow the command). nh uses the new level from its next tool call.
+already allow the command). The comment budget applies from nh's next tool
+call, the explanation depth from a new session or `/clear` (a resumed or
+compacted session keeps the senior line it started with, so switching back to
+junior needs one of those).
 
 - **What it edits:** only the `level` line under `[preset]`: it replaces the
   value of an existing `level = …` (keeping its comment), else uncomments the

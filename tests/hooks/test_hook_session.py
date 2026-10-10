@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -10,7 +11,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from hookenv import Sandbox, command_line, lock_hash, needs_system_python
+from hookenv import (
+    PLUGIN,
+    Sandbox,
+    command_line,
+    hook_time_factor,
+    lock_hash,
+    needs_system_python,
+    p95,
+)
 
 pytestmark = needs_system_python
 
@@ -257,6 +266,199 @@ def test_the_whole_context_is_redacted(sandbox: Sandbox) -> None:
     assert "Goal: Query with [redacted:WAREHOUSE_TOKEN]." in text
     assert "Main notebook: notebooks/[redacted:WAREHOUSE_TOKEN].ipynb." in text
     assert token not in text
+
+
+# --- the preset's explanation depth (design §6.9, C9b) ---------------------------------------
+
+# Pinned byte for byte: the model reads it at every session start of a senior project.
+SENIOR_LINE = (
+    "Preset: senior. Keep explanations short. After a cell runs, answer the reply contract in a "
+    "single short paragraph of a few plain sentences, not a paragraph per part, without headings, "
+    "labels or bullet lists: what changed, what to check in the output (the numbers that matter, "
+    "surprises first) and the proposed next cell; skip a part with nothing to say. Don't explain "
+    "what common pandas methods do; /nh:explain still walks through every part in numbered steps, "
+    "without defining methods."
+)
+FIRST_LINE = (
+    "Notebook Harness (nh) is active in this project: the notebook grows by one reviewed cell "
+    "per user message."
+)
+FACTS_LINE = "Goal: Find what drives late deliveries. Main notebook: notebooks/01_eda.ipynb."
+SKILL_LINE = "Before any notebook work, load the skill nh:notebook"
+SENIOR = '[preset]\nlevel = "senior"\n'
+
+
+def context_lines(sandbox: Sandbox, toml: str | bytes | None) -> list[str]:
+    path = sandbox.project / "harness.toml"
+    if toml is None:
+        path.unlink(missing_ok=True)
+    elif isinstance(toml, bytes):
+        path.write_bytes(toml)
+    else:
+        path.write_text(toml)
+    run = start(sandbox)
+    assert run.returncode == 0, run.stderr
+    return run.context.split("\n")
+
+
+def test_senior_gets_the_depth_line_after_the_goal_line(sandbox: Sandbox) -> None:
+    lines = context_lines(sandbox, HARNESS + SENIOR)
+    assert lines[:3] == [FIRST_LINE, FACTS_LINE, SENIOR_LINE]
+    assert lines[3].startswith(SKILL_LINE)
+    assert lines.count(SENIOR_LINE) == 1 and sum("Preset:" in line for line in lines) == 1
+
+
+@pytest.mark.parametrize(
+    "toml,facts",
+    [
+        (SENIOR, []),  # neither a goal nor a notebook: right after the first line
+        (
+            '[project]\nnotebook = "notebooks/a.ipynb"\n' + SENIOR,
+            ["Main notebook: notebooks/a.ipynb."],
+        ),
+        ('[project]\ngoal = "Churn"\n' + SENIOR, ["Goal: Churn."]),
+        (SENIOR + '[project]\ngoal = "Churn"\n', ["Goal: Churn."]),  # [preset] first
+    ],
+)
+def test_the_depth_line_follows_the_facts_and_precedes_the_skill_line(
+    sandbox: Sandbox, toml: str, facts: list[str]
+) -> None:
+    lines = context_lines(sandbox, toml)
+    assert lines[: 2 + len(facts)] == [FIRST_LINE, *facts, SENIOR_LINE]
+    assert lines[2 + len(facts)].startswith(SKILL_LINE)
+
+
+NOT_SENIOR = [
+    "",  # no [preset]
+    "[preset]\n",  # no level
+    '[preset]\nlevel = "junior"\n',
+    '[preset]\n# level = "senior"\n',  # commented out, as /nh:init leaves it
+    '[preset]\nlevel = "Senior"\n',  # bad levels read as junior (D171), as the gateway reads them
+    '[preset]\nlevel = "senior "\n',
+    '[preset]\nlevel = ""\n',
+    '[preset]\nlevel = "expert"\n',
+    "[preset]\nlevel = 1\n",
+    '[preset]\nlevel = ["senior"]\n',
+    "[preset]\nlevel = true\n",
+    '[preset.level]\nname = "senior"\n',
+    '[lint]\nlevel = "senior"\n',  # a level in another table
+]
+
+
+@pytest.mark.parametrize("preset", NOT_SENIOR)
+def test_no_depth_line_unless_the_level_is_senior(sandbox: Sandbox, preset: str) -> None:
+    """Junior gets no line: its context is byte for byte the one of a project with no [preset]."""
+    plain = context_lines(sandbox, HARNESS)
+    assert context_lines(sandbox, HARNESS + preset) == plain
+    assert not any("Preset:" in line or "explanations" in line for line in plain)
+
+
+UNREADABLE: list[str | bytes | None] = [
+    None,  # no harness.toml
+    HARNESS + SENIOR + "[project\n",  # doesn't parse: no settings at all
+    HARNESS + SENIOR + 'level = "senior"\n',  # a key defined twice: refused, as by tomllib
+    (HARNESS + SENIOR).encode() + b"# \xff\n",  # not UTF-8
+]
+
+
+@pytest.mark.parametrize("toml", UNREADABLE)
+def test_no_depth_line_without_a_harness_toml_nh_can_read(
+    sandbox: Sandbox, toml: str | bytes | None
+) -> None:
+    """No settings at all: no goal line and no depth line, as the gateway reads defaults."""
+    lines = context_lines(sandbox, toml)
+    assert lines[0] == FIRST_LINE and lines[1].startswith(SKILL_LINE)
+    assert not any("Preset:" in line for line in lines)
+
+
+def test_a_preset_that_isnt_a_table_reads_as_junior(sandbox: Sandbox) -> None:
+    """`preset = "senior"` at the top level (D171): junior, as the gateway reads it."""
+    plain = context_lines(sandbox, HARNESS)
+    assert context_lines(sandbox, 'preset = "senior"\n' + HARNESS) == plain
+    assert FACTS_LINE in plain and not any("Preset:" in line for line in plain)
+
+
+def test_the_hook_and_the_gateway_read_the_same_level(sandbox: Sandbox) -> None:
+    """Design §6.9: a bad level, a non-table preset, a file that doesn't parse and no file read
+    as junior "as the gateway reads them": over every file above, the hook adds the line exactly
+    when `config.load` reads senior."""
+    from nh_gateway import config
+
+    files = [
+        HARNESS + SENIOR,
+        SENIOR,
+        SENIOR + '[project]\ngoal = "Churn"\n',
+        '[preset]\nlevel = "senior"  # pinned\n',
+        "[preset]\nlevel = 'senior'\n",
+        'preset = "senior"\n' + HARNESS,
+        *(HARNESS + preset for preset in NOT_SENIOR),
+        *UNREADABLE,
+    ]
+    for toml in files:
+        lines = context_lines(sandbox, toml)
+        level = config.load(sandbox.project)["preset"]["level"]
+        assert (SENIOR_LINE in lines) == (level == "senior"), toml
+        assert sum("Preset:" in line for line in lines) == (level == "senior"), toml
+
+
+def test_handle_reads_the_level_from_the_settings_it_already_read() -> None:
+    """Design §6.9: `harness_toml.preset_level(config)`, `config` being the one `settings(layout)`
+    `handle` reads for the goal: no other read of the file, and no level read another way."""
+    source = (PLUGIN / "hooks" / "nh_hooks" / "session_start.py").read_text(encoding="utf-8")
+    handle = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "handle"
+    )
+    assert ast.unparse(handle.body[0]) == "config = settings(layout)"
+    stored = [
+        node.id
+        for node in ast.walk(handle)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    ]
+    assert stored.count("config") == 1
+    calls = [ast.unparse(node.func) for node in ast.walk(handle) if isinstance(node, ast.Call)]
+    assert calls.count("settings") == 1 and calls.count("harness_toml.preset_level") == 1
+    assert not any("tomlread" in call or call.endswith(".load") for call in calls), calls
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "harness_toml" for node in ast.walk(handle)
+    )  # layout.harness_toml: the file's path
+    (line,) = [
+        node
+        for node in ast.walk(handle)
+        if isinstance(node, ast.IfExp) and ast.unparse(node.body) == "SENIOR_LINE"
+    ]
+    assert ast.unparse(line.test) == "harness_toml.preset_level(config)[0] == 'senior'"
+    assert ast.unparse(line.orelse) == "None"
+    assert "tomlread" not in source
+
+
+def test_the_depth_line_is_never_in_the_per_message_reminder(sandbox: Sandbox) -> None:
+    (sandbox.project / "harness.toml").write_text(HARNESS + SENIOR)
+    assert SENIOR_LINE in start(sandbox).context
+    payload = sandbox.payload("UserPromptSubmit", prompt="explain the last cell")
+    run = sandbox.run("UserPromptSubmit", payload)
+    assert run.returncode == 0 and run.context
+    assert "Preset:" not in run.context and "explanations short" not in run.context
+
+
+@pytest.mark.slow
+def test_senior_session_start_stays_within_the_hook_budget(sandbox: Sandbox) -> None:
+    """p95 < 150 ms on a senior project, timed as test_hook_shim's test_hook_latency_p95 times
+    every hook: the production interpreter (a ready runtime venv), 3 warm-up runs, then 20,
+    each with its real result."""
+    sandbox.ready_runtime()
+    env = {k: v for k, v in sandbox.env.items() if k != "NH_PYTHON"}
+    (sandbox.project / "harness.toml").write_text(HARNESS + SENIOR)
+    samples = []
+    for n in range(23):
+        run = start(sandbox, env=env)
+        assert run.returncode == 0 and SENIOR_LINE in run.context.split("\n"), run.stderr
+        if n >= 3:
+            samples.append(run.seconds)
+    ms = round(p95(samples) * 1000)
+    print("session-start (senior) p95 ms:", ms)
+    assert ms < 150 * hook_time_factor(), ms
 
 
 def test_setup_builds_the_runtime_in_the_foreground(sandbox: Sandbox) -> None:

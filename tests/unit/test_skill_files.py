@@ -399,6 +399,7 @@ def test_eval_case_files(case: Path):
         ("plan-no-code", 3),
         ("batch-asks-once", 3),
         ("batch-stops-on-check-this", 3),
+        ("preset-senior", 3),
     ],
 )
 def test_eval_scaffold_builds_a_consistent_project(tmp_path: Path, case: str, cells: int):
@@ -607,6 +608,36 @@ TRIPS = {
     '        "n_unique": df.nunique(),\n'
     "    }\n)\nprint(df.shape)\nschema",
 }
+# preset-senior (design §6.9, C9b): the cell its prompt asks for, as every run of the case's first
+# rounds wrote it (the prompt names df_clean, by_region, by_product and their columns), so its mock
+# is the real result of the cell the runs write. 16 code lines and no comment line; two outputs,
+# so nh adds no readability hint.
+SENIOR_CELL = {
+    "title": "Clean copy and revenue by region, product",
+    "notes": [
+        "Copies df to df_clean, parses order_date (impossible dates become NaT) and drops rows "
+        "with no price",
+        "Adds revenue as units times price, then totals revenue and counts orders per region and "
+        "per product, highest revenue first",
+    ],
+    "intent": "a clean copy of df with revenue, summed per region and per product",
+    "code": "df_clean = df.copy()\n"
+    'df_clean["order_date"] = pd.to_datetime(df_clean["order_date"], errors="coerce")\n'
+    'df_clean = df_clean.dropna(subset=["price"])\n'
+    'df_clean["revenue"] = df_clean["units"] * df_clean["price"]\n\n'
+    "by_region = (\n"
+    '    df_clean.groupby("region")\n'
+    '    .agg(revenue=("revenue", "sum"), orders=("order_id", "count"))\n'
+    '    .sort_values("revenue", ascending=False)\n'
+    ")\n"
+    "by_product = (\n"
+    '    df_clean.groupby("product")\n'
+    '    .agg(revenue=("revenue", "sum"), orders=("order_id", "count"))\n'
+    '    .sort_values("revenue", ascending=False)\n'
+    ")\n\n"
+    "display(by_region)\n"
+    "display(by_product)",
+}
 # batch-stops-on-check-this (design §6.3, C6c): the user's "run the next 3" and yes, which every
 # scenario of its mocks replays first (MOCK_PROMPTS, _bs_replay), and plan steps as runs write
 # them. The fixture has no duplicate rows, so dropping them is a check this and stops the batch.
@@ -674,12 +705,16 @@ MOCK_SCENARIOS: dict[str, tuple[dict[str, str], list[tuple[str, str, dict[str, A
         [*BS_STOPPED, ("p1", "nh_run", {"cell_id": "$cell"})],
     ),
     "batch-stops-on-check-this/mocks/nh/nh_undo.md": ({}, [*BS_STOPPED, ("p1", "nh_undo", {})]),
+    "preset-senior/mocks/nh/nh_add_cell.md": ({}, [("p1", "nh_add_cell", SENIOR_CELL)]),
 }
 # The human messages (prompt id, text) a mock's scenario sends before its calls, which go in the
 # last one's turn.
 MOCK_PROMPTS = {name: BATCH_YES for name in MOCK_SCENARIOS if name.startswith("batch-stops-on")}
 # Mocks replayed on another case's project than the shared fixture: its scaffold script.
-MOCK_FIXTURES = {"init-url-data/mocks/nh/nh_inspect.md": "init-url-data/scaffold.sh"}
+MOCK_FIXTURES = {
+    "init-url-data/mocks/nh/nh_inspect.md": "init-url-data/scaffold.sh",
+    "preset-senior/mocks/nh/nh_add_cell.md": "preset-senior/scaffold.sh",  # under the senior preset
+}
 # What a URL serves while a mock's scenario runs (the kernel is FakeBackend, in this process).
 MOCK_URLS: dict[str, dict[str, str]] = {}
 
@@ -694,7 +729,11 @@ EXACT_MOCKS = {
     "batch-stops-on-check-this/mocks/nh/nh_edit_cell.md",
     "batch-stops-on-check-this/mocks/nh/nh_run.md",
     "batch-stops-on-check-this/mocks/nh/nh_undo.md",
+    "preset-senior/mocks/nh/nh_add_cell.md",  # its rubric quotes the output and the self-check
 }
+# Exact mocks of a cell nh adds: they echo the call's title, and the run time and the new cell's id
+# differ from run to run (design §6.9).
+EXACT_NEW_CELL_MOCKS = {"preset-senior/mocks/nh/nh_add_cell.md"}
 # Mocks whose `--- output ---` section a grader quotes (secret-print-refused's rubric quotes
 # KEY_CHECK_OUTPUT), with the kernel environment the real run needs to print the same.
 OUTPUT_MOCKS: dict[str, dict[str, str]] = {
@@ -702,6 +741,14 @@ OUTPUT_MOCKS: dict[str, dict[str, str]] = {
         "OPENAI_API_KEY": "sk-" + "fakeKeyForTheDriftTest0123456789",  # fake
     },
 }
+
+
+def _new_cell_form(text: str, title: str) -> str:
+    """An added cell's result as its exact mock must match it: the call's title in place of
+    `{{input.title}}`, and the run time and the new cell's id read as any."""
+    text = text.replace("{{input.title}}", title)
+    text = re.sub(r"\bran ok in \d+(?:\.\d+)?s;", "ran ok in Ns;", text)
+    return re.sub(r"\bcell=nh-[0-9a-f]{10}\b", "cell=nh-ID", text)
 
 
 def _output_section(text: str) -> str:
@@ -869,6 +916,9 @@ async def test_mock_matches_the_real_gateway_result(name: str, monkeypatch: pyte
     real = await run_mock_scenario(name)
     assert result_shape(body) == result_shape(real), f"{name} drifted from the gateway:\n{real}"
     if name in EXACT_MOCKS:  # its graders read the numbers, which result_shape leaves out
+        if name in EXACT_NEW_CELL_MOCKS:
+            title = MOCK_SCENARIOS[name][1][-1][2]["title"]
+            body, real = _new_cell_form(body, title), _new_cell_form(real, title)
         assert body.strip() == real.strip(), f"{name} drifted from the gateway:\n{real}"
     if name in OUTPUT_MOCKS:  # a grader quotes its output
         assert _output_section(body) == _output_section(real), f"{name}'s output drifted:\n{real}"
@@ -2462,7 +2512,13 @@ def test_the_network_cases_are_ci_cases_on_their_scaffolds():
     init = _read(EVALS / "init-url-data" / "scaffold.sh")
     assert 'nhctl" scaffold' in init and f'--data "{TRIPS_URL}"' in init
     assert "--data-mode" not in init and "curl" not in init and "wget" not in init
-    assert MOCK_FIXTURES == {"init-url-data/mocks/nh/nh_inspect.md": "init-url-data/scaffold.sh"}
+    # init-url-data's mock replays on its own scaffold, approval-network-cell's on the shared one;
+    # a mock replayed off the shared fixture (preset-senior's too, C9b) is on its own case's
+    assert MOCK_FIXTURES["init-url-data/mocks/nh/nh_inspect.md"] == "init-url-data/scaffold.sh"
+    assert not any(name.startswith("approval-network-cell/") for name in MOCK_FIXTURES)
+    assert all(
+        script == f"{name.split('/')[0]}/scaffold.sh" for name, script in MOCK_FIXTURES.items()
+    )
 
 
 def test_approval_network_cell_graders_read_what_they_say():
@@ -4070,6 +4126,258 @@ def test_skill_registered_reads_the_init_skill_list():
     assert not pattern.search(json.dumps(reply, separators=(",", ":")))
 
 
+# ------------------------------------------------------------------ preset-senior (design §6.9, C9b)
+
+PS_CASE = EVALS / "preset-senior"
+PS_MOCK = "preset-senior/mocks/nh/nh_add_cell.md"
+PS_GRADERS = {"add-called", "senior-line", "comment-budget", "terse-reply"}
+
+
+def _build(script: Path, where: Path) -> Path:
+    where.mkdir()
+    subprocess.run(["bash", str(script)], cwd=where, check=True, env={"PATH": "/usr/bin:/bin"})
+    return where
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_preset_senior_is_the_shared_fixture_made_senior(tmp_path: Path):
+    """Its scaffold is base.sh's project plus `[preset] level = "senior"`, which the gateway reads
+    as senior (comment_ratio 16) with no config problem."""
+    senior = _build(PS_CASE / "scaffold.sh", tmp_path / "senior")
+    base = _build(EVALS / "_scaffold" / "base.sh", tmp_path / "base")
+    cfg = config.load(senior)
+    assert cfg.problems == [] and cfg["preset"]["level"] == "senior"
+    assert cfg["lint"]["comment_ratio"] == 16
+    toml = (base / "harness.toml").read_text(encoding="utf-8")
+    assert (senior / "harness.toml").read_text(encoding="utf-8") == (
+        toml + '\n[preset]\nlevel = "senior"\n'
+    )
+    assert config.load(base)["preset"]["level"] == "junior"
+    for rel in ("data/sales.csv", "notebooks/eda.ipynb"):
+        assert (senior / rel).read_bytes() == (base / rel).read_bytes(), rel
+    front, prompt = split_frontmatter(PS_CASE / "prompt.md")
+    assert front["tags"] == ["ci"] and (front["runs"], front["max_turns"]) == (3, 12)
+    assert front["allowed_tools"] == ["Read", "Glob", "Grep", "Skill"]
+    for name in ("df_clean", "by_region", "by_product", "revenue", "orders"):
+        assert re.search(rf"\b{name}\b", prompt), name  # the names SENIOR_CELL uses
+    # SENIOR_CELL prints nothing: a print the fixed mock doesn't answer grades a reply on an
+    # output that isn't its cell's (C9b review)
+    assert "display only two tables" in prompt and "print nothing else" in prompt
+    assert "print(" not in SENIOR_CELL["code"]
+    assert (PS_CASE / "mocks" / "nh").is_dir() and [
+        m.name for m in (PS_CASE / "mocks" / "nh").iterdir()
+    ] == ["nh_add_cell.md"]
+
+
+def test_preset_senior_grader_weights_need_every_grader():
+    """Design §6.9: `terse-reply`, the depth, weighs 3 of 9, so missing in 2 runs of 3 fails the
+    case (0.78) and in 1 passes (0.89); each other grader weighs 2 of 9, so missing in all 3 runs
+    fails it (0.78) and in 2 passes (0.85), a deliberate tolerance."""
+    weights, threshold = _weights("preset-senior"), _ci_threshold()
+    assert weights == {"add-called": 2, "senior-line": 2, "comment-budget": 2, "terse-reply": 3}
+
+    def passes(*runs: set[str]) -> bool:
+        return _case_score(weights, list(runs)) >= threshold
+
+    assert passes(set(), set(), set())
+    for grader in sorted(PS_GRADERS):
+        assert passes({grader}, set(), set()), grader
+        assert passes({grader}, {grader}, set()) == (grader != "terse-reply"), grader
+        assert not passes({grader}, {grader}, {grader}), grader
+    # one miss each of the depth and another grader, in one run or in two, still passes
+    assert passes({"terse-reply", "comment-budget"}, set(), set())
+    assert passes({"terse-reply"}, {"comment-budget"}, set())
+    specs = {g.stem: split_frontmatter(g)[0] for g in (PS_CASE / "graders").glob("*.md")}
+    assert specs["add-called"] == {
+        "type": "tool_used",
+        "tool": TOOL_PREFIX + "nh_add_cell",
+        "min": 1,
+        "max": 1,
+        "weight": 2,
+    }
+    assert (specs["senior-line"]["target"], specs["senior-line"]["arm"]) == ("trace", "with-only")
+    budget = specs["comment-budget"]
+    assert (budget["target"], budget["match"], budget["arm"]) == (
+        "mock_calls",
+        "not_contains",
+        "both",
+    )
+    assert (specs["terse-reply"]["type"], specs["terse-reply"]["focus"]) == ("llm", "last_message")
+
+
+def _session_start_output(project: Path, home: Path) -> str:
+    """The real SessionStart hook's stdout for ``project``, run as an eval runs it."""
+    proc = subprocess.run(
+        ["/bin/sh", str(PLUGIN / "hooks" / "nh-hook"), "session-start"],
+        input=json.dumps(
+            {
+                "session_id": "s",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "cwd": str(project),
+            }
+        ).encode(),
+        capture_output=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "CLAUDE_PLUGIN_ROOT": str(PLUGIN),
+            "CLAUDE_PROJECT_DIR": str(project),
+            "CLAUDE_PLUGIN_DATA": str(home / "data"),
+            "CLAUDE_CODE_EVAL_CONFINED": "1",
+        },
+        cwd=str(project),
+        timeout=30,
+        check=True,
+    )
+    return proc.stdout.decode()
+
+
+def _hook_response_line(output: str) -> str:
+    """The trace's line for a SessionStart hook's result (compact JSON, as a kept 2.1.296 trace
+    holds it: the hook's stdout as the `output` string)."""
+    record = {
+        "type": "system",
+        "subtype": "hook_response",
+        "hook_id": "0cf31e5f-1d89-4c4b-bc84-5a3b498d7dcd",
+        "hook_name": "SessionStart:startup",
+        "hook_event": "SessionStart",
+        "output": output,
+        "stdout": output,
+        "stderr": "",
+        "exit_code": 0,
+        "outcome": "success",
+    }
+    return json.dumps(record, separators=(",", ":"))
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_senior_line_reads_the_real_session_start_of_a_senior_project(tmp_path: Path):
+    """`senior-line` matches the real hook's output on the case's own project, not on base.sh's
+    junior one, nor a reply quoting the line (JSON-escaped in the trace) or the hook's start."""
+    spec, _ = split_frontmatter(PS_CASE / "graders" / "senior-line.md")
+    pattern = re.compile(spec["pattern"])
+    senior = _build(PS_CASE / "scaffold.sh", tmp_path / "senior")
+    junior = _build(EVALS / "_scaffold" / "base.sh", tmp_path / "junior")
+    senior_out = _session_start_output(senior, tmp_path / "home")
+    junior_out = _session_start_output(junior, tmp_path / "home")
+    line = (
+        "Preset: senior. Keep explanations short. After a cell runs, answer the reply contract in a "
+        "single short paragraph of a few plain sentences, not a paragraph per part, without "
+        "headings, labels or bullet lists: what changed, what to check in the output (the numbers "
+        "that matter, surprises first) and the proposed next cell; skip a part with nothing to say. "
+        "Don't explain what common pandas methods do; /nh:explain still walks through every part "
+        "in numbered steps, without defining methods."
+    )
+    context = json.loads(senior_out)["hookSpecificOutput"]["additionalContext"].split("\n")
+    assert context[2] == line and context[1].startswith("Goal: ")
+    assert pattern.search(_hook_response_line(senior_out))
+    assert not pattern.search(_hook_response_line(junior_out))
+    assert "Preset:" not in junior_out
+    started = {"type": "system", "subtype": "hook_started", "hook_event": "SessionStart"}
+    reply = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": _hook_response_line(senior_out)}]},
+    }
+    for record in (started, reply, {"type": "user", "message": {"content": line}}):
+        assert not pattern.search(json.dumps(record, separators=(",", ":"))), record
+
+
+def _with_comments(code: str, *comments: tuple[int, str]) -> str:
+    """``code`` with ``(line index, comment)`` added: a whole line before that line, or, for an
+    inline comment (starting with two spaces), at the end of it."""
+    lines = code.split("\n")
+    for index, comment in sorted(comments, reverse=True):
+        if comment.startswith("  #"):
+            lines[index] += comment
+        else:
+            lines.insert(index, comment)
+    return "\n".join(lines)
+
+
+WHY = "# errors='coerce': an impossible date becomes NaT instead of raising"
+# (comments added to SENIOR_CELL, does L105 fire under senior, under junior)
+PS_COMMENTS = [
+    ((), False, False),
+    (((1, WHY),), False, False),
+    (((1, "  # the impossible 2024-02-30 becomes NaT"),), False, False),
+    (((1, "  # NaT for 2024-02-30 # coerce"),), False, False),  # two `#`, one comment line
+    (((1, WHY), (5, "# one table per grouping column")), True, False),
+    (((1, WHY), (3, "  # units times price")), True, False),
+    (((1, "  # NaT for 2024-02-30"), (3, "  # units times price")), True, False),
+    (((0, "# a clean copy"), (1, WHY), (5, "# per region")), True, True),
+]
+
+
+@pytest.mark.parametrize("comments,senior,junior", PS_COMMENTS)
+@pytest.mark.parametrize("spaced", [False, True])
+def test_comment_budget_reads_the_code_as_l105_at_seniors_ratio(
+    tmp_path: Path, comments: tuple, senior: bool, junior: bool, spaced: bool
+):
+    """`comment-budget` fails the add call exactly when L105 fires under the senior preset on
+    SENIOR_CELL (16 code lines: senior's budget 1, junior's 2), on compact and spaced lines."""
+    from nh_gateway.lint.lint import lint_cell
+
+    spec, _ = split_frontmatter(PS_CASE / "graders" / "comment-budget.md")
+    pattern = re.compile(spec["pattern"])
+    code = _with_comments(SENIOR_CELL["code"], *comments)
+    fired = {}
+    for level in ("senior", "junior"):
+        (tmp_path / "harness.toml").write_text(f'version = 1\n[preset]\nlevel = "{level}"\n')
+        report = lint_cell(
+            code,
+            title=SENIOR_CELL["title"],
+            notes=SENIOR_CELL["notes"],
+            intent=SENIOR_CELL["intent"],
+            cfg=config.load(tmp_path),
+            require_note=True,
+            require_intent=True,
+            kernel_python=None,
+            names_above=None,
+        )
+        assert report.code_lines == 16, report.code_lines
+        fired[level] = "L105" in {hint.rule for hint in report.hints}
+    assert fired == {"senior": senior, "junior": junior}
+    inspect = _mock_call("nh_inspect", {"view": "status"}, spaced)
+    add = _mock_call("nh_add_cell", {**SENIOR_CELL, "code": code}, spaced)
+    assert bool(pattern.search("\n".join([inspect, add]))) == senior
+    # a `#` in the title or notes is no comment; one inside a string counts (design §6.9)
+    titled = _mock_call("nh_add_cell", {**SENIOR_CELL, "title": "Top #1 # region"}, spaced)
+    assert not pattern.search(titled)
+
+
+def test_terse_reply_carries_the_mocks_whole_output():
+    """The judge sees only the last message, so the rubric quotes the mock's output and self-check
+    sections verbatim, and names the facts a reply may work out or read from the data."""
+    _, rubric = split_frontmatter(PS_CASE / "graders" / "terse-reply.md")
+    _, body = split_frontmatter(EVALS / PS_MOCK)
+    for section in ("output", "self-check"):
+        found = re.search(rf"^--- {section} ---\n.*?(?=^--- )", body, flags=re.M | re.S)
+        assert found and found.group(0) in rubric, section
+    assert "--- next ---" not in rubric
+    for phrase in (
+        "says what a common pandas method (to_datetime, dropna, groupby, agg, sort_values) does "
+        "in general",
+        "explains the code line by line, each line or call with its own explanation",
+        "ends with one proposed next cell",
+        "says it wrote or will write a second cell",
+        "presents a number the output below doesn't show",
+        "6 orders without a price dropped from 43",
+        "3100.74",
+        "2024-02-30",
+        # the depth the senior line asks for, which a junior reply's headed parts fail (§6.9)
+        "PASS if the reply is short plain prose, one or two short paragraphs",
+        "(a first sentence saying where the cell landed, and a last sentence proposing the next "
+        "cell, may stand on their own)",
+        "FAIL if it has headings or part labels",
+        "a bulleted or numbered list, or a table",
+        "runs to more than two paragraphs besides those two sentences",
+    ):
+        assert phrase in rubric, phrase
+    assert round(968.42 + 921.70 + 811.77 + 398.85, 2) == 3100.74
+    assert round(1435.80 + 987.81 + 677.13, 2) == 3100.74
+
+
 # secret-print-refused: the graders read the cell's code in the mock_calls line, like L011 does.
 SECRET_CASE = EVALS / "secret-print-refused"
 # Cells that check OPENAI_API_KEY without showing its value: every one lints clean of L011/L014.
@@ -4796,7 +5104,9 @@ def test_every_new_v02_code_in_nhctl_has_its_troubleshooting_row():
 
 def test_the_preset_is_documented():
     """Design §6.9: harness-toml.md's [preset] row and Reserved list, troubleshooting's D171 and
-    D172 rows and the README's nhctl preset row say what C9a built."""
+    D172 rows and the README's nhctl preset row say what C9a built, and what C9b added: the
+    explanation depth, advisory, from a new session or /clear (a resumed or compacted session keeps
+    the senior line), and /nh:status showing the level."""
     harness = _read(REPO / "docs" / "harness-toml.md")
     row = next(line for line in harness.splitlines() if line.startswith("| `level` |"))
     for phrase in (
@@ -4805,8 +5115,28 @@ def test_the_preset_is_documented():
         "A `comment_ratio` you set under `[lint]` wins over the preset at either level.",
         "`nhctl doctor` reports D171",
         "`--- config ---`",
+        # C9b: the depth line, advisory, and /nh:status
+        "Senior also tells Claude, at the start of each session, to reply after each cell in one "
+        "short paragraph",
+        "not to explain what common pandas methods do",
+        "`/nh:explain` keeps its numbered steps, without the definitions",
+        "The depth is advisory",
+        "`/nh:status` shows it too",
     ):
         assert phrase in row, phrase
+    prose = " ".join(harness.split())
+    assert (
+        "The comment budget applies from nh's next tool call, the explanation depth from a new "
+        "session or `/clear` (a resumed or compacted session keeps the senior line it started "
+        "with, so switching back to junior needs one of those)."
+    ) in prose
+    assert "nh uses the new level from its next tool call" not in prose
+    assert "the next session (or `/clear`)" not in prose
+    reloads = next(line for line in harness.split("\n- ") if line.startswith("**Reloads:**"))
+    assert (
+        "Two things reach Claude only when a session starts: the project's goal and the preset's "
+        "explanation depth"
+    ) in " ".join(reloads.split())
     reserved = next(line for line in harness.split("\n- ") if line.startswith("**Reserved:**"))
     assert "`[guardrails]`" in reserved and "[preset]" not in reserved
     ratio = next(line for line in harness.splitlines() if line.startswith("| `comment_ratio` |"))
@@ -4816,11 +5146,69 @@ def test_the_preset_is_documented():
     assert "harness.toml's [preset] level isn't junior or senior" in troubleshooting
     assert "harness.toml's preset isn't a [preset] table" in troubleshooting
     assert "read-only" in troubleshooting.split("| **D172** ", 1)[1].split("\n", 1)[0]
+    d171 = [row for row in troubleshooting.splitlines() if row.startswith("| **D171** ")]
+    assert len(d171) == 2 and all("(`nhctl doctor`, `/nh:status`)" in row for row in d171)
+    later = next(r for r in troubleshooting.splitlines() if "Claude still explains at length" in r)
+    assert "`/clear`" in later and "`/nh:status`" in later and "advisory" in later
+    assert "(startup, resume" not in later  # a running session gets no new SessionStart
+    back = next(r for r in troubleshooting.splitlines() if "still keeps explanations short" in r)
+    assert back.startswith("| After `nhctl preset junior` ")
+    for phrase in ("junior adds no line", "resumed", "compacted", "`/clear`"):
+        assert phrase in back, phrase
     readme = _read(PLUGIN / "README.md")
     assert (
         "| `nhctl preset senior`, `junior` | the project's preset in `harness.toml`: senior "
-        "allows 1 comment line per 16 code lines, junior (the default) 1 per 8 |"
+        "allows 1 comment line per 16 code lines and asks for short explanations, junior (the "
+        "default) 1 per 8; the comment budget applies from nh's next tool call, the explanation "
+        "depth from a new session or /clear |"
     ) in readme
+
+
+def test_status_shows_the_preset_and_explain_defers_to_it():
+    """Design §6.9 (C9b): /nh:status has a Preset row read from the doctor's `project.preset`,
+    with D171's message and fix when the level is bad and D131's when the file doesn't parse
+    (junior then); /nh:explain defines methods only at the default depth and keeps its numbered
+    steps under another, which a senior project's SessionStart line sets."""
+    front, body = split_frontmatter(PLUGIN / "skills" / "status" / "SKILL.md")
+    assert "Bash(nhctl doctor *)" in front["allowed-tools"]
+    rows = [line for line in body.splitlines() if line.startswith("| ")]
+    checks = [row.split(" | ")[0][2:] for row in rows[2:]]
+    assert checks.index("Preset") == checks.index("Project") + 1
+    preset = rows[2 + checks.index("Preset")]
+    for phrase in (
+        "`junior` or `senior`",
+        "`project.preset`",
+        "D171",
+        "D131 saying harness.toml can't be parsed (nh then reads junior)",
+        "message and fix",
+    ):
+        assert phrase in preset, phrase
+    assert "the Preset row prints the\n   level instead" in body
+    doctor = _read(PLUGIN / "scripts" / "nhctl" / "doctor.py")
+    assert '"project": project_info' in doctor and '"preset": level,' in doctor  # project.preset
+    assert 'problems.add("D171", *preset_problem)' in doctor
+    assert 'return [f"harness.toml can\'t be parsed: {exc}"]' in doctor  # D131's, as the row reads
+    _, explain = split_frontmatter(PLUGIN / "skills" / "explain" / "SKILL.md")
+    depth = " ".join(explain.split("Depth: ", 1)[1].split("\n\n", 1)[0].split())
+    assert depth.startswith(
+        "plain and junior-level, defining each pandas method the first time it appears (one "
+        "short clause each), unless nh's session context sets another depth: then follow it, and "
+        "still walk through every part in numbered steps."
+    )
+    assert "Define each pandas method" not in explain  # no unconditional definitions (C9b review)
+    hook = _read(PLUGIN / "hooks" / "nh_hooks" / "session_start.py")
+    senior = " ".join(
+        "".join(
+            re.findall(r'"([^"]*)"', hook.split("SENIOR_LINE = (", 1)[1].split("\n)", 1)[0])
+        ).split()
+    )
+    for phrase in (
+        "answer the reply contract in a single short paragraph of a few plain sentences, not a "
+        "paragraph per part, without headings, labels or bullet lists",
+        "Don't explain what common pandas methods do",
+        "/nh:explain still walks through every part in numbered steps, without defining methods.",
+    ):
+        assert phrase in senior, phrase
 
 
 def test_the_ask_flow_is_documented_where_the_model_reads_it():

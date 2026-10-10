@@ -394,8 +394,16 @@ def cmd_preset(args: argparse.Namespace) -> Result:
         "comment_ratio": ratio,
         "comment_ratio_set_by": set_by,
     }
-    if changed:
-        head = f"Preset: {level} (was {was}). {SHOWN} updated; nh uses it from its next tool call."
+    if changed and set_by == "preset":
+        head = (
+            f"Preset: {level} (was {was}). {SHOWN} updated: the comment budget applies from "
+            "nh's next tool call, the explanation depth from a new session or /clear."
+        )
+    elif changed:  # an explicit [lint] comment_ratio sets the budget, as the next line says
+        head = (
+            f"Preset: {level} (was {was}). {SHOWN} updated: the explanation depth applies from "
+            "a new session or /clear."
+        )
     else:
         head = f"Preset: {level} already; {SHOWN} unchanged."
     if set_by == "preset":
