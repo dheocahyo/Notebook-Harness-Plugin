@@ -866,10 +866,13 @@ def _flagged_text(flagged: list) -> str:
 
 
 def _notebook_dir(project: Path, notebook: Path) -> str:
-    """The notebook's folder relative to the project, as L013 takes it: "" for the root or a
-    notebook outside the project (design §6.10)."""
+    """The notebook's folder, where the review's kernel runs, as L013 takes it: relative to the
+    project, "" for the root; a notebook outside the project gives its own folder, absolute, so a
+    relative write from there is judged where it lands (design §6.10)."""
     folder = posixpath.normpath(os.path.relpath(notebook.parent, project).replace(os.sep, "/"))
-    return "" if folder in (".", "..") or folder.startswith("../") else folder
+    if folder == ".." or folder.startswith("../"):
+        return posixpath.normpath(notebook.parent.as_posix())
+    return "" if folder == "." else folder
 
 
 def _code_cells(copy: Path) -> list[int]:

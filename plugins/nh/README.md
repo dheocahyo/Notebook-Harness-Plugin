@@ -24,6 +24,14 @@ works in the same notebook you are looking at.
   Claude replies. It is still one cell per message, and one undo removes it.
   A cell nh asks you about first comes back to Claude, which asks you and,
   after your yes, writes it itself without a QA check.
+- **Review.** `/nh:review` runs a copy of the notebook top to bottom in a
+  separate kernel and reports the cells that fail, hidden state (a name a cell
+  reads before the cell that defines it, cells run out of order), long cells
+  to move to `src/`, and each cell's intent by heading. Your kernel and the
+  notebook stay as they are. Cells that would install packages, reach a host
+  your project hasn't approved, write outside the project (`/tmp` aside) or
+  show a secret, or that nh can't parse, run there only after your
+  `/nh:review yes`.
 - **Guardrails.** No raw edits to `.ipynb` files, no cells that print an env
   var's value, no writes from subagents except nh's own cell writer inside
   `/nh:qa-cell`, and a cell that installs packages, reaches a host your
@@ -130,11 +138,12 @@ and stops at the first error, "check this" finding or nh question.
 | `/nh:explain [cell]` | a numbered walkthrough of a cell (the last one by default) in chat, changing nothing; nh enforces it unless the text names a change ("fix", "add", "make", …) |
 | `/nh:plan <goal>` | a 5-12 step plan for the goal in chat, one cell per step, changing nothing; then "go" or "run the next N" |
 | `/nh:qa-cell <ask>` | one agent writes this message's cell, another QA-checks it (automatic under ultracode) |
+| `/nh:review [notebook]` | run a copy of the notebook (harness.toml's by default) top to bottom in a separate kernel and report failing cells, hidden state, cells to move to `src/` and the intents by heading, saved in `.nh/reviews/`; it asks first about cells that would install packages, reach a host your project hasn't approved, write outside the project (`/tmp` aside) or show a secret, or that nh can't parse: answer `/nh:review yes` or `/nh:review no`. Your kernel and the notebook are never touched |
 | `nhctl lab start`, `status`, `stop` | the project's JupyterLab |
 | `nhctl doctor` | the same checks as `/nh:status`, from a shell |
 | `nhctl preset senior`, `junior` | the project's preset in `harness.toml`: senior allows 1 comment line per 16 code lines and asks for short explanations, junior (the default) 1 per 8; the comment budget applies from nh's next tool call, the explanation depth from a new session or /clear |
 | `nhctl fresh-run` | run a copy of the notebook top to bottom in a fresh kernel |
-| `nhctl fresh-run --review` | `/nh:review`'s run: a copy of the notebook in a separate kernel, past errors; reports failing cells, hidden-state dependencies, cells over `[lint] max_cell_lines` (candidates for `src/`) and the cells' intents by heading, in `.nh/reviews/`. Cells that would install packages, reach the network, write outside the project or show a secret, or that nh can't parse, stop it before anything runs (exit 2) until you pass `--yes <digest>` (run them; the digest names the cells it listed) or `--skip-flagged` (skip them); your kernel and the notebook file are never touched |
+| `nhctl fresh-run --review` | `/nh:review`'s run: a copy of the notebook in a separate kernel, past errors; reports failing cells, hidden-state dependencies, cells over `[lint] max_cell_lines` (candidates for `src/`) and the cells' intents by heading, in `.nh/reviews/`. Cells that would install packages, reach a host your project hasn't approved, write outside the project (`/tmp` aside) or show a secret, or that nh can't parse, stop it before anything runs (exit 2) until you pass `--yes <digest>` (run them; the digest names the cells it listed) or `--skip-flagged` (skip them); your kernel and the notebook file are never touched |
 | `nhctl metrics summarize` | cells per message, undos and rejections, from `.nh/log.jsonl` |
 
 `nhctl` is on Claude Code's Bash PATH while nh is enabled.

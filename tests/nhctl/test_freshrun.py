@@ -678,7 +678,8 @@ print(json.dumps({
 def test_the_reviews_cell_timeout_and_notebook_dir(tmp_path, python):
     """The skill's --timeout 540 leaves --cell-timeout unset, so the review's default, 180 s,
     interrupts a hanging cell well before the deadline (V7's interrupt_on_timeout). L013 gets the
-    notebook's folder relative to the project, "" for the root or outside it."""
+    notebook's folder relative to the project, "" for the root, and for a notebook outside the
+    project its own folder, absolute: the review's kernel runs there (C10b's review)."""
     argv = [str(PLUGIN / "scripts" / "nhctl"), str(SERVER / "src")]
     proc = subprocess.run(
         [python, "-c", OPTIONS, *argv], capture_output=True, text=True, timeout=60, check=False
@@ -687,7 +688,7 @@ def test_the_reviews_cell_timeout_and_notebook_dir(tmp_path, python):
     shown = json.loads(proc.stdout)
     assert shown["skill"] == [540.0, None]
     assert shown["defaults"] == [180, 30, 600, 30, 33]
-    assert shown["dirs"] == ["notebooks", "notebooks/eda", "", "", "..cache"]
+    assert shown["dirs"] == ["notebooks", "notebooks/eda", "", "/srv/work/other", "..cache"]
 
 
 def test_a_cell_over_its_timeout_is_interrupted_and_the_review_goes_on(env, nb_project, tmp_path):

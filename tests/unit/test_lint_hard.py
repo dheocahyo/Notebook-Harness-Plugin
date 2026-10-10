@@ -2976,6 +2976,9 @@ def test_l013_relative_paths_start_from_the_notebooks_folder(
         ("/data/x.csv", "/home/me/proj/", "notebooks", "/data/x.csv"),
         ("/home/me/proj/x.csv", "/home/me/proj/", "", None),
         ("../../x.csv", "/home/me/proj", "notebooks", "/home/me/x.csv"),
+        # a notebook outside the project: the review passes its folder, absolute (design §6.10)
+        ("x.csv", "/home/me/proj", "/home/me/other", "/home/me/other/x.csv"),
+        ("../proj/x.csv", "/home/me/proj", "/home/me/other", None),
         ("~/x.csv", "/home/me/proj", "", "~/x.csv"),
         ("~", "/home/me/proj", "", "~"),
         # a project inside /tmp (tests, evals): every /tmp path is exempt

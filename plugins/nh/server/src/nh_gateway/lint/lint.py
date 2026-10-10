@@ -201,7 +201,7 @@ class _Cell:
     approved_hosts: frozenset[str]  # host keys; L012 skips a site whose hosts are all here
     code_above: tuple[str, ...]  # the code cells above, in order: L012 and L013 read their names
     project_root: str | None  # the project's folder; L013 needs it to tell inside from outside
-    notebook_dir: str  # the notebook's folder, relative to the project root (the kernel's)
+    notebook_dir: str  # the notebook's folder, relative to the root (absolute outside it)
 
     @classmethod
     def build(
@@ -312,8 +312,9 @@ def lint_cell(
     """Lint one cell. ``approved_hosts``: the project's approved host keys (the gateway reads
     ``.nh/state/approved_hosts.json`` per call), which L012 lets through; ``code_above``: the
     code cells above it, whose names L012 and L013 read; ``project_root`` and ``notebook_dir``
-    (the notebook's folder, relative to the root): where the project is and where the kernel
-    runs, for L013, which finds nothing without a root (design §6.4)."""
+    (the notebook's folder, relative to the root, or absolute for a notebook outside it, as the
+    review passes it): where the project is and where the kernel runs, for L013, which finds
+    nothing without a root (design §6.4, §6.10)."""
     clean_title = normalize_title(title) if title and title.strip() else None
     bullets = [re.sub(r"\s*\n\s*", " ", bullet) for bullet in split_notes(notes)]
     cell = _Cell.build(

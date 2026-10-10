@@ -7,12 +7,15 @@ import contextlib
 import csv
 import datetime
 import fnmatch
+import hashlib
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import textwrap
 import time
 import uuid
@@ -128,6 +131,7 @@ def test_every_skill_has_name_and_short_description():
         "status",
         "explain",
         "plan",
+        "review",
     }
     for path in SKILLS:
         front, body = split_frontmatter(path)
@@ -400,6 +404,7 @@ def test_eval_case_files(case: Path):
         ("batch-asks-once", 3),
         ("batch-stops-on-check-this", 3),
         ("preset-senior", 3),
+        ("review-report", 15),
     ],
 )
 def test_eval_scaffold_builds_a_consistent_project(tmp_path: Path, case: str, cells: int):
@@ -4376,6 +4381,625 @@ def test_terse_reply_carries_the_mocks_whole_output():
         assert phrase in rubric, phrase
     assert round(968.42 + 921.70 + 811.77 + 398.85, 2) == 3100.74
     assert round(1435.80 + 987.81 + 677.13, 2) == 3100.74
+
+
+# ------------------------------------------------------------------ review-report (design §6.10, C10b)
+#
+# /nh:review can't run in an eval (no Bash in a run: design §6.10), so the case resumes a session
+# whose last message ran it: the /nh:review message and the skill text it loaded, Claude's step-1
+# line, its Bash call (step 2's command) and that call's result, the stdout of the real
+# `nhctl fresh-run --review --json` on the case's scaffold with `ms` and the report's timestamp
+# fixed. The tests below rebuild that history from the skill and rerun the review.
+
+REVIEW_CASE = EVALS / "review-report"
+REVIEW_SKILL = PLUGIN / "skills" / "review" / "SKILL.md"
+# Step 2 as design §6.10 gives it: the skill's command, byte for byte.
+REVIEW_COMMAND = (
+    'nhctl fresh-run --review --plugin-data "${CLAUDE_PLUGIN_DATA}" --timeout 540 --json'
+)
+# What each rule the review flags would do in its kernel, in the D154 question's words.
+REVIEW_RULE_WORDS = {
+    "package_install": "installs packages",
+    "network": "reaches the network",
+    "outside_write": "writes outside the project",
+    "secret_print": "shows environment variables",
+    "secret_name": "shows a value named like a secret",
+    "unreadable": "is code nh can't parse, so it can't tell what it does",
+}
+REVIEW_QUESTION = (
+    "   > The review runs every cell again in a separate kernel. These cells would also do more "
+    "there:\n   > - <label>: <what>\n   >\n   > Run them in the review too? Type `/nh:review yes` "
+    "to run every cell, or `/nh:review no` to skip these; the report then lists them as not run.\n"
+)
+# The pre-approved rule (design §6.10): every command the skill gives, never a plain fresh-run.
+REVIEW_RULE = "Bash(nhctl fresh-run --review *)"
+# The recorded run: its report's name and first line, and its time.
+REVIEW_STAMP = "20261010T101500"
+REVIEW_WHEN = "2026-10-10 10:15"
+REVIEW_MS = 6214
+REVIEW_REPORT = f".nh/reviews/{REVIEW_STAMP}-eda.md"
+# An installed nh's folders, as Claude Code fills them in when /nh:review loads the skill
+# (`Base directory for this skill: …` and ${CLAUDE_PLUGIN_DATA}; a real session, design §6.10).
+REVIEW_SKILL_DIR = "/home/user/.claude/plugins/cache/notebook-harness/nh/0.2.0/skills/review"
+REVIEW_DATA = "/home/user/.claude/plugins/data/nh-notebook-harness"
+# Claude's step-1 line and its Bash call's description in that real session.
+REVIEW_SAYS = (
+    "The review can take a few minutes: it runs every cell again in a separate kernel, and the "
+    "notebook and its kernel stay as they are."
+)
+REVIEW_BASH_ID = "toolu_01NhReviewReportHistory0001"
+REVIEW_BASH_DESCRIPTION = "Run notebook review in separate kernel"
+REVIEW_PROMPT = "What did the review find?"
+REVIEW_GRADERS = {
+    "findings": 5,
+    "names-file": 2,
+    "no-ids": 1,
+    "no-ipynb-read": 1,
+    "no-nh-calls": 15,
+}
+# A reply the graders pass (the real session's, its report's name the recording's, every cell's
+# intent given: C10b's review found the judge passed four Clean cells by title only).
+REVIEW_REPLY = """**Review of `notebooks/eda.ipynb`:** all 6 code cells ran: 4 ok and 2 failed.
+
+**Failing cells**
+- "Count priced orders per region" [4]: `NameError`: name 'df_clean' is not defined
+- "Add a revenue column" [3]: `KeyError`: 'price'
+
+**Hidden state**
+- "Count priced orders per region" [4] reads `df_clean`, which "Drop rows with missing price" [2] defines.
+- "Drop rows with missing price" [2] ran before "Count priced orders per region" [4] above it.
+- "Add a revenue column" [3] ran before "Rename price to unit_price" [5] above it.
+- Both failing cells fail only in a fresh kernel.
+
+**Cells to move to `src/`**
+- "Check every column's values" [6]: 45 lines, over the 40-line limit.
+
+**Intent summary**
+- **Load**: "Load raw data and check schema" [1] loads data/sales.csv and checks its columns; "Count priced orders per region" [4] counts the priced orders in each region.
+- **Clean**: "Drop rows with missing price" [2] drops the rows where price is missing; "Rename price to unit_price" [5] renames the price column to unit_price; "Add a revenue column" [3] adds revenue as units times price; "Check every column's values" [6] checks each column for missing, repeated or impossible values.
+
+Report file: `.nh/reviews/20261010T101500-eda.md`"""
+
+
+def _review_skill_loaded() -> str:
+    """The text Claude Code adds when the user types /nh:review: the skill's folder, then its
+    body with ${CLAUDE_PLUGIN_DATA} filled in (a real session's transcript, design §6.10)."""
+    body = split_frontmatter(REVIEW_SKILL)[1].lstrip("\n")
+    return f"Base directory for this skill: {REVIEW_SKILL_DIR}\n\n" + body.replace(
+        "${CLAUDE_PLUGIN_DATA}", REVIEW_DATA
+    )
+
+
+def _review_history_jsonl(result: str) -> str:
+    """review-report's history_file for the Bash call's ``result`` (nhctl's stdout without its
+    newline), as Claude Code 2.1.296 writes /nh:review's first message up to that result: the
+    command message and the skill it loaded (`isMeta`) as two user entries, the reply's text and
+    its tool_use as two assistant entries of one message, and the result as a user entry with its
+    `toolUseResult`. The ids are fixed by the case and its place."""
+    case = "review-report"
+    command = REVIEW_COMMAND.replace("${CLAUDE_PLUGIN_DATA}", REVIEW_DATA)
+    bash = {"command": command, "description": REVIEW_BASH_DESCRIPTION, "timeout": 600000}
+    said = {"type": "text", "text": REVIEW_SAYS}
+    call = {"type": "tool_use", "id": REVIEW_BASH_ID, "name": "Bash", "input": bash}
+    answer = {"tool_use_id": REVIEW_BASH_ID, "type": "tool_result", "content": result}
+    ran = {"stdout": result, "stderr": "", "interrupted": False, "isImage": False}
+    turns: list[tuple[str, Any, dict[str, Any]]] = [
+        ("user", "<command-message>nh:review</command-message>\n<command-name>/nh:review"
+         "</command-name>", {}),
+        ("user", [{"type": "text", "text": _review_skill_loaded()}], {"isMeta": True}),
+        ("assistant", [said], {}),
+        ("assistant", [call], {}),
+        ("user", [dict(answer, is_error=False)],
+         {"toolUseResult": dict(ran, noOutputExpected=False)}),
+    ]  # fmt: skip
+    session, parent, lines = _history_session(case), None, []
+    for number, (role, content, extra) in enumerate(turns, start=1):
+        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"nh-evals/{case}/{number}"))
+        entry: dict[str, Any] = {
+            "parentUuid": parent,
+            "isSidechain": False,
+            "type": role,
+            "uuid": uid,
+            "timestamp": f"2026-10-10T10:15:{number:02d}.000Z",
+            "sessionId": session,
+            "userType": "external",
+            "version": "2.1.296",
+        }
+        if role == "user":
+            entry["message"] = {"role": "user", "content": content}
+        else:
+            entry["message"] = {
+                "id": "msg_nh_history_review",
+                "type": "message",
+                "role": "assistant",
+                "model": "<synthetic>",
+                "content": content,
+                "stop_reason": "tool_use",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        if "toolUseResult" in extra:
+            entry["sourceToolAssistantUUID"] = parent
+        entry.update(extra)
+        lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+        parent = uid
+    return "".join(lines)
+
+
+def _recorded_review() -> str:
+    """The Bash call's result the history holds: nhctl's JSON line."""
+    last = json.loads(_read(REVIEW_CASE / "history.jsonl").splitlines()[-1])
+    return last["message"]["content"][0]["content"]
+
+
+def _recorded_report() -> str:
+    """The report file the scaffold writes (the recorded run's)."""
+    script = _read(REVIEW_CASE / "scaffold.sh")
+    found = re.search(
+        rf"^cat > {re.escape(REVIEW_REPORT)} <<'REPORT'\n(.*?\n)REPORT\n", script, re.M | re.S
+    )
+    assert found, "scaffold.sh writes no recorded report"
+    return found.group(1)
+
+
+def _review_normalised(stdout: str, report: str) -> tuple[str, str]:
+    """A real review's stdout (its newline dropped, as the Bash tool gives it) and report file as
+    the recording holds them: the run's `ms`, and the report's timestamp, date, time and seconds,
+    fixed."""
+    data = json.loads(stdout)
+    assert re.fullmatch(r"\.nh/reviews/\d{8}T\d{6}-eda\.md", data["report"]), data["report"]
+    line, count = re.subn(r'"ms": \d+, ', f'"ms": {REVIEW_MS}, ', stdout.rstrip("\n"))
+    assert count == 1
+    line = line.replace(f'"report": "{data["report"]}"', f'"report": "{REVIEW_REPORT}"')
+    head = report.split("\n")[2]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d · .+ · \d+\.\d s", head), head
+    fixed = re.sub(r"^\S+ \S+ · ", f"{REVIEW_WHEN} · ", head)
+    fixed = re.sub(r" · \d+\.\d s$", f" · {REVIEW_MS / 1000:.1f} s", fixed)
+    return line, report.replace(head, fixed, 1)
+
+
+SERVER_PYTHON = PLUGIN / "server" / ".venv" / "bin" / "python"
+
+
+def _review_workspace(where: Path) -> tuple[Path, Path, dict[str, str]]:
+    """review-report's scaffold in ``where``/proj, set up to run the real review as
+    test_freshrun.py does: the server venv as the project env and as a ready runtime venv
+    (`venv-<sha(uv.lock)[:12]>` with `.nh-ready`), and nhctl's hermetic environment."""
+    project, home = where / "proj", where / "home"
+    project.mkdir()
+    home.mkdir()
+    subprocess.run(
+        ["bash", str(REVIEW_CASE / "scaffold.sh")],
+        cwd=project,
+        check=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
+    )
+    server = PLUGIN / "server"
+    env_json = {"manager": "uv", "prefix": str(server / ".venv")}
+    (project / ".nh" / "state" / "env.json").write_text(json.dumps(env_json), encoding="utf-8")
+    data = where / "plugin-data"
+    lock = hashlib.sha256((server / "uv.lock").read_bytes()).hexdigest()[:12]
+    (data / f"venv-{lock}" / "bin").mkdir(parents=True)
+    (data / f"venv-{lock}" / "bin" / "python").symlink_to(SERVER_PYTHON)
+    (data / f"venv-{lock}" / ".nh-ready").write_text("", encoding="utf-8")
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "LANG": "en_US.UTF-8",
+        "NH_PYTHON": sys.executable,
+        "NH_FALLBACK_ROOT": str(where / "root"),
+        "JUPYTER_RUNTIME_DIR": str(where / "jupyter-runtime"),
+        "JUPYTER_DATA_DIR": str(where / "jupyter-data"),
+        "JUPYTER_CONFIG_DIR": str(where / "jupyter-config"),
+    }
+    return project, data, env
+
+
+def _nhctl(command: str, project: Path, data: Path, env: dict[str, str]):
+    """``command`` (an `nhctl …` line of the skill's) with ${CLAUDE_PLUGIN_DATA} filled in, split
+    as a shell splits it and run through the repo's bin/nhctl."""
+    argv = shlex.split(command.replace("${CLAUDE_PLUGIN_DATA}", str(data)))
+    assert argv[0] == "nhctl", command
+    return subprocess.run(
+        ["/bin/sh", str(PLUGIN / "bin" / "nhctl"), *argv[1:]],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+def _freshrun_value(expression: str) -> Any:
+    """``expression`` evaluated with nhctl's freshrun imported, in a Python of its own (nhctl's
+    modules import as top-level names, which this process mustn't get), as test_freshrun does."""
+    code = (
+        "import json, sys; sys.path[:0] = sys.argv[1:3]; import freshrun; "
+        f"print(json.dumps({expression}))"
+    )
+    argv = [str(PLUGIN / "scripts" / "nhctl"), str(PLUGIN / "server" / "src")]
+    proc = subprocess.run(
+        [sys.executable, "-c", code, *argv], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_review_skill_is_user_invoked_and_runs_only_fresh_run():
+    """/nh:review (design §6.10, C10b): typed by the user, nhctl's review its only pre-approved
+    tool and no nh tool (nh_inspect probes the live kernel); step 1's line; step 2's command byte
+    for byte with Bash's ten minutes and the review's per-cell limit as freshrun computes it; the
+    D154 question in its exact form, answered with `/nh:review yes` or `no` (the rule pre-approves
+    a rerun only in the message that loads the skill), with the words of each rule the review
+    flags (review.py's keys, in order), and the rerun keeping the question's notebook; step 4's
+    parts, D153's longer review from a shell and a saved output Read; labels only."""
+    from nh_gateway import review
+
+    front, body = split_frontmatter(REVIEW_SKILL)
+    assert front["name"] == "review" and front["argument-hint"] == "[notebook]"
+    assert front["disable-model-invocation"] is True
+    assert front["allowed-tools"] == [REVIEW_RULE]
+    description = _prose(front["description"])
+    assert "/nh:review" in description
+    assert "Never touches the live kernel or the notebook." in description
+    assert "nh_" not in _read(REVIEW_SKILL).replace("`nh_inspect` would probe", "")
+    flat = _prose(body)
+    assert "Call no nh tool: `nh_inspect` would probe the live kernel" in flat
+    # the rule: step 2's command and both reruns, never a plain fresh-run (C10b's review: a plain
+    # one runs every cell with no flag check)
+    rule = REVIEW_RULE[len("Bash(") : -1]
+    rerun = (
+        'nhctl fresh-run --review {} "notebooks/02 other.ipynb" --plugin-data "/d" --timeout 540'
+    )
+    for command in (
+        REVIEW_COMMAND,
+        rerun.format("--yes 0123456789abcdef"),
+        rerun.format("--skip-flagged"),
+    ):
+        assert fnmatch.fnmatchcase(command, rule), command
+    assert not fnmatch.fnmatchcase('nhctl fresh-run --plugin-data "/d" --timeout 540 --json', rule)
+    # step 1: one line first; the recorded history's line says it
+    step1 = (
+        "Say first, in one line, that the review can take a few minutes: it runs every cell again "
+        "in a separate kernel, and the notebook and its kernel stay as they are."
+    )
+    assert step1 in flat and REVIEW_SAYS.startswith("The review can take a few minutes: ")
+    assert REVIEW_SAYS[len("The review ") :] in step1
+    # step 2: the command in a block of its own, Bash's ten minutes, no --cell-timeout, and the
+    # review's own limit per cell as freshrun computes it for that --timeout
+    assert re.findall(r"^ {3}```\n {3}(.*)\n {3}```$", body, flags=re.M) == [REVIEW_COMMAND]
+    assert "Run this with Bash, with `timeout: 600000`:" in body
+    assert "--cell-timeout" not in REVIEW_COMMAND and "Add no `--cell-timeout`" in flat
+    deadline = re.search(r"--timeout (\d+) ", REVIEW_COMMAND)
+    assert deadline
+    cell = _freshrun_value(f"freshrun._review_cell_timeout({deadline.group(1)})")
+    assert f"the review's own limit ({cell} s here) interrupts a cell that hangs" in flat
+    assert "If the user named a notebook, put its path right after `--review`." in flat
+    # step 3: the one question, word for word, and the words of every rule the review flags
+    assert REVIEW_QUESTION in body
+    table = re.findall(r"^ {3}\| `(\w+)` \| ([^|]+?) \|$", body, flags=re.M)
+    assert dict(table) == REVIEW_RULE_WORDS
+    assert [key for key, _ in table] == [key for _, key in review.FLAG_RULES] + [review.UNREADABLE]
+    for phrase in (
+        "A `yes` or `no` after `/nh:review` names no notebook: it answers step 3's question, so "
+        "run step 3's rerun instead (with no D154 above, this command as it is).",
+        "Exit 2, the JSON's `error.code` `D154`",
+        "then stop and wait for the answer (one question; no other call)",
+        "`<label>` is the cell's `label`, as given. `<what>` is its `rules`, each in these words, "
+        'joined with "; "',
+        # the rerun keeps the question's notebook (C10b's review: a dropped one reviewed
+        # harness.toml's), and only the slash answer is pre-approved
+        "The rerun: step 2's command with, right after `--review`, `--yes <digest>` for a yes (the "
+        "JSON's `digest`, as given) or `--skip-flagged` for a no, then the JSON's `notebook` in "
+        'double quotes: `nhctl fresh-run --review --yes <digest> "<notebook>" --plugin-data …`.',
+        "`/nh:review yes` or `no` runs it without a permission prompt; a plain yes or no gets the "
+        "same rerun, and Claude Code asks the user to allow it.",
+        "A D154 again after a yes means the flagged cells changed meanwhile: ask again, the same "
+        "way, about the new list.",
+        # step 4
+        "Exit 0, or exit 1 with `error.code` `D153`: show the report from the JSON.",
+        "With D153, say first that the review stopped before the end (`error`) and at which cell "
+        "(`stopped_at`)",
+        # D153's own fix says "Rerun with a larger --timeout"; Bash stops at 600 s (C10b's review)
+        "A longer review runs from a shell, `nhctl fresh-run --review --timeout 1800` (it writes "
+        "the same report): say so, and don't rerun it here with a larger `--timeout` (Bash stops a "
+        "command after 600 s).",
+        # the limit isn't a cell's length (C10b's review: "The longest cell is 40 lines")
+        "cells to move to `src/` (`src_candidates`), each with its line count: the cells over "
+        "`max_cell_lines` lines, the project's limit (no cell's length); with none, say no cell "
+        "is over that limit;",
+        "End by naming the report file (`report`).",
+        # Claude Code saves an output over 30,000 chars and shows its first 2 KB (C10b's review)
+        'If Claude Code saved the output to a file instead of showing it all ("Output too '
+        'large"), Read that file: it holds the whole JSON.',
+        "Any other error: its `message` and `fix`.",
+        "Name cells by their labels only; never mention `nh-` ids, line numbers or the review's "
+        "copy of the notebook.",
+    ):
+        assert phrase in flat, phrase
+    for key in ("failing", "hidden_state", "defined_in", "src_candidates", "not_run", "summary"):
+        assert f"(`{key}`" in flat, key
+    # out of order in the report's own words: the key `after` alone read as run order (C10b)
+    assert (
+        "cells that ran out of order, each as \"<label> ran before <its `after` cell's label> "
+        'above it" (its count is the lower one) or "<label> has the same count as <its `same_as` '
+        "cell's label> above it, so they ran in different kernel sessions\""
+    ) in flat
+    # fresh-only failures in the report's words too (C10b's review: a reply said neither failing
+    # cell came after a failed one, though [3]'s `after_error` was true)
+    assert (
+        'cells that fail only in a fresh kernel, each as "<label>: <ename> here, though the '
+        'notebook shows it ran without an error", plus "(a cell above it failed in the review)" '
+        'with `after_error`, "(a cell above it didn\'t run in the review)" with `after_not_run`, '
+        'or "(cells above it failed or didn\'t run in the review)" with both;'
+    ) in flat
+    for (error, not_run), note in review._ABOVE.items():
+        key = {(True, False): "with `after_error`", (False, True): "with `after_not_run`"}
+        assert f'"{note.strip()}" {key.get((error, not_run), "with both")}' in flat, note
+    markdown = _read(Path(review.__file__))
+    assert 'here, though the notebook shows it ran without "\n' in markdown
+    assert 'f"an error{note}"' in markdown
+    assert "ran before {c['after']['label']} above it\")" in markdown
+    assert "has the same count as {c['same_as']['label']} above it, so \"" in markdown
+    assert '"they ran in different kernel sessions"' in markdown
+
+
+def test_review_report_history_is_the_skills_first_message():
+    """The history is /nh:review's message up to its Bash call's result (rebuilt from the skill
+    by _review_history_jsonl): the skill's current text as Claude Code loads it, the step-1 line,
+    and step 2's command byte for byte, ${CLAUDE_PLUGIN_DATA} filled in; the result is a review
+    that ran to the end, with no nh- id or copy path. The prompt is the user's next message."""
+    case_yaml = _mapping(_read(REVIEW_CASE / "case.yaml").splitlines())
+    assert case_yaml["context"] == {
+        "scaffold_script": "scaffold.sh",
+        "history_file": "history.jsonl",
+    }
+    text = _read(REVIEW_CASE / "history.jsonl")
+    assert text == _review_history_jsonl(_recorded_review()), "rebuild review-report/history.jsonl"
+    entries = [json.loads(line) for line in text.splitlines()]
+    assert {entry["sessionId"] for entry in entries} == {_history_session("review-report")}
+    call = entries[3]["message"]["content"][0]["input"]
+    assert call["command"] == REVIEW_COMMAND.replace("${CLAUDE_PLUGIN_DATA}", REVIEW_DATA)
+    assert call["timeout"] == 600000 and f'"{REVIEW_DATA}"' in _review_skill_loaded()
+    assert "${" not in _review_skill_loaded()
+    ignored = "plugins/nh/evals/*/*-*-*-*-*.jsonl"  # the run's own transcript, next to it
+    assert ignored in _read(REPO / ".gitignore").splitlines()
+    assert fnmatch.fnmatch(
+        f"plugins/nh/evals/review-report/{_history_session('review-report')}.jsonl", ignored
+    )
+    recorded = _recorded_review()
+    result = json.loads(recorded)
+    assert (result["ok"], result["complete"], result["flagged"]) == (False, True, [])
+    assert (result["report"], result["ms"]) == (REVIEW_REPORT, REVIEW_MS)
+    assert not re.search(r"nh-[0-9a-f]{10}|\.nh/tmp", recorded)
+    front, prompt = split_frontmatter(REVIEW_CASE / "prompt.md")
+    assert prompt.strip() == REVIEW_PROMPT and front["tags"] == ["ci"]
+    assert (front["runs"], front["max_turns"]) == (3, 8)
+    assert front["allowed_tools"] == ["Read", "Glob", "Grep", "Skill"]
+    assert not (REVIEW_CASE / "mocks").exists()  # the suite's mocks answer nh's tools
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.skipif(not SERVER_PYTHON.exists(), reason="server venv not synced")
+def test_review_report_records_the_real_review(tmp_path: Path):
+    """The recorded result and report are what the real `nhctl fresh-run --review --json` gives
+    on the case's scaffold, run as step 2's command, with `ms` and the timestamp normalised."""
+    project, data, env = _review_workspace(tmp_path)
+    proc = _nhctl(REVIEW_COMMAND, project, data, env)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    report = _read(project / json.loads(proc.stdout)["report"])
+    assert _review_normalised(proc.stdout, report) == (_recorded_review(), _recorded_report())
+    assert _read(project / REVIEW_REPORT) == _recorded_report()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.skipif(not SERVER_PYTHON.exists(), reason="server venv not synced")
+def test_review_skill_steps_read_what_the_real_nhctl_prints(tmp_path: Path):
+    """What steps 3 and 4 rely on (design §6.10): a flagged cell in a notebook the user named
+    gives exit 2, `error.code` D154, that `notebook` as named, the cell's `label` and `rules`
+    under `flagged`, and the `digest`. Step 3's rerun, `--yes <digest> "<notebook>"` right after
+    `--review`, runs it too, in that notebook (exit 0); a stale digest asks again; and
+    `--skip-flagged "<notebook>"` there lists it as not run. Each command matches the skill's
+    rule; step 4's keys are there, `report` last."""
+    project, data, env = _review_workspace(tmp_path)
+    notebook = json.loads(_read(project / "notebooks" / "eda.ipynb"))
+    shows = "import os\nprint(os.environ['HOME'])"  # secret_print (L011)
+    cell = {"cell_type": "code", "execution_count": None, "id": "shows-home", "metadata": {},
+            "outputs": [], "source": shows}  # fmt: skip
+    named = "notebooks/02 other.ipynb"  # not harness.toml's notebook, a space in its name
+    other = dict(notebook, cells=[*notebook["cells"], cell])
+    (project / named).write_text(json.dumps(other), encoding="utf-8")
+    rule = REVIEW_RULE[len("Bash(") : -1]
+
+    def run(option: str):
+        command = REVIEW_COMMAND.replace("--review ", f"--review {option}", 1)
+        assert fnmatch.fnmatchcase(command, rule), command
+        return _nhctl(command, project, data, env)
+
+    asked = run(f'"{named}" ')  # step 2, the notebook right after --review
+    assert asked.returncode == 2, (asked.stdout, asked.stderr)
+    d154 = json.loads(asked.stdout)
+    assert set(d154) == {"ok", "error", "notebook", "flagged", "digest"}
+    assert d154["error"]["code"] == "D154" and re.fullmatch(r"[0-9a-f]{16}", d154["digest"])
+    assert d154["notebook"] == named
+    flagged = {"index": 15, "label": "the cell `import os`", "title": None,
+               "rules": ["secret_print"]}  # fmt: skip
+    assert d154["flagged"] == [flagged]
+
+    def answered(option: str):  # step 3's rerun: the option, then the JSON's notebook, quoted
+        return run(f'{option} "{d154["notebook"]}" ')
+
+    stale = answered("--yes " + "0" * 16)
+    assert stale.returncode == 2
+    assert json.loads(stale.stdout)["error"]["message"].startswith(
+        "The cells to ask about changed since that yes. 1 cell(s) would do more than compute"
+    )
+    skipped = answered("--skip-flagged")
+    assert skipped.returncode == 0, (skipped.stdout, skipped.stderr)
+    result = json.loads(skipped.stdout)
+    assert result["notebook"] == named
+    assert result["not_run"] == [{"index": 15, "label": flagged["label"], "reason": "flagged"}]
+    ran = answered(f"--yes {d154['digest']}")
+    assert ran.returncode == 0, (ran.stdout, ran.stderr)
+    result = json.loads(ran.stdout)
+    assert (result["notebook"], result["flagged"]) == (named, [flagged])
+    assert result["ran"] == {"ok": 5, "error": 2, "not_run": 0}
+    for key in ("failing", "hidden_state", "src_candidates", "max_cell_lines", "not_run",
+                "summary", "stopped_at"):  # fmt: skip
+        assert key in result, key
+    assert list(result)[-1] == "report"
+
+
+def test_review_report_graders_fail_what_they_guard():
+    """Each regex and tool grader on a good reply and on what it guards (design §6.10): a reply
+    without the report file, one naming an nh- id or the copy, a call of each nh tool (compact and
+    spaced), a Read of the notebook or the copy. The judge's rubric holds the recorded report."""
+    specs = {g.stem: split_frontmatter(g)[0] for g in (REVIEW_CASE / "graders").glob("*.md")}
+    assert _weights("review-report") == REVIEW_GRADERS
+    assert specs["no-ipynb-read"] == {"type": "tool_used", "tool": "Read",
+        "input_match": "\\.ipynb", "min": 0, "max": 0, "weight": 1, "arm": "both"}  # fmt: skip
+    for name, target, match in (
+        ("no-nh-calls", "mock_calls", "not_contains"),
+        ("names-file", "last_message", None),
+        ("no-ids", "last_message", "not_contains"),
+    ):
+        assert (specs[name]["type"], specs[name]["target"], specs[name].get("match")) == (
+            "regex",
+            target,
+            match,
+        ), name
+    assert specs["no-nh-calls"]["arm"] == "both"
+    assert (specs["findings"]["type"], specs["findings"]["focus"]) == ("llm", "last_message")
+    names = re.compile(specs["names-file"]["pattern"])
+    no_ids = re.compile(specs["no-ids"]["pattern"])
+    assert names.search(REVIEW_REPLY) and not no_ids.search(REVIEW_REPLY)
+    assert names.search(f"Saved to /tmp/x/{REVIEW_REPORT}.")
+    assert not names.search(REVIEW_REPLY.replace(REVIEW_REPORT, "the report file"))
+    assert not names.search(REVIEW_REPLY.replace(REVIEW_STAMP, "20261010T101501"))
+    for shown in ("(cell nh-5c2e8a1f34)", "the copy .nh/tmp/review-20261010T101500-4242.ipynb"):
+        assert no_ids.search(f"{REVIEW_REPLY}\n{shown}"), shown
+    calls = re.compile(specs["no-nh-calls"]["pattern"])
+    for spaced in (False, True):
+        for tool in sorted(TOOL_DEFAULTS):
+            assert calls.search(_mock_call(tool, {}, spaced)), (tool, spaced)
+        assert not calls.search(_mock_call("nh_inspect", {}, spaced).replace("nh_inspect", "x"))
+    reads = re.compile(specs["no-ipynb-read"]["input_match"])
+    for path in ("/w/notebooks/eda.ipynb", "/w/.nh/tmp/review-20261010T101500-4242.ipynb"):
+        assert reads.search(json.dumps({"file_path": path})), path
+    for path in (f"/w/{REVIEW_REPORT}", "/w/data/sales.csv"):
+        assert not reads.search(json.dumps({"file_path": path})), path
+    _, rubric = split_frontmatter(REVIEW_CASE / "graders" / "findings.md")
+    report = _recorded_report()
+    assert rubric.rstrip("\n").endswith(report.rstrip("\n"))  # the judge sees only the reply
+    # the judge's criteria, each a finding of the recorded report (C10b's review: a rubric
+    # weakened by one of them passed every test)
+    flat = _prose(rubric)
+    for phrase in (
+        'PASS if the reply reports all of these from the review: (1) the two failing cells, "Count '
+        'priced orders per region" [4] with a NameError (df_clean is not defined) and "Add a '
+        "revenue column\" [3] with a KeyError for 'price';",
+        '(2) that "Count priced orders per region" [4] reads df_clean, which only the later cell '
+        '"Drop rows with missing price" [2] defines;',
+        '(3) the two cells that ran out of order, "Drop rows with missing price" [2] before "Count '
+        'priced orders per region" [4] and "Add a revenue column" [3] before "Rename price to '
+        'unit_price" [5];',
+        '(4) "Check every column\'s values" [6], 45 lines, as a candidate to move to src/;',
+        # each cell's intent, not its title alone (C10b's review: titles only passed)
+        "(5) under the headings Load and Clean, each of the six cells (by its title or [n]) with "
+        "its intent, in the report's words or close to them; a cell's title alone is not its "
+        "intent",
+        "FAIL if it misses any of (1)-(5), gives a finding to another cell than the report does, "
+        "or states a number the review doesn't hold.",
+    ):
+        assert phrase in flat, phrase
+    for finding in (
+        "\"Count priced orders per region\" [4]: NameError: name 'df_clean' is not defined",
+        "\"Add a revenue column\" [3]: KeyError: 'price'",
+        '"Count priced orders per region" [4] reads `df_clean`, defined later in "Drop rows with '
+        'missing price" [2]',
+        '"Drop rows with missing price" [2] ran before "Count priced orders per region" [4] above',
+        '"Add a revenue column" [3] ran before "Rename price to unit_price" [5] above it',
+        '"Check every column\'s values" [6]: 45 lines',
+        "## Cells over 40 lines (candidates for src/)",
+        "### Load",
+        "### Clean",
+    ):
+        assert finding in report, finding
+    # the numbers it counts as held: the report's, the JSON's time and the skill's two limits
+    # (C10b's review: "in 6214 ms", true, failed under a list of the report's alone)
+    held = re.search(r"The report's numbers are (.*?); the review also gave its time as (\d+) ms, "
+                     r"and its deadline, (\d+) s, and its limit per cell, (\d+) s, count as held",
+                     flat)  # fmt: skip
+    assert held, "the rubric's numbers"
+    listed, ms, deadline, per_cell = held.groups()
+    assert listed == ("the date and time, 6 code cells, 4 ok, 2 failed, 6.2 s, the cells' [n] "
+                      "from 1 to 6, 40 and 45 lines")  # fmt: skip
+    for number in ("6 code cells", "4 ok", "2 failed", "6.2 s", "[1]", "[6]", "40 lines",
+                   "45 lines"):  # fmt: skip
+        assert number in report, number
+    assert report.split("\n")[2].startswith(REVIEW_WHEN)
+    recorded = json.loads(_recorded_review())
+    assert (int(ms), float(deadline)) == (recorded["ms"], recorded["timeout_s"])
+    assert f"({per_cell} s here)" in _read(REVIEW_SKILL)
+    assert int(per_cell) == _freshrun_value(f"freshrun._review_cell_timeout({deadline})")
+    assert f"--timeout {deadline} " in REVIEW_COMMAND
+
+
+def test_review_command_is_listed_where_the_commands_are():
+    """C10b: both READMEs name /nh:review in their feature list, the plugin README's command
+    table has its row, and troubleshooting's D154 row gives the question /nh:review asks (in the
+    skill's words); the out-of-order row's heading is the report's."""
+    from nh_gateway import review
+
+    for readme in (REPO / "README.md", PLUGIN / "README.md"):
+        bullets = _read(readme).split("\n## ", 1)[0]
+        assert "- **Review.** `/nh:review` runs a copy of the notebook" in bullets, readme
+    commands = _read(PLUGIN / "README.md").split("\n## Commands\n", 1)[1].split("\n## ", 1)[0]
+    row = next(r for r in commands.splitlines() if r.startswith("| `/nh:review [notebook]` |"))
+    for phrase in ("harness.toml's by default", "in `.nh/reviews/`", "it asks first",
+                   "Your kernel and the notebook are never touched"):  # fmt: skip
+        assert phrase in row, phrase
+    rows = _read(REPO / "docs" / "troubleshooting.md").splitlines()
+    d154 = next(r for r in rows if r.startswith("| **D154** "))
+    asks = re.search(r"Run them in the review too\?", REVIEW_QUESTION)
+    assert asks and f'`/nh:review` asks "{asks.group()}"' in d154
+    assert any(r.startswith('| A review lists "Cells that ran out of order" |') for r in rows)
+    assert '"Cells that ran out of order:"' in _read(Path(review.__file__))
+
+
+def test_review_report_weights():
+    """Design §6.10's weights (24 in all, as the explain cases'), at CI's threshold: an nh call in
+    one run of three fails the case (0.79), as the suite's other change-nothing cases do (C10b's
+    review: weighted 5 of 12, one call passed, 0.86); the judge, 5, failing every run fails it
+    (0.79), in two runs of three passes (0.86) and in one passes (0.93); the cheap graders alone
+    never fail it (names-file 0.92, no-ids and no-ipynb-read 0.96, every run); a judge miss and a
+    names-file miss in one run pass (0.90)."""
+    weights, threshold = _weights("review-report"), _ci_threshold()
+    assert weights == REVIEW_GRADERS and sum(weights.values()) == 24
+
+    def score(*runs: set[str]) -> float:
+        return round(_case_score(weights, list(runs)), 2)
+
+    ok: set[str] = set()
+    table = {  # design §6.10's table: the grader failing in 1, 2 and 3 runs of 3
+        "no-nh-calls": (0.79, 0.58, 0.38),
+        "findings": (0.93, 0.86, 0.79),
+        "names-file": (0.97, 0.94, 0.92),
+        "no-ids": (0.99, 0.97, 0.96),
+        "no-ipynb-read": (0.99, 0.97, 0.96),
+    }
+    for grader, scores in table.items():
+        failed = {grader}
+        runs = ((failed, ok, ok), (failed, failed, ok), (failed, failed, failed))
+        assert tuple(score(*r) for r in runs) == scores, grader
+    assert score(ok, ok, ok) == 1.0
+    assert score({"no-nh-calls"}, ok, ok) < threshold
+    assert score({"findings"}, {"findings"}, {"findings"}) < threshold
+    assert score({"findings"}, {"findings"}, ok) >= threshold  # r0's and r2's runs would pass
+    for cheap in ("names-file", "no-ids", "no-ipynb-read"):
+        assert score({cheap}, {cheap}, {cheap}) >= threshold, cheap
+    assert score({"findings", "names-file"}, ok, ok) == 0.90 >= threshold
 
 
 # secret-print-refused: the graders read the cell's code in the mock_calls line, like L011 does.

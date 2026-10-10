@@ -408,7 +408,9 @@ def test_newer_syntax_than_nhs_python_is_flagged(project: Path):
 
 def test_relative_writes_are_judged_from_the_notebooks_folder():
     """L013 resolves a relative path from the kernel's cwd, the notebook's folder: with a
-    project outside /tmp (which L013 exempts), ``../`` stays inside, ``../../`` doesn't."""
+    project outside /tmp (which L013 exempts), ``../`` stays inside, ``../../`` doesn't. A
+    notebook outside the project comes with its own folder, absolute (``_notebook_dir``), so its
+    relative write lands outside and asks (C10b's review: it had the project root)."""
     root = Path("/srv/nh-review-test/sales")
     secrets.install(secrets.Redactor.for_project(None))
     try:
@@ -420,6 +422,12 @@ def test_relative_writes_are_judged_from_the_notebooks_folder():
         assert [(f["index"], f["rules"]) for f in inside] == [(1, ["outside_write"])]
         at_root = review.flag(root, cells, "")
         assert [f["index"] for f in at_root] == [0, 1]
+        away = cells_of(
+            plain("open('written-by-review.txt', 'w').write('x')", 1),
+            plain("open('../../sales/kept.txt', 'w').write('x')", 2),
+        )
+        outside = review.flag(root, away, "/srv/nh-review-test/outside/sub")
+        assert [(f["index"], f["rules"]) for f in outside] == [(0, ["outside_write"])]
     finally:
         secrets.reset()
 

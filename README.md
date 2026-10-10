@@ -28,6 +28,14 @@ your files.
   Claude replies. It is still one cell per message, and one undo removes it.
   A cell nh asks you about first comes back to Claude, which asks you and,
   after your yes, writes it itself without a QA check.
+- **Review.** `/nh:review` runs a copy of the notebook top to bottom in a
+  separate kernel and reports the cells that fail, hidden state (a name a cell
+  reads before the cell that defines it, cells run out of order), long cells
+  to move to `src/`, and each cell's intent by heading. Your kernel and the
+  notebook stay as they are. Cells that would install packages, reach a host
+  your project hasn't approved, write outside the project (`/tmp` aside) or
+  show a secret, or that nh can't parse, run there only after your
+  `/nh:review yes`.
 - **Guardrails.** No raw `.ipynb` edits, no cells that print an env var's
   value, no writes from subagents except nh's own cell writer inside
   `/nh:qa-cell`, and a cell that installs packages, reaches a host your
