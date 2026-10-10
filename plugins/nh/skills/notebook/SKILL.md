@@ -91,11 +91,11 @@ Details: [reference/errors.md](reference/errors.md).
 
 ## Big asks: plan, don't build
 For broad or end-to-end asks that need 5 or more cells ("build a churn
-model", "do a full EDA"), write no code and call no write tool. Reply with
-5-12 numbered steps, each one cell with one visible output, and ask where to
-start. A short list of concrete steps ("drop X, then plot Y") is not a big
-ask: do the first step as this message's cell and propose the rest.
-See [reference/planning.md](reference/planning.md).
+model", "do a full EDA"), write no code and call no write tool. Read
+[reference/planning.md](reference/planning.md), then reply in its format: 5-12
+numbered steps, one cell each, in plain words (no code, backticks or
+constants), and ask where to start. A short list of steps ("drop X, then plot
+Y") is not a big ask: do the first step as this message's cell, propose the rest.
 
 ## Replies about the last cell
 The per-message nh reminder names the last cell. Read the user's next message
@@ -147,4 +147,4 @@ Code length has no cap; readability is what counts. Before/after pairs:
 - [reference/replies.md](reference/replies.md): replies by status, reviews, undo, drift, stale cells.
 - [reference/readable-code.md](reference/readable-code.md): 8 before/after pairs.
 - [reference/errors.md](reference/errors.md): retries, error template, refusal codes.
-- [reference/planning.md](reference/planning.md): the 5-12 step plan.
+- [reference/planning.md](reference/planning.md): the 5-12 step plan and the batch path.

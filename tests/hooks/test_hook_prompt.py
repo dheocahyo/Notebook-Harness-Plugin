@@ -22,11 +22,13 @@ EXPLAIN = (
     "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; "
     "change nothing."
 )
-# Design §6.3's ask and approved-batch parts (C6b), pinned: the model reads them each message.
+# Design §6.3's plan part (C6c) and ask and approved-batch parts (C6b), pinned: the model reads
+# them each message.
+PLAN = "[nh] Plan only this message: numbered steps in chat, never in the notebook; change nothing."
 ASK = "[nh] Ask, don't write: one question in chat, then stop."
 ASK_BATCH = (
-    '[nh] Ask, don\'t write: one question in chat, "Run steps a-b in one reply?", for the plan '
-    "steps the user asked for; then stop."
+    '[nh] Ask, don\'t write: one question in chat, "Run steps a-b in one reply?" (one cell per '
+    "step), for the plan steps the user asked for; then stop."
 )
 
 
@@ -34,7 +36,7 @@ def ask_batch(cap: int | None = None) -> str:
     """``ASK_BATCH`` for an ask of more steps than ``[turn] max_batch`` (``cap``)."""
     if cap is None:
         return ASK_BATCH
-    clause = f" (nh runs at most {cap} at once: ask about the first {cap})"
+    clause = f" (at most {cap}: ask about the first {cap})"
     return ASK_BATCH.replace("; then stop.", f"{clause}; then stop.")
 
 
@@ -432,8 +434,8 @@ def test_a_new_turn_records_the_message_intent(sandbox: Sandbox) -> None:
 
 
 def test_a_notification_keeps_the_turns_intent(sandbox: Sandbox) -> None:
-    say(sandbox, "/nh:plan the cleaning", "p1")
-    notify(sandbox, "note-1")
+    assert say(sandbox, "/nh:plan the cleaning", "p1").context == f"{RULE} {PLAN}"
+    assert notify(sandbox, "note-1").context == f"{BACKGROUND} {PLAN}"  # still a plan turn
     record = turn(sandbox)
     assert (record["prompt_id"], intent_of(record)) == ("note-1", ("plan", None, None, None, None))
 
@@ -688,8 +690,8 @@ def test_the_ask_and_batch_heads_for_new_messages(sandbox: Sandbox) -> None:
     # C7's re-run request asks too, without a batch: the plain ask part; its yes has no batch.
     assert say(sandbox, "re-run the stale cells", "p11").context == f"{RULE} {ASK}"
     assert say(sandbox, "yes", "p12").context == RULE
-    # An explain or plan message has its own part (or none): no ask part.
-    assert say(sandbox, "/nh:plan a churn model", "p13").context == RULE
+    # An explain or plan message has its own part: no ask part.
+    assert say(sandbox, "/nh:plan a churn model", "p13").context == f"{RULE} {PLAN}"
     assert say(sandbox, "explain the parse", "p14").context == f"{RULE} {EXPLAIN}"
 
 
@@ -804,7 +806,7 @@ def test_messages_typed_into_the_yes_message(sandbox: Sandbox) -> None:
 
 @pytest.mark.parametrize(
     ("typed", "part"),
-    [("explain what it does", EXPLAIN), ("run the next 2", ASK_BATCH), ("/nh:plan the rest", "")],
+    [("explain what it does", EXPLAIN), ("run the next 2", ASK_BATCH), ("/nh:plan the rest", PLAN)],
 )
 def test_a_mode_typed_into_the_yes_message_replaces_the_batch_part(
     sandbox: Sandbox, typed: str, part: str
@@ -857,11 +859,11 @@ def test_the_reminder_order_and_clip_with_the_batch_parts(sandbox: Sandbox) -> N
     # A batch step's report: 2 characters of the drift line would show, so it goes, and the
     # last cell after it.
     assert len(head) == 397 and notified == head
-    # Without a prompt id: the warning, RULE and the longest ask part, all whole; 5
-    # characters of the last cell would show, so it goes too.
+    # Without a prompt id: the warning, RULE and the longest ask part, all whole; 1
+    # character of the last cell would show, so it goes too.
     write_state(sandbox, "kernel_drift.json", {})
     longest = f"{NO_PROMPT_ID} {RULE} {ask_batch(5)}"
-    assert len(longest) == 393
+    assert len(longest) == 397
     assert say(sandbox, "run the next 9", None).context == longest
 
 
@@ -904,12 +906,14 @@ def test_the_ask_and_batch_parts_are_pinned(prompt_submit: ModuleType) -> None:
     ) == ask_batch(5)
     assert prompt_submit.BATCH.format(k=4) == batch(4)
     assert prompt_submit.BATCH_STOP == BATCH_STOP
+    assert prompt_submit.PLAN == PLAN  # C6c, outside the pinned MODE_PARTS
     assert prompt_submit.CLIP_MIN_CHARS == 24
-    for part in (ask_batch(20), ASK, ASK_HEADLESS, EXPLAIN):
+    for part in (ask_batch(20), ASK, ASK_HEADLESS, EXPLAIN, PLAN):
         assert len(f"{NO_PROMPT_ID} {RULE} {part}") <= 400, part
     for first in (QA_REPORT, QA_EARLIER, BACKGROUND):
         assert len(f"{first} {batch(20)}") <= 400
         assert len(f"{first} {ask_batch(20)}") <= 400
+        assert len(f"{NO_PROMPT_ID} {first} {PLAN}") <= 400
     assert len(f"{RULE} {batch(20)}") <= 400
     for first in (QA_REPORT, QA_EARLIER, BACKGROUND):  # cut: the docstring's case
         assert len(f"{NO_PROMPT_ID} {first} {batch(2)}") > 400

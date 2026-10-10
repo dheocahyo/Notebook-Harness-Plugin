@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import textwrap
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +122,13 @@ def is_model_invoked(front: dict) -> bool:
 
 
 def test_every_skill_has_name_and_short_description():
-    assert {path.parent.name for path in SKILLS} == {"notebook", "init", "status", "explain"}
+    assert {path.parent.name for path in SKILLS} == {
+        "notebook",
+        "init",
+        "status",
+        "explain",
+        "plan",
+    }
     for path in SKILLS:
         front, body = split_frontmatter(path)
         assert front["name"] == path.parent.name
@@ -165,6 +172,92 @@ def test_explain_skill_is_user_invoked_and_read_only():
     # reminder's last-cell line can be clipped away: the skill says both (design §6.2).
     assert "when the message names no change" in body and "the rule holds either way" in body
     assert "if it names none, the last code cell nh wrote" in " ".join(body.split())
+
+
+PLAN_SKILL = PLUGIN / "skills" / "plan" / "SKILL.md"
+# The plan format the plan skill and planning.md both state (design §6.3, C6c), worded alike.
+PLAN_FORMAT = [
+    "Each is one cell with one visible output the user can check (a table, a shape, one plot).",
+    "Start each step with its title in bold (a verb, at most 8 words), then a colon and the one "
+    'result it shows, in a few words: "**Drop customers without a signup date**: rows before and '
+    'after." One result, not two joined by "and": "the dates that fail to convert", not "the date '
+    'type, and the dates that fail to convert". A decision the user will face is a second short '
+    'sentence: "**Handle the missing ages**: the rows without an age. You choose whether to drop, '
+    'fill or keep them." One action per step: a step that would do two things ("list the names, '
+    'then merge them") is two steps.',
+    "Plain words only: no code, commands, constants, method or variable names, and no backticks. "
+    'Say "the first rows", not the method.',
+    "Start from what the user asked: the reply opens with the plan and says nothing about what "
+    'the notebook holds, before the list or after it ("cell [1] already loads the data" and "I '
+    'left out the loading step" are recaps: leave them out). A step the notebook already holds '
+    "(the loader, a check that ran) is not listed.",
+    "say so in words at the step that needs it (when that step comes, ask the user before "
+    'installing it). A package that `nh_inspect` lists under "installed:", "(not imported)" or '
+    'not, gets no word: "**Plot signups per week**: one line chart.", not "… one line chart. '
+    'This uses matplotlib, which is installed."',
+    'in these words: "Where should I start? Say "go" for step 1, or "run the next 3" to do '
+    'several in one reply." (or another number, or "run steps a-b"; you then ask once before '
+    "writing them).",
+]
+# The format's own examples come from no eval's data (C6c review): a model that copies one
+# can't pass for a plan of the fixture's sales.
+PLAN_EXAMPLE_TITLES = (
+    "Drop customers without a signup date",
+    "Handle the missing ages",
+    "Plot signups per week",
+)
+
+
+def test_plan_skill_is_user_invoked_and_read_only():
+    """/nh:plan (design §6.3, C6c): typed by the user, inspect only, E109 guards the rest; its
+    format is planning.md's, worded alike, and its later messages lead to the batch path."""
+    front, body = split_frontmatter(PLAN_SKILL)
+    explain, _ = split_frontmatter(PLUGIN / "skills" / "explain" / "SKILL.md")
+    assert front["name"] == "plan" and front["argument-hint"] == "<goal>"
+    assert front["disable-model-invocation"] is True
+    assert front["allowed-tools"] == explain["allowed-tools"] == [TOOL_PREFIX + "nh_inspect"]
+    assert "/nh:plan" in front["description"]
+    assert intent.classify("/nh:plan clean the data")["mode"] == "plan"  # E109 for its writes
+    flat = _prose(body)
+    assert "(nh refuses them: E109), no code and no code fence" in flat
+    for view in ('view="outline"', 'view="vars"'):
+        assert view in body
+    assert "Never Read the `.ipynb` file." in flat
+    planning = _prose(_read(NOTEBOOK_REFS / "planning.md"))
+    for phrase in PLAN_FORMAT:
+        assert _prose(phrase) in flat and _prose(phrase) in planning, phrase
+    assert "re-print the whole updated list and write nothing" in flat
+    assert "re-print the whole updated list" in planning
+    # "go" is the step the last reply proposed, not always step 1; a plan edit names the plan
+    assert '"go": write the step the last reply proposed (step 1 right after the plan)' in flat
+    assert intent.classify("go")["answer"] == "yes" and intent.classify("go")["mode"] is None
+    assert '("drop step 4", "swap steps 3 and 4", "add a step that plots by month")' in flat
+    for title in PLAN_EXAMPLE_TITLES:
+        assert f"**{title}**" in flat and f"**{title}**" in planning
+    columns = _sales_csv().splitlines()[0].split(",")  # the fixture: orders, no customers or ages
+    assert "customer" not in _sales_csv().lower() and "age" not in columns
+    assert "signup" not in _sales_csv().lower()
+    assert 'follow "The batch path" in [planning.md](../notebook/reference/planning.md)' in flat
+    assert "\n## The batch path\n" in _read(NOTEBOOK_REFS / "planning.md")
+    assert (PLAN_SKILL.parent / "../notebook/reference/planning.md").resolve().is_file()
+    assert "never mention `nh-` ids" in flat
+    # the installed-package rule names nh_inspect's own words for an installed package
+    listing = _read(PLUGIN / "server" / "src" / "nh_gateway" / "tools" / "inspect.py")
+    assert '"installed: "' in listing and "(not imported)" in listing
+
+
+def test_notebook_skill_sends_big_asks_to_planning_md():
+    """The notebook skill's last line points at planning.md's plan and batch path, and its big-ask
+    rule has the model read planning.md and keep its plain-words format (big-ask-plans)."""
+    text = _read(PLUGIN / "skills" / "notebook" / "SKILL.md")
+    assert text.splitlines()[-1] == (
+        "- [reference/planning.md](reference/planning.md): the 5-12 step plan and the batch path."
+    )
+    big = _prose(text.partition("\n## Big asks: plan, don't build\n")[2].partition("\n## ")[0])
+    assert "write no code and call no write tool" in big
+    assert "Read [reference/planning.md](reference/planning.md), then reply in its format" in big
+    assert "in plain words (no code, backticks or constants), and ask where to start" in big
+    assert "do the first step as this message's cell, propose the rest" in big
 
 
 def test_init_skill_follows_the_plan():
@@ -277,6 +370,8 @@ def test_eval_case_files(case: Path):
     assert case_yaml["schema_version"] == "1.1" and case_yaml["name"] == case.name
     script = case / case_yaml["context"]["scaffold_script"]
     assert script.parent == case and script.is_file()
+    history = case_yaml["context"].get("history_file")  # the earlier turns (design §6.3, C6c)
+    assert history is None or (case / history).is_file()
     graders = sorted((case / "graders").glob("*.md"))
     assert graders
     for grader in graders:
@@ -301,6 +396,9 @@ def test_eval_case_files(case: Path):
         ("explain-only", 3),
         ("slash-explain", 3),
         ("approval-network-cell", 3),
+        ("plan-no-code", 3),
+        ("batch-asks-once", 3),
+        ("batch-stops-on-check-this", 3),
     ],
 )
 def test_eval_scaffold_builds_a_consistent_project(tmp_path: Path, case: str, cells: int):
@@ -509,6 +607,27 @@ TRIPS = {
     '        "n_unique": df.nunique(),\n'
     "    }\n)\nprint(df.shape)\nschema",
 }
+# batch-stops-on-check-this (design §6.3, C6c): the user's "run the next 3" and yes, which every
+# scenario of its mocks replays first (MOCK_PROMPTS, _bs_replay), and plan steps as runs write
+# them. The fixture has no duplicate rows, so dropping them is a check this and stops the batch.
+BATCH_YES = (("p0", "run the next 3"), ("p1", "yes"))
+BS_NOTES = ["Does one step of the approved plan", "Shows its result so the user can check it"]
+
+
+def _step(title: str, code: str, **fields: Any) -> tuple[str, str, dict[str, Any]]:
+    """An nh_add_cell call for one step of the approved batch."""
+    args = {"title": title, "notes": BS_NOTES, "intent": "the plan's next step", "code": code}
+    return ("p1", "nh_add_cell", {**args, **fields})
+
+
+BS_COUNT = _step(
+    "Count orders per region", 'orders_per_region = df["region"].value_counts()\norders_per_region'
+)
+BS_DEDUP = _step(
+    "Drop duplicate orders",
+    'df_unique = df.drop_duplicates()\nprint(f"rows: {len(df)} -> {len(df_unique)}")\ndf_unique.shape',
+)
+BS_STOPPED = [BS_COUNT, BS_DEDUP]  # check this stops the batch at step 2
 # mock path (relative to evals/) -> (fixture env, calls); "$cell" is the id the previous call returned
 MOCK_SCENARIOS: dict[str, tuple[dict[str, str], list[tuple[str, str, dict[str, Any]]]]] = {
     "mocks/nh/nh_add_cell.md": ({}, [("p1", "nh_add_cell", DROP)]),
@@ -546,7 +665,19 @@ MOCK_SCENARIOS: dict[str, tuple[dict[str, str], list[tuple[str, str, dict[str, A
     "secret-print-refused/mocks/nh/nh_add_cell.md": ({}, [("p1", "nh_add_cell", KEY_CHECK)]),
     "approval-network-cell/mocks/nh/nh_add_cell.md": ({}, [("p1", "nh_add_cell", TRIPS)]),
     "init-url-data/mocks/nh/nh_inspect.md": ({}, [("p1", "nh_inspect", {"view": "overview"})]),
+    "batch-stops-on-check-this/mocks/nh/nh_edit_cell.md": (
+        {},
+        [*BS_STOPPED, ("p1", "nh_edit_cell", {"cell_id": "$cell", "code": "df_unique.shape"})],
+    ),
+    "batch-stops-on-check-this/mocks/nh/nh_run.md": (
+        {},
+        [*BS_STOPPED, ("p1", "nh_run", {"cell_id": "$cell"})],
+    ),
+    "batch-stops-on-check-this/mocks/nh/nh_undo.md": ({}, [*BS_STOPPED, ("p1", "nh_undo", {})]),
 }
+# The human messages (prompt id, text) a mock's scenario sends before its calls, which go in the
+# last one's turn.
+MOCK_PROMPTS = {name: BATCH_YES for name in MOCK_SCENARIOS if name.startswith("batch-stops-on")}
 # Mocks replayed on another case's project than the shared fixture: its scaffold script.
 MOCK_FIXTURES = {"init-url-data/mocks/nh/nh_inspect.md": "init-url-data/scaffold.sh"}
 # What a URL serves while a mock's scenario runs (the kernel is FakeBackend, in this process).
@@ -559,6 +690,10 @@ EXACT_MOCKS = {
     "explain-only/mocks/nh/nh_inspect.md",
     "slash-explain/mocks/nh/nh_inspect.md",
     "approval-network-cell/mocks/nh/nh_add_cell.md",  # its graders read the question
+    # they name the step the batch stopped at, which the reply must report
+    "batch-stops-on-check-this/mocks/nh/nh_edit_cell.md",
+    "batch-stops-on-check-this/mocks/nh/nh_run.md",
+    "batch-stops-on-check-this/mocks/nh/nh_undo.md",
 }
 # Mocks whose `--- output ---` section a grader quotes (secret-print-refused's rubric quotes
 # KEY_CHECK_OUTPUT), with the kernel environment the real run needs to print the same.
@@ -634,10 +769,12 @@ async def replay(
     calls: list[tuple[str, str, dict[str, Any]]],
     seen: list | None = None,
     script: str = "_scaffold/base.sh",
+    before: tuple[tuple[str, str], ...] = (),
 ) -> Any:
     """The real gateway's result (a CallToolResult) for the last of ``calls`` on the eval fixture
     (or the project ``script`` builds). A "$cell" argument is the cell id the previous call's
-    result names. ``seen``, when given, collects every call's result in order."""
+    result names. ``seen``, when given, collects every call's result in order. ``before`` are
+    human messages (prompt id, text) sent first; a call in the last one's turn opens no other."""
     from fastmcp import Client
 
     from nh_gateway.app import create_server
@@ -651,6 +788,9 @@ async def replay(
             if cell.cell_type == "code":
                 backend._execute(cell.source)
         turns, prompt, result = Turns(project, data), "", None
+        for prompt_id, words in before:
+            turns.prompt(prompt_id, text=words)
+            prompt = prompt_id
         async with Client(create_server(project, backend)) as client:
             for prompt_id, tool, args in calls:
                 if prompt_id != prompt:
@@ -666,15 +806,16 @@ async def replay(
 
 async def run_mock_scenario(name: str) -> str:
     """The real gateway's text for the last call of MOCK_SCENARIOS[name], with the URLs of
-    MOCK_URLS[name] served and the project MOCK_FIXTURES[name] builds (the shared fixture by
-    default)."""
+    MOCK_URLS[name] served, the project MOCK_FIXTURES[name] builds (the shared fixture by
+    default) and the messages MOCK_PROMPTS[name] sent first."""
     from tests.fakes.turns import text
 
     script = MOCK_FIXTURES.get(name, "_scaffold/base.sh")
     from tests.fakes.net import serving
 
     with serving(MOCK_URLS.get(name, {})):
-        return text(await replay(*MOCK_SCENARIOS[name], script=script))
+        before = MOCK_PROMPTS.get(name, ())
+        return text(await replay(*MOCK_SCENARIOS[name], script=script, before=before))
 
 
 def result_shape(text: str) -> dict[str, Any]:
@@ -1176,10 +1317,10 @@ def test_match_template_reads_placeholders():
 
 
 def test_agent_mocks_are_on_one_description_each():
-    """Agent mocks live in error-retry and init-url-data only, each case's on its own
-    description (mocks/nh/fixtures/nh-server.md) with its own `expect`; every other mock is fixed
-    and replayed by the drift test above."""
-    agents = {ER_MOCKS: ER_EXPECT, IUD_MOCKS: IUD_EXPECT}
+    """Agent mocks live in error-retry, init-url-data and batch-stops-on-check-this only, each
+    case's on its own description (mocks/nh/fixtures/nh-server.md) with its own `expect`; every
+    other mock is fixed and replayed by the drift test above."""
+    agents = {ER_MOCKS: ER_EXPECT, IUD_MOCKS: IUD_EXPECT, BS_MOCKS: BS_EXPECT}
     for mock in EVALS.rglob("mocks/nh/*.md"):
         front, body = split_frontmatter(mock)
         if front.get("type") != "agent":  # a fixed mock is replayed by the test above
@@ -2835,6 +2976,930 @@ def test_init_url_data_server_facts():
     assert text_columns == ["trip_id", "started_at", "rider_type", "start_station", "end_station"]
 
 
+# ------------------------------------------------------------------ the plan and batch evals (design §6.3)
+#
+# plan-no-code plans a goal with /nh:plan; batch-asks-once and batch-stops-on-check-this resume a
+# session that planned the same goal (their history.jsonl), then ask for a batch and approve it.
+# batch-stops-on-check-this's nh_add_cell mock is an agent on the case's own description, the
+# error-retry pattern: each template must match the real gateway's text after the history's
+# "run the next 3" and the yes (BATCH_YES), in every state BS_SCENARIOS lists for it (each with
+# the "Which template" rule that picks it there); its worked examples must be the gateway's whole
+# results, and its pandas facts the same under the suite's pandas and the 2.2.3 it names. Its
+# other three mocks are fixed: E123 once the batch stopped (MOCK_SCENARIOS).
+
+PLAN_GOAL = (
+    "/nh:plan clean the sales data, then find which region brings in the most revenue and how "
+    "that changes by month"
+)
+# The plan the histories hold: /nh:plan's reply to PLAN_GOAL, in planning.md's format.
+PLAN_END = (
+    'Where should I start? Say "go" for step 1, or "run the next 3" to do several in one reply.'
+)
+SHARED_PLAN = f"""1. **Count orders per region**: one table of orders per region.
+2. **Drop duplicate orders**: rows before and after.
+3. **Drop rows with missing price**: rows before and after.
+4. **Parse the order dates**: the dates that fail to parse.
+5. **Add a revenue column**: the first rows with their revenue.
+6. **Total revenue per region**: one table, largest first.
+7. **Sum revenue per region by month**: one table with a row per month.
+8. **Plot monthly revenue per region**: one line chart.
+
+{PLAN_END}"""
+BATCH_ASK = (
+    "Run steps 1-3 (Count orders per region, Drop duplicate orders, Drop rows with missing price) "
+    "in one reply?"
+)
+BATCH_HISTORIES = {
+    "batch-asks-once": [("user", PLAN_GOAL), ("assistant", SHARED_PLAN)],
+    "batch-stops-on-check-this": [
+        ("user", PLAN_GOAL),
+        ("assistant", SHARED_PLAN),
+        ("user", "run the next 3"),
+        ("assistant", BATCH_ASK),
+    ],
+}
+PLAN_CASES = ("plan-no-code", *BATCH_HISTORIES)
+
+
+def _history_session(case: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"nh-evals/{case}"))
+
+
+def _history_jsonl(case: str, turns: list[tuple[str, str]]) -> str:
+    """A history_file of ``turns`` (role, text), as Claude Code 2.1.296 writes a session:
+    `claude plugin eval` resumes it (`--resume`), so the run keeps its session id. Each entry's
+    ids are fixed by the case and its place; the replies' model is `<synthetic>`."""
+    session, parent, lines = _history_session(case), None, []
+    for number, (role, words) in enumerate(turns, start=1):
+        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"nh-evals/{case}/{number}"))
+        entry: dict[str, Any] = {
+            "parentUuid": parent,
+            "isSidechain": False,
+            "type": role,
+            "uuid": uid,
+            "timestamp": f"2026-10-01T09:{number:02d}:00.000Z",
+            "sessionId": session,
+            "userType": "external",
+            "version": "2.1.296",
+        }
+        if role == "user":
+            entry["message"] = {"role": "user", "content": words}
+        else:
+            entry["message"] = {
+                "id": f"msg_nh_history_{number:02d}",
+                "type": "message",
+                "role": "assistant",
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": words}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+        parent = uid
+    return "".join(lines)
+
+
+def _case_prompt(case: str) -> str:
+    return split_frontmatter(EVALS / case / "prompt.md")[1].strip()
+
+
+def _hook_texts() -> dict[str, str]:
+    """prompt_submit's string constants, read without importing the hook package."""
+    import ast
+
+    tree = ast.parse(_read(PLUGIN / "hooks" / "nh_hooks" / "prompt_submit.py"))
+    found: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(getattr(node.value, "value", None), str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found[target.id] = node.value.value
+    return found
+
+
+def test_batch_histories_hold_the_shared_plan():
+    """Each batch case resumes the session its history file holds: /nh:plan's plan of PLAN_GOAL
+    (plan-no-code's prompt), then for batch-stops-on-check-this the ask and nh's question."""
+    assert _case_prompt("plan-no-code") == PLAN_GOAL
+    for case, turns in BATCH_HISTORIES.items():
+        case_yaml = _mapping(_read(EVALS / case / "case.yaml").splitlines())
+        assert case_yaml["context"]["history_file"] == "history.jsonl"
+        text = _read(EVALS / case / "history.jsonl")
+        assert text == _history_jsonl(case, turns), f"rebuild {case}/history.jsonl"
+        entries = [json.loads(line) for line in text.splitlines()]
+        assert [entry["type"] for entry in entries] == ["user", "assistant"] * (len(turns) // 2)
+        assert {entry["sessionId"] for entry in entries} == {_history_session(case)}
+        # the run's transcript lands next to the history, as <session id>.jsonl: git ignores it
+        ignored = "plugins/nh/evals/*/*-*-*-*-*.jsonl"
+        assert ignored in _read(REPO / ".gitignore").splitlines()
+        assert fnmatch.fnmatch(f"plugins/nh/evals/{case}/{_history_session(case)}.jsonl", ignored)
+        assert not fnmatch.fnmatch(f"plugins/nh/evals/{case}/history.jsonl", ignored)
+    assert _case_prompt("batch-asks-once") == "run the next 3"
+    assert _case_prompt("batch-stops-on-check-this") == "yes"
+
+
+def test_the_shared_plan_is_in_the_planning_format():
+    """The histories' plan is what planning.md asks for (and what the plan skill's format and
+    plan-no-code's graders pass): it opens with step 1, each step a bold title, a colon and one
+    result, and it ends with the format's question in its own words. nh's question names its
+    steps 1-3, the steps batch-stops-on-check-this's mock plays."""
+    steps = re.findall(r"^(\d+)\. \*\*([^*]+)\*\*: (.+)$", SHARED_PLAN, flags=re.M)
+    assert [int(number) for number, _, _ in steps] == list(range(1, 9))
+    assert SHARED_PLAN.startswith("1. **")  # no preface, no recap of the notebook
+    titles = [title for _, title, _ in steps]
+    assert all(len(title.split()) <= 8 for title in titles)
+    assert not [title for title in titles if title.startswith(("Load", "Read"))]  # the loader
+    assert titles[:3] == [call[2]["title"] for call in (BS_COUNT, BS_DEDUP, BS_PRICED)]
+    # one result each: no second result after a comma or a semicolon ("the date range, and …")
+    results = [result for _, _, result in steps]
+    assert [r for r in results if ", and " in r or ";" in r or r.count(".") != 1] == []
+    assert "`" not in SHARED_PLAN and SHARED_PLAN.count("?") == 1
+    assert SHARED_PLAN.endswith(f"\n\n{PLAN_END}")
+    format_end = re.search(r'in these words: "(.+?)" \(', _prose(_read(PLAN_SKILL)))
+    assert format_end and format_end.group(1) == PLAN_END
+    graders = EVALS / "plan-no-code" / "graders"
+    assert not re.search(split_frontmatter(graders / "no-code.md")[0]["pattern"], SHARED_PLAN)
+    assert re.search(split_frontmatter(graders / "five-steps.md")[0]["pattern"], SHARED_PLAN, re.I)
+    assert not re.search(split_frontmatter(graders / "no-step-13.md")[0]["pattern"], SHARED_PLAN)
+    assert f"Run steps 1-3 ({', '.join(titles[:3])}) in one reply?" == BATCH_ASK
+    assert _prose(f'nh asked "{BATCH_ASK}"') in _prose(_read(BS_SERVER))
+    _, asks_once = split_frontmatter(EVALS / "batch-asks-once" / "graders" / "asks-once.md")
+    assert f"steps 1-3 of the plan ({', '.join(titles[:3])})" in asks_once
+    _, stops = split_frontmatter(
+        EVALS / "batch-stops-on-check-this" / "graders" / "stops-and-reports.md"
+    )
+    assert all(f'"{title}"' in stops for title in titles[:3])
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_plan_and_batch_cases_get_their_reminders():
+    """The real prompt hook on each case's project: /nh:plan gets the plan part (its writes get
+    E109), the ask its batch part, and batch-stops-on-check-this's yes the approved batch, from
+    the record its scaffold seeds: the one the hook writes for the history's ask message."""
+    from nh_gateway._shared import turn_record
+    from tests.fakes.turns import Turns
+
+    hooks = _hook_texts()
+
+    def reminder(out: dict[str, Any] | None) -> str:
+        assert out is not None
+        return out["hookSpecificOutput"]["additionalContext"]
+
+    assert intent.classify(PLAN_GOAL)["mode"] == "plan"
+    with _eval_fixture({}, "plan-no-code/scaffold.sh") as (project, data):
+        planned = reminder(Turns(project, data).prompt("p1", text=PLAN_GOAL))
+        assert planned == f"{hooks['RULE']} {hooks['PLAN']}"
+    case = "batch-asks-once"
+    with _eval_fixture({}, f"{case}/scaffold.sh") as (project, data):
+        turns = Turns(project, data, session_id=_history_session(case))
+        asked = reminder(turns.prompt("p1", text=_case_prompt(case)))
+        assert asked == f"{hooks['RULE']} {hooks['ASK_BATCH'].format(cap='')}"
+    case = "batch-stops-on-check-this"
+    session = _history_session(case)
+    assert f'session="{session}"' in _read(EVALS / case / "scaffold.sh")
+    with _eval_fixture({}) as (project, data):
+        turns = Turns(project, data, session_id=session)
+        turns.prompt("hist-p1", text=PLAN_GOAL)
+        turns.prompt("hist-p2", text="run the next 3")
+        written = json.loads(_read(project / ".nh" / "state" / "turns" / f"{session}.json"))
+    with _eval_fixture({}, f"{case}/scaffold.sh") as (project, data):
+        path = project / ".nh" / "state" / "turns" / f"{session}.json"
+        seeded = json.loads(_read(path))
+        assert {**seeded, "ts": 0} == {**written, "ts": 0}
+        assert isinstance(seeded["ts"], int) and 0 < time.time() - seeded["ts"] < 600
+        approved = reminder(Turns(project, data, session_id=session).prompt("p3", text="yes"))
+        assert approved == f"{hooks['RULE']} {hooks['BATCH'].format(k=3)}"
+        assert turn_record.approved_batch(json.loads(_read(path)), "p3") == 3
+
+
+def test_the_batch_path_is_documented_where_the_model_reads_it():
+    """planning.md's batch path (design §6.3, C6c) says what the hook's parts and the gateway's
+    batch texts say, in the same words where the model must match them."""
+    from nh_gateway import render
+    from nh_gateway.tools import approvals, batch
+
+    hooks = _hook_texts()
+    planning = _read(NOTEBOOK_REFS / "planning.md")
+    path = _prose(planning.partition("\n## The batch path\n")[2].partition("\n## ")[0])
+    assert '"Run steps a-b in one reply?" (one cell per step)' in hooks["ASK_BATCH"]
+    assert "for the plan steps the user asked for" in hooks["ASK_BATCH"]
+    assert "A yes writes them one cell per step, not as one cell." in path
+    assert (
+        'Ask one question in chat, "Run steps a-b in one reply?", with the plan\'s numbers of the '
+        "steps the user asked for, then stop." in path
+    )
+    assert "Write nothing (nh refuses it: `E109`)." in path and "E109" in CATALOGUE
+    assert "nh runs at most `max_batch` steps at once (5 by default)" in path
+    assert config.DEFAULTS["turn"]["max_batch"] == 5
+    assert hooks["ASK_BATCH_CAP"] == " (at most {max}: ask about the first {max})"
+    # the yes: a whole-message yes or "go" alone; anything else is a normal message
+    assert '**The yes message** (a whole-message yes, or "go" alone)' in path
+    answers = [intent.classify(words)["answer"] for words in ("yes", "go", "go on", "yes, but …")]
+    assert answers == ["yes", "yes", None, None] and intent.classify("no")["answer"] == "no"
+    assert (
+        'Any other answer to the question grants no batch: "no" means write nothing and ask what '
+        'to do instead; "go on" or "yes, but …" is a normal message (at most one cell); a new '
+        '"run …" is a new ask.' in path
+    )
+    for words in ("yes, but only run steps 1-2", "no, run the next 2"):  # a new ask, not a yes
+        assert intent.classify(words)["mode"] == "ask", words
+    assert "a short report after each" in hooks["BATCH"]
+    assert "one `nh_add_cell` each, with a short report after each" in path
+    assert "stop at the first error or 'check this'" in hooks["BATCH"]
+    assert (
+        'Stop at the first error, "check this" section or `E12x` refusal (an nh question, '
+        "`E122`, included) and reply as that result says (its `--- next ---` block, or the "
+        "refusal's `Next:` line)" in path
+    )
+    assert "E122" in batch.STOP_CODES and "E123" in CATALOGUE
+    # E122 in a batch keeps its own Next (ask nh's question, then stop): the reply asks it
+    assert "E122" not in batch._REPLACED_NEXT and "Ask the user, then stop" in approvals.ASK_NEXT
+    assert "which planned steps did not run, and after an `E122` nh's question word for" in path
+    assert "say which planned steps did not run" in batch.UNDONE_NEXT
+    # nh's step numbers count the batch, not the plan: the going block names no plan step
+    going = render.next_block("ok", retries_left=2, waits_left=2, cell="c", batch=(1, 3, 0))
+    assert "the batch's next step (step 2 of 3)" in going and "of the plan" not in going
+    assert (
+        'nh counts the batch\'s own steps, 1 to N: its "step 1 of 3" is the first step the user '
+        'approved (plan step 2 after "run steps 2-4"). To the user, name each step by its plan '
+        "number and title." in path
+    )
+    assert "No retry or fix of the failing step in that reply." in path
+    assert "a batch has no retries" in render.NO_RETRY
+    assert "`E123` means the batch has stopped: report and wait." in path
+    assert '"In an approved batch" in [qa-workflow.md](qa-workflow.md)' in path
+    assert "\n## In an approved batch\n" in _read(NOTEBOOK_REFS / "qa-workflow.md")
+    assert (
+        "**At the end of that reply** (after the batch's last step, or where it stopped): list "
+        "the remaining steps as a numbered list" in path
+    )
+    assert "Reply with the remaining steps as a numbered list" in CATALOGUE["E110"][1]
+    # the one-turn rule above the batch path names its exception
+    assert "wait (an approved batch is the one exception: below)" in _prose(planning)
+
+
+# batch-stops-on-check-this's agent mock: its steps in other forms, as runs write them
+BS_MOCKS = EVALS / "batch-stops-on-check-this" / "mocks" / "nh"
+BS_SERVER = BS_MOCKS / "fixtures" / "nh-server.md"
+BS_EXPECT = {"nh_add_cell": ADD_CELL_EXPECT}
+BS_LOADER = '"Load raw data and check schema" [1]'
+BS_GROUPBY = _step("Count orders per region", 'df.groupby("region").size()')
+BS_SORTED = _step(
+    "Count orders per region",
+    'region_counts = df.groupby("region")["order_id"].count().sort_values(ascending=False)\n'
+    "region_counts",
+)
+BS_FRAME = _step(
+    "Count orders per region",
+    'region_orders = df["region"].value_counts().rename_axis("region").reset_index(name="orders")\n'
+    "region_orders",
+)
+BS_TYPO = _step("Count orders per region", 'df["regon"].value_counts()')
+BS_SET = _step(
+    "Drop duplicate orders",
+    "rows_before = len(df)\ndf = df.drop_duplicates()\n"
+    'print(f"rows before: {rows_before}, after: {len(df)}")',
+)
+BS_INPLACE = _step("Drop duplicate orders", "df.drop_duplicates(inplace=True)\ndf.shape")
+BS_DUPES = _step(
+    "Drop duplicate orders",
+    "dupes = df[df.duplicated()]\ndf_unique = df.drop_duplicates()\n"
+    'print(len(dupes), "duplicates")\ndf_unique.shape',
+)
+BS_SUBSET = _step(
+    "Drop duplicate orders",
+    'df_dedup = df.drop_duplicates(subset="order_id")\nprint(f"Rows before: {len(df)}")\n'
+    'print(f"Rows after: {len(df_dedup)}")',
+)
+BS_N_DUPES = _step("Drop duplicate orders", "n_dupes = df.duplicated().sum()\nn_dupes")
+BS_DEDUP_FAILS = _step(
+    "Drop duplicate orders", 'df_unique = df.drop_duplicates()\ndf_unique["pric"].sum()'
+)
+BS_KEPT = _step("Keep the North orders", 'north = df[df["region"] == "North"]\nnorth.shape')
+BS_LOST = _step("Keep the North orders", 'df = df[df["region"] == "North"]\ndf.shape')
+BS_NONE_LEFT = _step("Keep the orders over 100", 'df = df[df["price"] > 100]\ndf.shape')
+BS_PRICED = _step(
+    "Drop rows with missing price",
+    'df_priced = df.dropna(subset=["price"])\nprint(f"rows: {len(df)} -> {len(df_priced)}")\n'
+    "df_priced.shape",
+)
+BS_PRICED_SET = _step(
+    "Drop rows with missing price", 'df = df.dropna(subset=["price"])\nprint("rows:", len(df))'
+)
+BS_PRICED_FAILS = _step(
+    "Drop rows with missing price",
+    'df_priced = df.dropna(subset=["price"])\nprint("rows:", len(df_priced))\n'
+    'df_priced["pric"].mean()',
+)
+BS_LONG = _step(
+    "Drop duplicate orders and show the rows before and after", "df_unique = df.drop_duplicates()"
+)
+BS_ONE_NOTE = _step(
+    "Drop duplicate orders", "df_unique = df.drop_duplicates()", notes=["Drops duplicate rows"]
+)
+BS_GOES_ON = [BS_COUNT, BS_N_DUPES]  # no check this: the batch goes on to step 3
+
+# The "Which template" rules (the description's), each naming the templates it picks from.
+R_BS_E123 = 'The batch has stopped: "E123".'
+R_BS_E110 = 'Steps 1, 2 and 3 are written: "E110".'
+R_BS_NOTE = (
+    "Else, if the title has more than 8 words, or the notes have fewer than 2 or more than 5 "
+    'bullets: "E120 note".'
+)
+R_BS_STEP = (
+    'Steps 1 and 2: "step failed" if the run failed; else "step ok, check this" if it has check '
+    'lines (see "Check this"); else "step ok".'
+)
+R_BS_LAST = (
+    'Step 3: "the last step failed" if the run failed; else "the last step ok, check this" if it '
+    'has check lines; else "the last step ok".'
+)
+BS_SCENARIOS: dict[str, list[tuple[str, list[Call]]]] = {
+    "step ok": [
+        (R_BS_STEP, [BS_COUNT]),
+        (R_BS_STEP, [BS_GROUPBY]),
+        (R_BS_STEP, [BS_SORTED]),
+        (R_BS_STEP, [BS_FRAME]),
+        (R_BS_STEP, BS_GOES_ON),
+    ],
+    "step ok, check this": [
+        (R_BS_STEP, BS_STOPPED),
+        (R_BS_STEP, [BS_DEDUP]),
+        (R_BS_STEP, [BS_COUNT, BS_SET]),
+        (R_BS_STEP, [BS_COUNT, BS_INPLACE]),
+        (R_BS_STEP, [BS_COUNT, BS_DUPES]),
+        (R_BS_STEP, [BS_COUNT, BS_SUBSET]),
+        (R_BS_STEP, [BS_COUNT, BS_KEPT]),
+        (R_BS_STEP, [BS_COUNT, BS_LOST]),
+        (R_BS_STEP, [BS_COUNT, BS_NONE_LEFT]),
+    ],
+    "step failed": [
+        (R_BS_STEP, [BS_TYPO]),
+        (R_BS_STEP, [BS_COUNT, BS_DEDUP_FAILS]),  # with a check this section
+    ],
+    "the last step ok": [
+        (R_BS_LAST, [*BS_GOES_ON, BS_PRICED]),
+        (R_BS_LAST, [*BS_GOES_ON, BS_PRICED_SET]),
+    ],
+    "the last step ok, check this": [(R_BS_LAST, [*BS_GOES_ON, BS_DEDUP])],
+    "the last step failed": [(R_BS_LAST, [*BS_GOES_ON, BS_PRICED_FAILS])],
+    "E120 note": [
+        (R_BS_NOTE, [BS_COUNT, BS_LONG]),
+        (R_BS_NOTE, [BS_COUNT, BS_ONE_NOTE]),
+        (R_BS_NOTE, [BS_ONE_NOTE]),
+    ],
+    "E123": [
+        (R_BS_E123, [*BS_STOPPED, BS_PRICED]),
+        (R_BS_E123, [BS_TYPO, BS_COUNT]),
+        (R_BS_E123, [BS_COUNT, BS_LONG, BS_DEDUP]),
+    ],
+    "E110": [(R_BS_E110, [*BS_GOES_ON, BS_PRICED, BS_GROUPBY])],
+}
+BS_CASES = [(name, i) for name, cases in BS_SCENARIOS.items() for i in range(len(cases))]
+BS_PATTERNS = {
+    "n": r"\d+",
+    "k": r"[1-3]",
+    "s": r"[1-3]",
+    "next step": r"[2-3]",
+    "cell id": r"nh-[0-9a-f]{10}",
+    "seconds": r"\d+\.\d",
+    "line": r"\d+",
+}
+# self-check lines as the description states them: (group order, form, its regex)
+BS_SELF_CHECK = [
+    (
+        0,
+        "`<name>: new DataFrame <rows>×<cols> (from <sources>)`",
+        r"(?P<name>\w+): new DataFrame \d+×\d+( \(from [^()]+\))?(; no nulls|; nulls: \w+ \d+(, \w+ \d+)*)",
+    ),
+    (
+        0,
+        "`<name>: DataFrame <old rows>×<old cols> → <rows>×<cols>`",
+        r"(?P<name>\w+): DataFrame \d+×\d+ → \d+×\d+( \([+-]\d+ rows\))?(; nulls \w+ \d+ → \d+(, \w+ \d+ → \d+)*)?",
+    ),
+    (
+        1,
+        "`<name>: new Series len <length> <dtype> (from <sources>)`",
+        r"(?P<name>\w+): new Series len \d+ \S+( \(from [^()]+\))?(; nulls [1-9]\d*)?",
+    ),
+    (2, "`<name>: new ndarray <shape> <dtype>`", r"(?P<name>\w+): new ndarray \([\d, ]+\) \S+"),
+    (3, "`<name>: new <type> len <length>`", r"(?P<name>\w+): new [\w.]+ len \d+"),
+    (3, "`<name>: new <type> <repr>`", r"(?P<name>\w+): new [\w.]+ \S.*"),
+]
+
+
+async def _bs_replay(calls: list[Call], seen: list | None = None) -> Any:
+    return await replay({}, calls, seen, before=BATCH_YES)
+
+
+def _bs_section(title: str) -> str:
+    text = BS_SERVER.read_text(encoding="utf-8")
+    return text.partition(f"\n## {title}\n")[2].partition("\n## ")[0]
+
+
+def _bs_as_shown(real: str) -> str:
+    """The real text as the description tells the mock to show it: never a readability hints
+    section (the gateway adds one for `inplace=True` and for `df = df.drop_duplicates()`)."""
+    server = _prose(BS_SERVER.read_text(encoding="utf-8"))
+    assert _prose("never add a `--- readability hints (advisory) ---` section.") in server
+    lines = real.split("\n")
+    if HINTS in lines:
+        start = lines.index(HINTS)
+        end = next(i for i in range(start + 1, len(lines)) if SECTION.fullmatch(lines[i]))
+        del lines[start:end]
+    return "\n".join(lines)
+
+
+def _bs_check_forms() -> list[str]:
+    """The "Check this" section's line forms, in the order it lists them."""
+    return re.findall(r"`(<name> [^`]+)`", _bs_section("Check this"))
+
+
+def _bs_progress(calls: list[Call], seen: list[Any]) -> tuple[list[str], int | None]:
+    """The titles of the steps written, and the step the batch stopped at (None while it goes
+    on): a step whose run failed or has check this, or the step nh refused (E12x)."""
+    from tests.fakes.turns import text
+
+    titles: list[str] = []
+    stop: int | None = None
+    for (_, tool, args), result in zip(calls, seen, strict=True):
+        body = text(result)
+        if stop is not None:
+            continue
+        if tool == "nh_add_cell" and not result.is_error:
+            titles.append(args["title"])
+            if "\n--- check this ---\n" in body or "; it failed with " in body.split("\n")[0]:
+                stop = len(titles)
+        elif re.search(r"^nh: E12\d", body, flags=re.M):
+            stop = len(titles) + 1
+    return titles, stop
+
+
+def _bs_check_lines(lines: list[str]) -> list[int]:
+    """Each check line fits one form of the "Check this" section (its index), in name order."""
+    forms = _bs_check_forms()
+    names = [line.split(" ", 1)[0] for line in lines]
+    assert names == sorted(names), lines
+    found = []
+    for line in lines:
+        fits = [i for i, form in enumerate(forms) if match_template(form, line) is not None]
+        assert len(fits) == 1, line
+        found.append(fits[0])
+    return found
+
+
+def _bs_self_check(lines: list[str], headline: str | None, ran: str, code: str) -> None:
+    """The self-check lines follow the description's forms and order, and the headline (an ok
+    run's) is the first one about a frame, a series or an array. ``ran`` is the code that ran
+    (in a failed run, the lines before the failing one), ``code`` the code sent."""
+    server = _prose(BS_SERVER.read_text(encoding="utf-8"))
+    assert (
+        _prose(
+            "then `; nulls ` and `<column> <old count> → <count>` for each column whose missing "
+            'count changed, joined by ", "'
+        )
+        in server
+    )
+    closing = None
+    if lines and lines[-1].split(": ")[0] in ("same shape and nulls", "unchanged"):
+        closing, lines = lines[-1], lines[:-1]
+        groups = [part.split(": ", 1) for part in closing.split("; ")]
+        labels = [label for label, _ in groups]
+        assert labels in (
+            ["same shape and nulls"],
+            ["unchanged"],
+            ["same shape and nulls", "unchanged"],
+        )
+        assert all(names.split(", ") == sorted(names.split(", ")) for _, names in groups)
+    seen: list[tuple[int, str, str]] = []
+    for line in lines:
+        fits = [(kind, re.fullmatch(rx, line)) for kind, _, rx in BS_SELF_CHECK]
+        kind, found = next(((k, m) for k, m in fits if m), (None, None))
+        assert found is not None, f"no self-check form fits {line!r}"
+        seen.append((kind, found.group("name"), line))
+    for _, form, _ in BS_SELF_CHECK:
+        assert _prose(form) in server, form
+    assert [kind for kind, _, _ in seen] == sorted(kind for kind, _, _ in seen), lines
+    names = [name for _, name, _ in seen]
+    last = ran.rstrip().splitlines()[-1] if ran.strip() else ""
+    shown = {n: m.start() for n in names if (m := re.search(rf"\b{re.escape(n)}\b", last))}
+    bound = [n for n in re.findall(r"(?m)^(\w+)\s*=(?!=)", ran) if n in names]
+    lead = min(shown, key=shown.__getitem__) if shown else (bound[-1] if bound else None)
+    for kind in {kind for kind, _, _ in seen}:
+        group = [name for k, name, _ in seen if k == kind]
+        first = [lead] if lead in group else []
+        assert group == first + sorted(n for n in group if n != lead), (group, lead)
+    # df in the closing line when the code sent names it and the run didn't change it (also
+    # when it set df again to an equal frame, or failed before changing it)
+    df_lines = [line for _, name, line in seen if name == "df"]
+    if re.search(r"\bdf\b", code) and not df_lines:
+        assert closing and "df" in dict(g.split(": ", 1) for g in closing.split("; ")).get(
+            "same shape and nulls", ""
+        ).split(", "), (closing, code)
+    data = [line for kind, _, line in seen if kind < 3]
+    if headline is not None:
+        assert all(len(line) <= 100 for line in data[:1])
+        assert headline == (f"; {data[0]}" if data else "")
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("name,index", BS_CASES, ids=[f"{n}#{i}" for n, i in BS_CASES])
+async def test_batch_stops_template_matches_the_real_gateway(name: str, index: int):
+    pytest.importorskip("pandas")
+    from tests.fakes.turns import text
+
+    templates = nh_server_templates(BS_SERVER)
+    assert set(templates) == set(BS_SCENARIOS)
+    rule, calls = BS_SCENARIOS[name][index]
+    assert f'"{name}"' in rule and _prose(rule) in _prose(_bs_section("Which template"))
+    seen: list[Any] = []
+    result = await _bs_replay(calls, seen)
+    real = _bs_as_shown(text(result))
+    template = templates[name]
+    values = match_template(template.removeprefix(ERROR_PREFIX), real, BS_PATTERNS)
+    assert values is not None, f"{name!r} drifted from the gateway:\n{real}"
+    assert template.startswith(ERROR_PREFIX) == result.is_error, real
+    titles, stop = _bs_progress(calls, seen)
+    args = calls[-1][2]
+    if "title" in values:
+        assert values["title"] == args["title"] == titles[-1]
+    if "k" in values:  # the step this call wrote, or the step nh refused
+        assert values["k"] == str(len(titles) + (1 if result.is_error else 0))
+    if "n" in values:
+        assert values["n"] == str(len(titles) + 1)
+    if "next step" in values:
+        assert values["next step"] == str(len(titles) + 1)
+    if "the cell above" in values:
+        above = f'"{titles[-2]}" [{len(titles)}]' if len(titles) > 1 else BS_LOADER
+        assert values["the cell above"] == above
+    if "s" in values:
+        assert values["s"] == str(stop)
+    if "the last step's title" in values:
+        assert values["the last step's title"] == titles[2]
+    if "check lines" in values:
+        _bs_check_lines(values["check lines"].split("\n"))
+    if values.get("check this section lines"):
+        section = values["check this section lines"].split("\n")
+        assert section[0] == "--- check this ---"
+        _bs_check_lines(section[1:])
+    if "self-check section lines" in values:
+        checks = values["self-check section lines"].split("\n")[1:]
+        headline = values.get("; headline, if any")  # None for a failed run
+        ran = args["code"]
+        if "line" in values:  # a failed run: the lines before the failing one
+            ran = "\n".join(ran.split("\n")[: int(values["line"]) - 1])
+        _bs_self_check(checks, headline, ran, args["code"])
+    if "error name" in values:
+        message = values["full error message, all its lines"].split("\n")
+        summary = f"{values['error name']}: {message[0]}"
+        if len(message) > 1:
+            summary = summary.removesuffix(":") + "…"
+        assert values["error summary"] == summary
+        stop_mark = "" if summary.endswith(("…", ".")) else "."
+        assert values['error summary, and a "." unless it ends with "…" or "."'] == (
+            summary + stop_mark
+        )
+        assert values["failing line"] == args["code"].split("\n")[int(values["line"]) - 1].strip()
+    if name == "E120 note":
+        for line in values["problem lines"].splitlines():
+            if line.startswith("- L003: "):
+                words, shown = re.fullmatch(
+                    r"- L003: The title has (\d+) words \(max 8\): `(.+)`\. Fix: .*", line
+                ).groups()
+                assert int(words) == len(args["title"].split()) and shown == args["title"]
+                fix = line.partition("`. Fix: ")[2]
+                assert f"`. Fix: {fix}`" in _read(BS_SERVER)
+            else:
+                line = re.sub(
+                    r"has (1 bullet|\d+ bullets|no bullets);", "has <count> bullet;", line
+                )
+                assert f"`{line}`" in _read(BS_SERVER), line
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+async def test_batch_stops_check_forms_are_each_replayed():
+    """Every "Check this" form is a line the gateway gave in some scenario, in the order the
+    description lists them (the first that fits a frame is the one it gets); so is the changed
+    frame's self-check line the description shows."""
+    pytest.importorskip("pandas")
+    from tests.fakes.turns import text
+
+    hit: set[int] = set()
+    shown: set[str] = set()
+    for cases in BS_SCENARIOS.values():
+        for _, calls in cases:
+            lines = _bs_as_shown(text(await _bs_replay(calls))).split("\n")
+            shown.update(lines)
+            if "--- check this ---" in lines:
+                start = lines.index("--- check this ---") + 1
+                end = next(i for i in range(start, len(lines)) if SECTION.fullmatch(lines[i]))
+                hit.update(_bs_check_lines(lines[start:end]))
+    assert hit == set(range(len(_bs_check_forms()))) and len(_bs_check_forms()) == 6
+    example = re.search(
+        r'`df = df\.dropna\(subset=\["price"\]\)` gives `([^`]+)`',
+        _prose(_bs_section("Running code")),
+    )
+    assert example and example.group(1) in shown, example
+
+
+BS_EXAMPLES = [[BS_COUNT], BS_STOPPED, [BS_COUNT, BS_SET]]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+async def test_batch_stops_worked_examples_match_the_gateway():
+    """Each worked example is the gateway's whole result for its code in the approved batch,
+    without the `nh:` line and the `--- next ---` section (the run time aside)."""
+    pytest.importorskip("pandas")
+    from tests.fakes.turns import text
+
+    examples = re.findall(
+        r"^### [^\n]+\n\n```python\n(.*?)\n```\n\n```text\n(.*?)\n```$",
+        _bs_section("Worked examples"),
+        flags=re.M | re.S,
+    )
+    assert len(examples) == len(BS_EXAMPLES) == _bs_section("Worked examples").count("\n### ")
+    for (code, shown), calls in zip(examples, BS_EXAMPLES, strict=True):
+        assert calls[-1][2]["code"] == code
+        lines = _bs_as_shown(text(await _bs_replay(calls))).partition("\n--- next ---\n")[0]
+        lines = lines.split("\n")
+        assert lines[1].startswith("nh: cell=")
+        real = "\n".join(lines[:1] + lines[2:])
+        assert re.sub(r"ran ok in \d+\.\ds", "ran ok in 0.1s", real) == shown, real
+    # the "Check this" section's own two examples are the worked examples' check lines
+    section = _prose(_bs_section("Check this"))
+    for _, shown in examples[1:]:
+        check = shown.split("--- check this ---\n", 1)[1].split("\n", 1)[0]
+        assert f"gives `{check}`" in section, check
+
+
+def test_batch_stops_server_facts():
+    """The description's state is what the scaffold and the history hold, and its pandas facts
+    are the suite's pandas's (they read the same under the pandas 2.2.3 it names, which the
+    suite's overview mock shows)."""
+    pd = pytest.importorskip("pandas")
+    server = BS_SERVER.read_text(encoding="utf-8")
+    flat = _prose(server)
+    overview = _read(EVALS / "mocks" / "nh" / "nh_inspect.md")
+    assert re.search(r"^installed: pandas 2\.2\.3, numpy 2\.1\.3\b", overview, flags=re.M)
+    assert "which has pandas 2.2.3 and numpy 2.1.3" in flat
+    assert (
+        f'the loader `{FIXTURE_LOADER}`, "Load raw data and check schema", which ran as [1]' in flat
+    )
+    assert "The kernel holds only `DATA_PATH`, `df` and `schema`." in flat
+    df = pd.read_csv(io.StringIO(_sales_csv()))
+    block = re.search(
+        r"^`print\(df\)` shows the whole frame.*?\n\n```text\n(.*?)\n```$", server, re.M | re.S
+    )
+    assert block.group(1).splitlines() == _printed_df() == df.to_string().splitlines()
+    assert "43 rows and 6 columns" in flat and "price float64 with 6 missing prices" in flat
+    # no duplicates: every drop_duplicates keeps all 43 rows, and the count is np.int64(0)
+    assert repr(df.duplicated().sum()) == repr(df.duplicated(subset=["order_id"]).sum())
+    assert repr(df.duplicated().sum()) == "np.int64(0)"
+    for kwargs in ({}, {"subset": ["order_id"]}, {"subset": "order_id"}, {"keep": "last"}):
+        kept = df.drop_duplicates(**kwargs)
+        assert kept.shape == (43, 6) and int(kept["price"].isna().sum()) == 6
+    assert df[df.duplicated()].shape == (0, 6)
+    missing = [f"{i} ({df.at[i, 'region']})" for i in df.index[df["price"].isna()]]
+    assert f"The 6 missing prices are at index {_and(missing)}." in flat
+    assert len(df.dropna(subset=["price"])) == len(df.dropna()) == 37
+    section = _bs_section("pandas on this data")
+    fences = [textwrap.dedent(f) for f in re.findall(r"```text\n(.*?)\n *```", section, re.S)]
+    counts = df["region"].value_counts()
+    size = df.groupby("region").size()
+    frame = df["region"].value_counts().rename_axis("region").reset_index(name="orders")
+    assert fences == [repr(counts), repr(size), repr(frame)]
+    assert repr(size.sort_values(ascending=False)) == repr(size)
+    by_id = repr(df.groupby("region")["order_id"].count())
+    assert by_id == repr(size).replace("dtype: int64", "Name: order_id, dtype: int64")
+    priced = df.dropna(subset=["price"])["region"].value_counts()
+    shown = ", ".join(f"{region} {n}" for region, n in priced.items())
+    assert f"Orders per region after dropping the missing prices: {shown} (37 in all)" in flat
+    # the judge's facts
+    _, stops = split_frontmatter(
+        EVALS / "batch-stops-on-check-this" / "graders" / "stops-and-reports.md"
+    )
+    regions = ", ".join(f"{region} {n}" for region, n in counts.items())
+    assert f"orders per region {regions}; 6 missing prices" in _prose(stops)
+    assert "43 orders and no duplicate rows" in stops
+
+
+# plan-no-code's code check: it fails a plan that shows code, a command or a constant
+PLAIN_PLANS = [
+    SHARED_PLAN,
+    "1. **Fit a baseline**: test error (MAE and R²). This needs scikit-learn, which isn't "
+    "installed yet.",
+    "6. **Split train and test**: sizes of each, e.g. 80/20 (stratified).",
+    "4. **Parse the order dates**: the date range (2024-01-01 to 2024-06-22) and bad dates.",
+    'Where should I start? Say "go" for step 1, or "run the next 3" to do several in one reply.',
+    "5. **Plot revenue per month**: one line chart (x: month, y: revenue).",
+    "2. **Check the file**: the rows of sales.csv, i.e. one per order (e.g. 43).",
+    "3. **Fit a baseline**: test error. This needs scikit-learn 1.5.2, which isn't installed.",
+]
+CODE_IN_PLANS = [
+    "```python\ndf.head()\n```",
+    "1. **Look at the data**: `df.head()` shows the first rows.",
+    "2. **Drop duplicates**: df.drop_duplicates() keeps the first of each.",
+    '3. **Check prices**: df["price"] has 6 missing values.',
+    "import pandas as pd",
+    "- from sklearn.linear_model import LinearRegression",
+    "Run pip install scikit-learn first.",
+    "I'll run uv add scikit-learn before step 6.",
+    "5. **Split train and test**: TEST_SIZE = 0.2 and RANDOM_STATE=42.",
+    # backticked or bare code names, which planning.md rules out too (C6c review)
+    "3. **Drop rows**: rows before and after in `df_clean`.",
+    "3. **Drop rows**: with `dropna`.",
+    "2. **Parse dates** with pd.to_datetime on the order dates.",
+    "1. **Look at the data**: df.head shows the first rows.",
+    "4. **Count duplicates**: the count from df_clean.drop_duplicates on the orders.",
+]
+
+
+def _planning_examples() -> list[str]:
+    """planning.md's example replies (its `> ` quotes)."""
+    text = _read(NOTEBOOK_REFS / "planning.md")
+    quotes = re.findall(r"(?:^>.*\n)+", text, flags=re.M)
+    assert len(quotes) == 2
+    return [re.sub(r"(?m)^> ?", "", quote) for quote in quotes]
+
+
+def test_no_code_reads_code_not_plain_words():
+    spec, _ = split_frontmatter(EVALS / "plan-no-code" / "graders" / "no-code.md")
+    assert (spec["type"], spec["target"], spec["match"]) == (
+        "regex",
+        "last_message",
+        "not_contains",
+    )
+    pattern = re.compile(spec["pattern"])
+    examples = _planning_examples()
+    assert [text for text in [*PLAIN_PLANS, *examples] if pattern.search(text)] == []
+    assert [text for text in CODE_IN_PLANS if not pattern.search(text)] == []
+    for example in examples:  # the examples are in the format they show
+        assert "`" not in example and "cell [1]" not in example
+        assert re.search(
+            r'Where should I start\? Say "go" for step 1, or "run (the next 3|steps 1-3)"',
+            _prose(example),
+        )
+
+
+def test_plan_shape_is_a_checklist_of_the_format():
+    """plan-shape's judge checks concrete claims, one per rule, and passes only when all hold
+    (design §6.3, C6c review: a one-paragraph rubric drew split votes on plans that broke no
+    rule). Each claim is a rule of planning.md's format or of the plan message."""
+    spec, rubric = split_frontmatter(EVALS / "plan-no-code" / "graders" / "plan-shape.md")
+    assert (spec["type"], spec["focus"], spec["weight"]) == ("llm", "last_message", 10)
+    claims = re.findall(r"^(\d)\. (.+)$", rubric, flags=re.M)
+    assert [int(number) for number, _ in claims] == list(range(1, 7))
+    text = _prose(rubric)
+    for check in (
+        "a numbered list of 5 to 12 steps toward the user's goal: " + PLAN_GOAL.split(" ", 1)[1],
+        "Each step is one action for one notebook cell and says what it shows",
+        "No step shows code, a command or a constant",
+        "no method call such as df.dropna(), no install command",
+        "no setting such as TEST_SIZE = 0.2, no name in backticks",
+        "No step loads or reads the data file",
+        "It does not say it wrote, ran or changed a cell.",
+        'It ends by asking where to start: "go" for step 1, or a way to run several steps',
+        "PASS if all six claims hold. FAIL if any claim does not hold.",
+    ):
+        assert check in text, check
+    assert 'cell [1], "Load raw data and check schema", already loads it' in text
+    assert "Load raw data and check schema" in _read(EVALS / "mocks" / "nh" / "nh_inspect.md")
+
+
+def test_big_ask_plans_fails_a_step_that_loads_the_data_again():
+    """The notebook's loader already reads the data (planning.md: a step the notebook already
+    holds is not listed): a numbered step that loads, reads or opens it again fails
+    big-ask-plans. C6c's review found one in 15 of 33 runs, which no grader saw."""
+    spec, _ = split_frontmatter(EVALS / "big-ask-plans" / "graders" / "no-load-step.md")
+    assert (spec["type"], spec["target"], spec["match"], spec["flags"]) == (
+        "regex",
+        "last_message",
+        "not_contains",
+        "i",
+    )
+    pattern = re.compile(spec["pattern"], re.IGNORECASE)
+    loads = [
+        "1. **Load the sales data**: the size and the first rows.",
+        "Here's the plan.\n\n1. **Load sales.csv and check its size**: rows and columns.",
+        "**1. Load the data**: the first rows.",
+        "### Step 1: Read the CSV",
+        "2. **Reload the data**: the first rows.",
+        "1) Import the data from data/sales.csv",
+    ]
+    plans = [
+        SHARED_PLAN,
+        *_planning_examples(),
+        "4. **Drop rows that fail to load**: rows before and after.",
+        "The loader in cell [1] already reads data/sales.csv.\n\n1. **Count orders**: a table.",
+    ]
+    assert [text for text in loads if not pattern.search(text)] == []
+    assert [text for text in plans if pattern.search(text)] == []
+    assert "A step the notebook already holds (the loader" in _prose(
+        _read(NOTEBOOK_REFS / "planning.md")
+    )
+
+
+def test_plan_step_count_graders_are_the_numbered_steps_pattern():
+    """plan-no-code's 5-12 check is explain's numbered-steps pattern, read for steps 5 and 13."""
+    explain, _ = split_frontmatter(EVALS / "explain-only" / "graders" / "numbered-steps.md")
+    for grader, number, match in (("five-steps", "5", None), ("no-step-13", "13", "not_contains")):
+        spec, _ = split_frontmatter(EVALS / "plan-no-code" / "graders" / f"{grader}.md")
+        assert spec["pattern"] == explain["pattern"].replace("3", number) and spec["flags"] == "i"
+        assert spec.get("match") == match and spec["target"] == "last_message"
+        pattern = re.compile(spec["pattern"], re.IGNORECASE)
+        assert [t for t in NUMBERED_GOOD if not pattern.search(t.replace("3", number))] == []
+        assert [t for t in NUMBERED_BAD if pattern.search(t.replace("3", number))] == []
+        twelve = "\n".join(f"{i}. **Step {i}**: one table." for i in range(1, 13))
+        thirteen = twelve + "\n13. **Step 13**: one table."
+        assert bool(pattern.search(twelve)) == (number == "5")
+        assert pattern.search(thirteen)
+
+
+def test_plan_skill_registered_reads_the_init_skill_list():
+    grader = EVALS / "plan-no-code" / "graders" / "skill-registered.md"
+    spec, _ = split_frontmatter(grader)
+    assert (spec["type"], spec["target"], spec["arm"]) == ("regex", "trace", "with-only")
+    pattern = re.compile(spec["pattern"])
+    manifest = json.loads(_read(PLUGIN / ".claude-plugin" / "plugin.json"))
+    name = f"{manifest['name']}:{split_frontmatter(PLAN_SKILL)[0]['name']}"
+    assert pattern.search(_init_line(["nh:qa-cell", name, "nh:init"]))
+    assert not pattern.search(_init_line(["nh:qa-cell", "nh:explain"]))
+    assert not pattern.search(_init_line([name + "s"]))
+
+
+def test_one_question_counts_question_marks():
+    """`match: count:1` passes exactly one match (the CLI's count of a global regex)."""
+    spec, _ = split_frontmatter(EVALS / "batch-asks-once" / "graders" / "one-question.md")
+    assert (spec["target"], spec["match"]) == ("last_message", "count:1")
+    pattern = re.compile(spec["pattern"])
+    assert len(pattern.findall(BATCH_ASK)) == 1
+    assert len(pattern.findall(f"{BATCH_ASK} Or only step 1?")) == 2
+    assert len(pattern.findall("I'll run steps 1-3 now.")) == 0
+
+
+@pytest.mark.parametrize("spaced", [False, True])
+def test_no_write_past_the_stop_reads_the_calls(spaced: bool):
+    """A third nh_add_cell, or any edit, run or undo, is a write past check this's stop."""
+    grader = EVALS / "batch-stops-on-check-this" / "graders" / "no-write-past-the-stop.md"
+    spec, _ = split_frontmatter(grader)
+    assert (spec["type"], spec["target"], spec["match"], spec["arm"]) == (
+        "regex",
+        "mock_calls",
+        "not_contains",
+        "both",
+    )
+    pattern = re.compile(spec["pattern"])
+
+    def add(call: Call) -> str:
+        return _mock_call("nh_add_cell", call[2], spaced)
+
+    quoting = _mock_call(
+        "nh_inspect", {"view": "var", "name": f'"tool":"{TOOL_PREFIX}nh_add_cell"'}, spaced
+    )
+    two = [add(BS_COUNT), _mock_call("nh_inspect", {"view": "outline"}, spaced), add(BS_DEDUP)]
+    assert not pattern.search("\n".join([*two, quoting]))
+    assert pattern.search("\n".join([*two, add(BS_PRICED)]))
+    for tool in ("nh_edit_cell", "nh_run", "nh_undo"):
+        assert pattern.search("\n".join([*two, _mock_call(tool, {"cell_id": "c"}, spaced)])), tool
+    spec, _ = split_frontmatter(EVALS / "batch-stops-on-check-this" / "graders" / "two-steps.md")
+    assert (spec["tool"], spec["min"], spec["max"]) == (TOOL_PREFIX + "nh_add_cell", 2, 2)
+
+
+# case -> (the heavy check of a wrong write, the judge, the light check of the judge's failure)
+PLAN_GRADERS = {
+    "plan-no-code": ("no-writes", "plan-shape", "no-code"),
+    "batch-asks-once": ("no-writes", "asks-once", "one-question"),
+    "batch-stops-on-check-this": ("no-write-past-the-stop", "stops-and-reports", "two-steps"),
+}
+
+
+@pytest.mark.parametrize("case", PLAN_CASES)
+def test_plan_and_batch_weights_fail_a_wrong_write_and_a_wrong_reply(case: str):
+    """A write in the plan or the ask message, or past the batch's stop, fails the case in one
+    run of three with all else right; a reply the judge and its light check both fail (code in
+    the plan, a second question, a third step) fails it in two runs of three, and so does a
+    judge that fails every run. One such run passes, and so do the weight-1 checks failing in
+    every run."""
+    weights, threshold = _weights(case), _ci_threshold()
+    heavy, judge, light = PLAN_GRADERS[case]
+    cheap = {name for name, weight in weights.items() if weight == 1}
+    assert set(weights) == {heavy, judge, light} | cheap
+    total = sum(weights.values())
+    assert weights[heavy] / total > 0.6 and weights[judge] / total > 0.2
+    assert (weights[judge] + weights[light]) / total > 0.3
+
+    def passes(*runs: set[str]) -> bool:
+        return _case_score(weights, list(runs)) >= threshold
+
+    ok: set[str] = set()
+    both = {judge, light}
+    assert passes(ok, ok, ok) and passes(both, ok, ok) and passes(cheap, cheap, cheap)
+    assert not passes({heavy}, ok, ok)
+    assert not passes(both, both, ok)
+    assert not passes({judge}, {judge}, {judge})
+
+
 # ------------------------------------------------------------------ the explain evals (design §6.2)
 
 EXPLAIN_CASES = ("explain-only", "slash-explain")
@@ -2911,7 +3976,11 @@ def _mock_call(tool: str, tool_input: dict[str, Any], spaced: bool) -> str:
     return json.dumps(record, separators=(",", ":"), ensure_ascii=False)
 
 
-@pytest.mark.parametrize("case", EXPLAIN_CASES)
+# the cases whose message may change nothing: no-writes fails any write call
+NO_WRITES_CASES = (*EXPLAIN_CASES, "plan-no-code", "batch-asks-once")
+
+
+@pytest.mark.parametrize("case", NO_WRITES_CASES)
 @pytest.mark.parametrize("spaced", [False, True])
 def test_no_writes_finds_every_write_call_and_nothing_else(case: str, spaced: bool):
     spec, _ = split_frontmatter(EVALS / case / "graders" / "no-writes.md")

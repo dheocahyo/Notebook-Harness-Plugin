@@ -7,7 +7,9 @@ works in the same notebook you are looking at.
 
 - **One cell per message.** The agent adds one code cell, runs it in your
   kernel and reports the real output. Your next message is the review of that
-  cell. Big asks get a numbered plan instead of a notebook full of code.
+  cell. Big asks get a numbered plan instead of a notebook full of code
+  (`/nh:plan <goal>` asks for one), and "run the next 3" writes several of its
+  steps in one reply after one question.
 - **Notes.** Above each cell sits a short note: a title of at most 8 words and
   2-5 bullets on what the cell does and why. The ask behind each cell is kept
   in the cell's metadata, so the notebook carries its own intent trail.
@@ -102,9 +104,22 @@ distinct values. On the uv path this takes under 10 minutes.
 | **undo** | removes the cell; tells you what is still in the kernel |
 | **explain** … | walks through the cell step by step in chat; nh blocks notebook changes in that message unless it also names one ("fix", "add", "make", …) |
 | **tidy** | applies the readability hints to that cell |
+| **run the next 3** (or **run steps 2-4**) | after a plan: asks once ("Run steps 2-4 in one reply?") and writes nothing; your **yes** (or **go**) alone then writes those steps in order, one cell each with a short report, and stops at the first error, "check this" finding or nh question |
 
 If a cell fails, the agent fixes it in place, at most twice, then explains the
-error in plain words.
+error in plain words. In an approved batch it doesn't: the batch stops there,
+and the agent explains the error and which planned steps didn't run.
+
+## Plans and batches
+
+For a goal that needs many cells ("build a churn model"), the agent replies
+with a plan of 5-12 numbered steps, one cell each, in plain words, and changes
+nothing; type `/nh:plan <goal>` to ask for one. Then say **go** for step 1, or
+**run the next 3** to have several steps written in one reply. The agent asks
+once ("Run steps 1-3 in one reply?"); only a whole-message **yes** (or **go**)
+approves it, and any other answer gets no batch (at most one cell). The batch
+writes at most `[turn] max_batch` steps (5 by default), reports after each,
+and stops at the first error, "check this" finding or nh question.
 
 ## Commands
 
@@ -113,6 +128,7 @@ error in plain words.
 | `/nh:init` | set up a project in this folder, or adopt an existing notebook |
 | `/nh:status` | check every part of the setup, with fixes |
 | `/nh:explain [cell]` | a numbered walkthrough of a cell (the last one by default) in chat, changing nothing; nh enforces it unless the text names a change ("fix", "add", "make", …) |
+| `/nh:plan <goal>` | a 5-12 step plan for the goal in chat, one cell per step, changing nothing; then "go" or "run the next N" |
 | `/nh:qa-cell <ask>` | one agent writes this message's cell, another QA-checks it (automatic under ultracode) |
 | `nhctl lab start`, `status`, `stop` | the project's JupyterLab |
 | `nhctl doctor` | the same checks as `/nh:status`, from a shell |

@@ -765,8 +765,9 @@ def _batch_next(
     status: str, plain: str, *, cell: str, batch: tuple[int, int, int], check_this: bool
 ) -> str:
     """The next block of a cell in an approved batch (design §6.3): go on to the next step,
-    or stop there and report. At the batch's last step every planned step ran, so a stop there
-    doesn't ask which did not."""
+    or stop there and report. Steps count the batch's own cells (1 to N), not the plan's: a
+    batch may start after plan step 1. At the batch's last step every planned step ran, so a
+    stop there doesn't ask which did not."""
     step, total, stop = batch
     subject = cell[:1].upper() + cell[1:]
     if not stop:
@@ -776,8 +777,8 @@ def _batch_next(
             return (
                 f"Step {step} of {total} of the approved batch ran OK. Give the user a short "
                 f"report on {cell}: what it did and the real numbers, surprises first, named by "
-                f"title and [n]. Then write step {step + 1} of the plan with nh_add_cell, "
-                "without waiting for the user."
+                f"title and [n]. Then write the batch's next step (step {step + 1} of {total}) "
+                "with nh_add_cell, without waiting for the user."
             )
         last = plain.replace("Do not write a second cell.", "Do not write another cell.")
         return BATCH_LAST.format(total=total) + last

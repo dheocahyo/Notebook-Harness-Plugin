@@ -14,9 +14,10 @@ One typed while Claude works arrives with the running turn's prompt id (``turn_r
 the human turn's own, or a notification's alias): it opens no turn and only tightens the
 running one (``turn_record.absorbed``), so the reminder skips ``RULE``. An explain message
 (or one absorbed into a turn that became explain, or a notification of such a turn) gets
-``EXPLAIN``: the gateway refuses its writes (E109). An ask message gets ``ASK_BATCH`` (a batch
-request) or ``ASK`` (headless: ``ASK_HEADLESS``); the yes to a batch request gets ``BATCH``, and a
-whole-message no typed into that reply ``BATCH_STOP`` (design §6.3).
+``EXPLAIN``: the gateway refuses its writes (E109). A plan message gets ``PLAN`` and an ask
+message ``ASK_BATCH`` (a batch request) or ``ASK`` (headless: ``ASK_HEADLESS``); the yes to a
+batch request gets ``BATCH``, and a whole-message no typed into that reply ``BATCH_STOP``
+(design §6.3).
 """
 
 from __future__ import annotations
@@ -45,18 +46,19 @@ EXPLAIN = (
     "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; "
     "change nothing."
 )
-# The reminder part for a turn's mode (design §6.2); the ask and batch parts below (§6.3).
+# The reminder part for a turn's mode (design §6.2); the plan, ask and batch parts below (§6.3).
 MODE_PARTS = {"explain": EXPLAIN}
+PLAN = "[nh] Plan only this message: numbered steps in chat, never in the notebook; change nothing."
 ASK = "[nh] Ask, don't write: one question in chat, then stop."
 ASK_HEADLESS = (
     "[nh] No one can answer here (NH_HEADLESS=1): write nothing, and tell the user this needs "
     "their yes in an interactive session."
 )
 ASK_BATCH = (
-    '[nh] Ask, don\'t write: one question in chat, "Run steps a-b in one reply?", for the plan '
-    "steps the user asked for{cap}; then stop."
+    '[nh] Ask, don\'t write: one question in chat, "Run steps a-b in one reply?" (one cell per '
+    "step), for the plan steps the user asked for{cap}; then stop."
 )
-ASK_BATCH_CAP = " (nh runs at most {max} at once: ask about the first {max})"
+ASK_BATCH_CAP = " (at most {max}: ask about the first {max})"
 BATCH = (
     "[nh] Approved batch, for this reply in place of one new cell: up to {k} new cells, one plan "
     "step each, in order (ultracode: one nh:qa-cell run per step, each after the last report), a "
@@ -169,18 +171,20 @@ def mode_parts(
     said_no: bool = False,
 ) -> list[str]:
     """What the turn's record asks of this reply (design §6.3; a mode absorbed mid-turn
-    included): ``EXPLAIN`` for an explain turn; for an ask ``ASK_HEADLESS`` headless, else
-    ``ASK_BATCH`` with a batch request and ``ASK`` without; and for a yes to the previous
-    message's batch request (not headless) ``BATCH``. A message ``absorbed`` into that reply
-    gets ``BATCH_STOP`` when ``said_no`` (a whole-message no), else no batch part: ``BATCH``
-    would read as leave to go on. Else nothing. ``[turn] max_batch`` is read from harness.toml
-    only for a part that names it."""
+    included): ``EXPLAIN`` for an explain turn, ``PLAN`` for a plan turn (/nh:plan); for an
+    ask ``ASK_HEADLESS`` headless, else ``ASK_BATCH`` with a batch request and ``ASK``
+    without; and for a yes to the previous message's batch request (not headless) ``BATCH``.
+    A message ``absorbed`` into that reply gets ``BATCH_STOP`` when ``said_no`` (a
+    whole-message no), else no batch part: ``BATCH`` would read as leave to go on. Else
+    nothing. ``[turn] max_batch`` is read from harness.toml only for a part that names it."""
     if not record:
         return []
     mode = record.get("mode")
     part = MODE_PARTS.get(mode) if isinstance(mode, str) else None
     if part:
         return [part]
+    if mode == "plan":
+        return [PLAN]
     if mode == "ask":
         if headless():  # no yes can arrive, so nh grants nothing (design §6.0 b)
             return [ASK_HEADLESS]

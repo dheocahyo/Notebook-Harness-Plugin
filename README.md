@@ -11,7 +11,9 @@ your files.
 
 - **One cell per message.** The agent adds one code cell, runs it in your
   kernel and reports the real output. Your next message reviews it. Big asks
-  get a numbered plan, not a notebook full of code.
+  get a numbered plan, not a notebook full of code (`/nh:plan <goal>` asks for
+  one), and "run the next 3" writes several of its steps in one reply, after
+  one question and your yes.
 - **Notes.** Above each cell: a title of at most 8 words and 2-5 bullets on
   what the cell does and why. Your ask is kept in the cell's metadata, so the
   notebook carries its own intent trail.
@@ -99,6 +101,12 @@ each column's type, nulls and distinct values. On the uv path this takes under
 
 If a cell fails, the agent fixes it in place, at most twice, then explains the
 error in plain words.
+
+After a plan, **run the next 3** gets one question, "Run steps 1-3 in one
+reply?", and no cell. Your whole-message **yes** (or **go**) then writes those
+steps in order, one cell each with a short report after each, and the batch
+stops at the first error, "check this" finding or nh question. Any other answer
+gets no batch (at most one cell).
 
 ## Settings
 

@@ -179,7 +179,8 @@ async def test_a_batchs_next_blocks_go_on_then_close(nh: Harness) -> None:
     assert _next(first) == (
         'Step 1 of 2 of the approved batch ran OK. Give the user a short report on "Load sales '
         'data" [1]: what it did and the real numbers, surprises first, named by title and [n]. '
-        "Then write step 2 of the plan with nh_add_cell, without waiting for the user."
+        "Then write the batch's next step (step 2 of 2) with nh_add_cell, without waiting for "
+        "the user."
     )
     last = await nh.call("nh_add_cell", "p2", **DROP)
     assert _next(last).startswith(
@@ -187,6 +188,26 @@ async def test_a_batchs_next_blocks_go_on_then_close(nh: Harness) -> None:
         'rows with missing price" [2]: (1) what the cell does;'
     )
     assert _next(last).endswith("Do not write another cell.")
+
+
+async def test_a_batch_after_go_counts_its_own_steps(nh: Harness) -> None:
+    """V14's order: /nh:plan, "go" (plan step 1, one cell), then "run the next 3" and "yes". The
+    batch's first cell is plan step 2, and nh counts it as the batch's step 1 of 3, so its next
+    block names the batch's next step, never a plan step already written (C6c review)."""
+    nh.turns.prompt("p1", text="/nh:plan clean the sales data")
+    nh.turns.prompt("p2", text="go")
+    first = await nh.call("nh_add_cell", "p2", **LOAD)
+    assert " turn=1/1 " in text(first)
+    nh.turns.prompt("p3", text="run the next 3")
+    nh.turns.prompt("p4", text="yes")
+    step = await nh.call("nh_add_cell", "p4", **DROP)
+    assert " turn=1/3 batch " in text(step)
+    assert _next(step) == (
+        'Step 1 of 3 of the approved batch ran OK. Give the user a short report on "Drop rows '
+        'with missing price" [2]: what it did and the real numbers, surprises first, named by '
+        "title and [n]. Then write the batch's next step (step 2 of 3) with nh_add_cell, "
+        "without waiting for the user."
+    )
 
 
 async def test_a_batchs_error_block_says_no_retry(nh: Harness) -> None:

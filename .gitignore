@@ -20,6 +20,8 @@ htmlcov/
 # Test and spike artifacts
 spikes/out/
 plugins/nh/evals/results/
+# a history_file case's run transcript, which claude plugin eval writes next to the history
+plugins/nh/evals/*/*-*-*-*-*.jsonl
 dev/sandbox/.nh/state/
 dev/sandbox/.nh/history/
 dev/sandbox/.nh/outputs/

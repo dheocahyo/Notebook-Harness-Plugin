@@ -163,9 +163,12 @@ def _block(status, batch, check_this=False):
 def test_next_block_goes_on_to_the_next_step():
     assert _block("ok", (2, 3, 0)) == (
         f"Step 2 of 3 of the approved batch ran OK. Give the user a short report on {CELL}: what "
-        "it did and the real numbers, surprises first, named by title and [n]. Then write step 3 "
-        "of the plan with nh_add_cell, without waiting for the user."
+        "it did and the real numbers, surprises first, named by title and [n]. Then write the "
+        "batch's next step (step 3 of 3) with nh_add_cell, without waiting for the user."
     )
+    # The batch's own count, not the plan's: it names no plan step (C6c review).
+    assert "of the plan" not in _block("ok", (1, 5, 0))
+    assert "the batch's next step (step 2 of 5)" in _block("ok", (1, 5, 0))
 
 
 def test_next_block_closes_the_batch_on_its_last_step():
