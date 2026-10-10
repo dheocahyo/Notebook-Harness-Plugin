@@ -210,6 +210,60 @@ def test_a_bad_turn_entry_is_skipped(layout: Layout) -> None:
     assert TurnLedger(layout).recent_turn_ids(SESSION) == ["p2"]
 
 
+# --- writer_runs: the run that owns each claimed cell (design §6.3, C6b) ----------------------
+
+
+def test_writer_runs_round_trip(layout: Layout) -> None:
+    ledger = TurnLedger(layout)
+    ledger.save(state("p1", 1.0, claims=["u1", "u2", "u3"], writer_runs={"u1": "r1", "u3": "r3"}))
+    turn = saved(layout)["turns"]["p1"]
+    assert turn["writer_runs"] == {"u1": "r1", "u3": "r3"} and "writer_run" not in turn
+    fresh = TurnLedger(layout).get(SESSION, "p1")
+    assert fresh.writer_runs == {"u1": "r1", "u3": "r3"}
+    assert [fresh.owner(u) for u in ("u1", "u2", "u3", "u9")] == ["r1", None, "r3", None]
+    assert fresh.owns("r1") == ["u1"] and fresh.owns("r9") == [] and fresh.owns(None) == []
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize(
+    ("old", "claims", "owners"),
+    [
+        ("wf_1", ["u1", "u2"], {"u1": "wf_1"}),  # the first run that wrote owned the cell
+        ("wf_1", [], {}),
+        (None, ["u1"], {}),
+        ("", ["u1"], {}),
+        (7, ["u1"], {}),
+    ],
+)
+def test_an_old_ledgers_writer_run_owns_the_first_claim(
+    layout: Layout, version: int, old: Any, claims: list[str], owners: dict[str, str]
+) -> None:
+    """A ledger saved before C6b (v1 or v2) has one ``writer_run`` and no ``writer_runs``."""
+    turn = dict(state("p1", 1.0, claims=claims).__dict__, writer_run=old)
+    del turn["writer_runs"]
+    write(layout, {"v": version, "turns": {"p1": turn}})
+    loaded = TurnLedger(layout).get(SESSION, "p1")
+    assert loaded.claims == claims and loaded.writer_runs == owners
+
+
+@pytest.mark.parametrize(
+    ("stored", "owners"),
+    [
+        ({"u1": "r1", "u2": None, "u3": 7, "u4": ""}, {"u1": "r1"}),
+        ("r1", {}),
+        (["r1"], {}),
+        (None, {}),
+    ],
+)
+def test_bad_writer_runs_entries_are_dropped(
+    layout: Layout, stored: Any, owners: dict[str, str]
+) -> None:
+    turn = dict(state("p1", 1.0, claims=["u1"]).__dict__, writer_runs=stored, writer_run="r0")
+    write(layout, {"v": 2, "turns": {"p1": turn}})
+    expected = owners if isinstance(stored, dict) else {"u1": "r0"}
+    assert TurnLedger(layout).get(SESSION, "p1").writer_runs == expected
+
+
 # --- the pending question --------------------------------------------------------------------
 
 

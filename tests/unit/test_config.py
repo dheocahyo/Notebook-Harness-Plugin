@@ -130,19 +130,27 @@ def test_max_batch_defaults_to_5() -> None:
     assert config.load(None)["turn"]["max_batch"] == 5
 
 
-@pytest.mark.parametrize("value", [1, 2, 7, 999])
-def test_max_batch_takes_an_integer_of_at_least_1(tmp_path: Path, value: int) -> None:
+@pytest.mark.parametrize("value", [2, 7, 20])
+def test_max_batch_takes_an_integer_from_2_to_20(tmp_path: Path, value: int) -> None:
+    """Design §6.3 (C6b): a batch is two or more steps, and the launch guard counts a batch's
+    runs in the run registry, which keeps the session's last 20."""
     cfg = config.load(project(tmp_path, f"[turn]\nmax_batch = {value}\n"))
     assert cfg.problems == [] and cfg["turn"]["max_batch"] == value
+
+
+RANGE = "turn.max_batch must be an integer from 2 to 20"
 
 
 @pytest.mark.parametrize(
     ("written", "problems"),
     [
-        ("0", ["turn.max_batch must be an integer >= 1"]),
-        ("-2", ["turn.max_batch must be an integer >= 1"]),
-        ("2.5", ["turn.max_batch must be an integer >= 1"]),
-        ("3.0", ["turn.max_batch must be an integer >= 1"]),
+        ("0", [RANGE]),
+        ("-2", [RANGE]),
+        ("1", [RANGE]),
+        ("21", [RANGE]),
+        ("999", [RANGE]),
+        ("2.5", [RANGE]),
+        ("3.0", [RANGE]),
         ('"3"', ["turn.max_batch must be int"]),
         ("true", ["turn.max_batch must be int"]),
     ],
@@ -153,3 +161,13 @@ def test_any_other_max_batch_reads_as_5_with_a_problem(
     cfg = config.load(project(tmp_path, f"[turn]\nmax_batch = {written}\n"))
     assert cfg.problems == problems
     assert cfg["turn"]["max_batch"] == 5
+
+
+def test_a_harness_toml_that_isnt_utf8_is_a_problem_not_a_crash(tmp_path: Path) -> None:
+    """Before C6b's review the ``UnicodeDecodeError`` escaped ``load`` (it caught only
+    ``OSError`` and TOML errors); now it reads as defaults with a problem, as a TOML error does."""
+    (tmp_path / "harness.toml").write_bytes(b"version = 1\n[turn]\nmax_batch = 2\n# \xff\n")
+    cfg = config.load(tmp_path)
+    assert cfg["turn"]["max_batch"] == 5
+    assert len(cfg.problems) == 1 and cfg.problems[0].startswith("harness.toml unreadable: ")
+    assert "utf-8" in cfg.problems[0]

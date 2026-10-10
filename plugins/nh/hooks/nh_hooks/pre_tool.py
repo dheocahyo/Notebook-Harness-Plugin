@@ -12,7 +12,7 @@ Variants (the second argument in hooks.json):
 - ``workflow``: a launch of nh's qa-cell workflow (by its name ``nh:qa-cell``, or its script
   inline, by path or as a resume of one of its runs); denied when harness.toml asks to approve
   each cell (its writer can't ask), from a subagent, in an explain, plan or ask message, or
-  when this message already had a run.
+  when this message already had a run (an approved batch: its k runs, or one still open).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import sys
 import time
 from typing import Any
 
-from common import Payload, context, deny, setting, settings, text_field
+from common import Payload, context, deny, headless, max_batch, setting, settings, text_field
 
 from nh_gateway._shared.paths import Layout, atomic_write_json
 
@@ -98,6 +98,15 @@ WORKFLOW_AGAIN_REASON = (
     "nh: this user message already had its nh:qa-cell run (one per message). Reply from its "
     "report when it arrives; if its writer wrote no cell, write the cell yourself, unless the "
     "report says needs_approval: then ask its question and stop."
+)
+# An approved batch (design §6.3): one run per step, each after the last one's report.
+WORKFLOW_BATCH_OPEN_REASON = (
+    "nh: the approved batch's last step is still being written and checked; wait for its report, "
+    "then launch the next step's run."
+)
+WORKFLOW_BATCH_DONE_REASON = (
+    "nh: this user message's approved batch already had its {k} nh:qa-cell runs, one per step. "
+    "Reply from their reports; the rest of the plan waits for the user's next message."
 )
 FOREIGN_DENY_REASON = (
     "nh project: notebook edits and runs go through the mcp__plugin_nh_nh__* tools, so each "
@@ -302,8 +311,9 @@ def workflow_guard(layout: Layout, payload: Payload) -> Payload | None:
         return None
     if payload.get("agent_id"):
         return deny(WORKFLOW_SUBAGENT_REASON)
-    approve = setting(settings(layout), "approval", "approve_before_run", False)
-    if approve and os.environ.get("NH_HEADLESS") != "1":  # as the gateway's tool_meta
+    data = settings(layout)
+    approve = setting(data, "approval", "approve_before_run", False)
+    if approve and not headless():  # as the gateway's tool_meta
         return deny(WORKFLOW_APPROVAL_REASON)
     if not session_id:
         return None
@@ -311,9 +321,23 @@ def workflow_guard(layout: Layout, payload: Payload) -> Payload | None:
     turn = turn_record.canonical(record, text_field(payload, "prompt_id") or None)
     if turn_record.no_write_mode(record, turn):  # design §6.2; the gateway's E109 enforces it
         return deny(WORKFLOW_MODE_REASON)
-    runs = turn_record.find_runs(layout, session_id)
-    if turn and any(run.get("turn_id") == turn and turn_record.is_own_run(run) for run in runs):
-        return deny(WORKFLOW_AGAIN_REASON)
+    if not turn:
+        return None
+    runs = [
+        run
+        for run in turn_record.find_runs(layout, session_id)
+        if run.get("turn_id") == turn and turn_record.is_own_run(run)
+    ]
+    n = None if headless() else turn_record.approved_batch(record, turn)
+    if n is None:  # one run per message
+        return deny(WORKFLOW_AGAIN_REASON) if runs else None
+    # An approved batch (design §6.3): k runs, one per step, each after the last one reported.
+    k = min(n, max_batch(data))
+    if len(runs) >= k:
+        return deny(WORKFLOW_BATCH_DONE_REASON.format(k=k))
+    now = time.time()
+    if any(turn_record.run_open(run, now) for run in runs):
+        return deny(WORKFLOW_BATCH_OPEN_REASON)
     return None
 
 

@@ -73,8 +73,9 @@ async def snapshot(svc: Services, ref: NotebookRef, outputs: str = "none") -> li
 
 
 def _rebuild_claims(state: TurnState, cells: list[CellView], notebook: str) -> None:
-    """After a gateway restart the ledger may be empty; the document still knows this turn's cell,
-    and how often nh:cell-writer revised it."""
+    """With the ledger lost (its file gone or unreadable) the document still knows this turn's
+    cells, how often nh:cell-writer revised them, and which nh:qa-cell run wrote each one
+    (``metadata.nh.run``, design §6.3)."""
     if state.claims:
         return
     for cell in cells:
@@ -93,6 +94,11 @@ def _rebuild_claims(state: TurnState, cells: list[CellView], notebook: str) -> N
                 done = revision.get("n")
                 if isinstance(done, int) and done > state.revisions.get(uid, 0):
                     state.revisions[uid] = done
+            run = nh.get("run")
+            if isinstance(run, dict) and run.get("turn") == state.prompt_id:
+                owner = run.get("id")
+                if isinstance(owner, str) and owner:
+                    state.writer_runs.setdefault(uid, owner)
 
 
 async def _claimed(
@@ -256,19 +262,58 @@ def next_for(turn: TurnContext, main: str | None = None) -> str | None:
     return RETURN_TO_WORKFLOW if is_writer(turn) else main
 
 
+OTHER_RUN_LINE = "- Another nh:qa-cell run owns this message's cell."
+
+
 async def refuse_other_run(
     svc: Services, ref: NotebookRef, cells: list[CellView], state: TurnState, turn: TurnContext
 ) -> None:
-    """The first nh:qa-cell run whose writer wrote owns this message's cell: a second run of the
-    same message (launched in parallel) changes nothing, not even that cell."""
-    if turn.run_id and state.writer_run and state.writer_run != turn.run_id:
+    """A cell another nh:qa-cell run of this message wrote holds this run back (design §6.3,
+    §6.4). With no batch the first run that wrote owns the message's one cell: a second run (two
+    launched in parallel) changes nothing, not even that cell. In an approved batch the next
+    step's run writes only once every earlier step's run reported (no longer open in the run
+    registry), so it builds on a step QA is done with."""
+    if not turn.run_id:
+        return
+    others = [uid for uid in state.claims if state.owner(uid) not in (None, turn.run_id)]
+    if not others:
+        return
+    if not state.batch_total:
         _, _, name = await _claimed(svc, ref, cells, state)
+        raise NhError("E110", OTHER_RUN_LINE, cell=name, next_step=RETURN_TO_WORKFLOW)
+    running = batch.open_runs(svc, turn)
+    busy = [uid for uid in others if state.owner(uid) in running]
+    if busy:
         raise NhError(
             "E110",
-            "- Another nh:qa-cell run owns this message's cell.",
-            cell=name,
+            OTHER_RUN_LINE,
+            head=batch.RUN_OPEN_HEAD,
+            step=str(state.claims.index(busy[-1]) + 1),
             next_step=RETURN_TO_WORKFLOW,
         )
+
+
+def refuse_other_slot(state: TurnState, turn: TurnContext, uid: str, name: str) -> None:
+    """A writer's retry or revision changes only its own run's cell, and in an approved batch
+    only while no later step is written on top of it (design §6.3): a step another run wrote is
+    E110, and so, in a batch, is one the main conversation wrote; one a later step builds on is
+    E112. Outside a batch C5's rule stands: the run may revise the message's cell whoever wrote
+    it."""
+    if not turn.run_id or uid not in state.claims:
+        return
+    step = state.claims.index(uid) + 1
+    owner = state.owner(uid)
+    if owner != turn.run_id and (owner is not None or state.batch_total):
+        raise NhError(
+            "E110",
+            OTHER_RUN_LINE if owner is not None else batch.MAIN_STEP_LINE,
+            head=batch.OTHER_STEP_HEAD,
+            cell=name,
+            step=str(step),
+            next_step=RETURN_TO_WORKFLOW,
+        )
+    if state.batch_total and step < len(state.claims):
+        raise NhError("E112", head=batch.LATER_HEAD, cell=name, next_step=RETURN_TO_WORKFLOW)
 
 
 def refuse_user_code(
@@ -777,6 +822,7 @@ async def add_cell(
                 turn_id=turn.prompt_id,
                 source=code,
                 agent=turn.agent_type if writer else None,
+                run_id=turn.run_id if writer else None,  # design §6.3: the step's run
             ),
         }
         note_md = {
@@ -795,16 +841,15 @@ async def add_cell(
         state.claim_notebooks[uid] = ref.rel_path
         state.kinds[uid] = "add"
         state.status[uid] = "running"
-        owner = state.writer_run
-        if writer:
-            state.writer_run = turn.run_id
+        if writer and turn.run_id:  # the step is this run's (design §6.3)
+            state.writer_runs[uid] = turn.run_id
         svc.ledger.save(state)
 
         async def rollback() -> None:
             await svc.backend.delete_cells(ref, [note_uid, uid])
             state.claims.remove(uid)
             state.status.pop(uid, None)
-            state.writer_run = owner
+            state.writer_runs.pop(uid, None)
             svc.ledger.save(state)
 
         history = dict(
@@ -918,11 +963,12 @@ async def edit_cell(
         uid = uid_of(target)
         attempt.uid = uid
         if writer:
+            refuse_other_slot(state, turn, uid, target_label)
             refuse_user_code(svc, uid, ref, target, target_label)
 
         retry = False
         revision = False  # nh:cell-writer changing its OK cell from QA findings
-        prior, owner = state.status.get(uid), state.writer_run
+        prior, owner = state.status.get(uid), state.writer_runs.get(uid)
         if state.claims:
             if uid not in state.claims:
                 _, _, claimed = await _claimed(svc, ref, cells, state)
@@ -1049,6 +1095,8 @@ async def edit_cell(
             new_nh["rationale"] = bullets
         if writer:
             new_nh["agent"] = turn.agent_type
+            if turn.run_id:  # the cell is this run's now (design §6.3)
+                new_nh["run"] = meta.run_metadata(turn.prompt_id, turn.run_id)
         if revision:
             new_nh["revision"] = {"turn": turn.prompt_id, "n": state.revisions.get(uid, 0) + 1}
         # Outputs and [n] stay until the run starts (it clears them), so a rollback keeps them.
@@ -1101,8 +1149,8 @@ async def edit_cell(
             state.retries[uid] = state.retries.get(uid, 0) + 1
         if revision:
             state.revisions[uid] = state.revisions.get(uid, 0) + 1
-        if writer:
-            state.writer_run = turn.run_id
+        if writer and turn.run_id:  # the cell is this run's now (design §6.3)
+            state.writer_runs[uid] = turn.run_id
         state.status[uid] = "running"
         svc.ledger.save(state)
 
@@ -1134,7 +1182,10 @@ async def edit_cell(
                 state.retries[uid] -= 1
             if revision:
                 state.revisions[uid] -= 1
-            state.writer_run = owner
+            if owner is None:
+                state.writer_runs.pop(uid, None)
+            else:
+                state.writer_runs[uid] = owner
             if writer and prior is not None:  # its OK (or failed) run still stands
                 state.status[uid] = prior
             else:

@@ -8,6 +8,10 @@ result (E133 until it is in). The batch stops at the first result that isn't ok 
 "check this" section, at any E12x refusal and at an undo; after that, every add, edit, re-run
 and undo of the message gets E123.
 
+Under ultracode each step is its own nh:qa-cell run (design §6.3, C6b): one cell per run, and
+the next step's run writes only once every earlier step's run reported (``refuse_second_cell``,
+``write.refuse_other_run``, ``write.refuse_other_slot``).
+
 Everything here runs inside ``svc.locks.hold`` (E125's stop: ``svc.locks.hold_turn``), except
 ``reported``, which ``report_run`` calls where it already updates the turn's status.
 """
@@ -15,6 +19,7 @@ Everything here runs inside ``svc.locks.hold`` (E125's stop: ``svc.locks.hold_tu
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -45,9 +50,22 @@ FULL_HEAD = (
     "Not written (by design): the approved batch's {total} cells are written; the last is {cell}."
 )
 FULL_LINE = "- The rest of the plan waits for the user's next message."
-# E110 for a writer's second cell from one nh:qa-cell run (C6a, until C6b's per-slot runs).
+# E110 for a writer's second cell from one nh:qa-cell run: one QA pass checks one cell (design
+# §6.3; C6a in a batch, C6b everywhere).
 RUN_HEAD = (
     "Not written (by design): one new cell per nh:qa-cell run, and this run already wrote one."
+)
+# Per-slot writer runs (design §6.3, C6b): the next step's run writes only once every earlier
+# step's run reported, and a run changes only its own step. Each with write.OTHER_RUN_LINE.
+RUN_OPEN_HEAD = (
+    "Not written (by design): step {step} of the approved batch is still being written and checked."
+)
+OTHER_STEP_HEAD = "Not written (by design): {cell} is step {step} of the approved batch."
+# With OTHER_STEP_HEAD, for a step no run owns (design §6.3): a run changes only its own step.
+MAIN_STEP_LINE = "- The main conversation wrote this step; an nh:qa-cell run changes only its own."
+# E112 for a writer's retry or revision once a later step is written on top of its cell.
+LATER_HEAD = (
+    "Not written (by design): a later step of this message builds on {cell}, so it stays as it is."
 )
 # E133 for a step sent before the last step's result is in (a parallel call): nothing stops.
 WAITING_DETAIL = " with step {step} of the approved batch, whose result isn't in yet"
@@ -186,10 +204,22 @@ def full(state: TurnState, turn: TurnContext, cell: str) -> NhError:
 
 
 def refuse_second_cell(state: TurnState, turn: TurnContext) -> None:
-    """In a batch, one nh:qa-cell run writes one cell, as the cap of 1 kept it before (C6a;
-    C6b's per-slot runs replace this). Another run is ``refuse_other_run``'s."""
-    if state.batch_total and _writer(turn) and turn.run_id and state.writer_run == turn.run_id:
+    """One new cell per nh:qa-cell run, in a batch or not (design §6.3): one QA pass checks one
+    cell, so a run that owns a cell of this message writes no other. Another run's cell is
+    ``write.refuse_other_run``'s."""
+    if _writer(turn) and state.owns(turn.run_id):
         raise NhError("E110", head=RUN_HEAD, next_step=RETURN_TO_WORKFLOW)
+
+
+def open_runs(svc: Services, turn: TurnContext) -> set[str]:
+    """The session's nh:qa-cell runs that haven't reported (the run registry the hooks write:
+    no ``done_ts``, launched under an hour ago)."""
+    now = time.time()
+    return {
+        str(run["run_id"])
+        for run in turn_record.find_runs(svc.layout, turn.session_id)
+        if turn_record.run_open(run, now)
+    }
 
 
 def attempt_step(state: TurnState, uid: str | None = None) -> int:

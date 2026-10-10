@@ -10,6 +10,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
+from ._shared import turn_record
+
 RESERVED_SECTIONS = {"preset", "guardrails", "secrets", "libraries", "comprehension"}
 # A [lint.rules] level; "ask" holds the cell for the user's yes (design §6.4).
 RULE_LEVELS = ("off", "hint", "error", "ask")
@@ -80,7 +82,7 @@ def load(project: Path | None) -> Config:
             user = tomllib.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             user = {}
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        except (OSError, ValueError) as exc:  # a TOML error, or a file that isn't UTF-8
             user = {}
             problems.append(f"harness.toml unreadable: {exc}")
         _merge(data, user, "", problems)
@@ -90,10 +92,10 @@ def load(project: Path | None) -> Config:
         if value not in levels:
             problems.append(f"lint.rules.{key} must be {'|'.join(levels)}")
             data["lint"]["rules"][key] = DEFAULTS["lint"]["rules"].get(key, "hint")
-    # The most steps one approved batch writes (design §6.3): an integer of at least 1.
-    max_batch = data["turn"]["max_batch"]
-    if isinstance(max_batch, bool) or not isinstance(max_batch, int) or max_batch < 1:
-        problems.append("turn.max_batch must be an integer >= 1")
+    # The most steps one approved batch writes (design §6.3): an integer from 2 to 20.
+    if not turn_record.valid_max_batch(data["turn"]["max_batch"]):
+        least, most = turn_record.MAX_BATCH_RANGE
+        problems.append(f"turn.max_batch must be an integer from {least} to {most}")
         data["turn"]["max_batch"] = DEFAULTS["turn"]["max_batch"]
     return Config(data=data, problems=problems, source_mtime=mtime)
 

@@ -10,8 +10,10 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 from hookenv import (
@@ -381,6 +383,20 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
         return run.stdout == "" and (sandbox.nh / "state" / "workflows" / "sess-2.json").is_file()
 
     messages = itertools.count(1)
+
+    def batch_payloads() -> Iterator[dict[str, Any]]:
+        for n in itertools.count(1):
+            for text in ("run the next 3 steps of the plan", "yes"):
+                yield sandbox.payload(
+                    "UserPromptSubmit", prompt_id=f"batch-{n}-{text}", prompt=text
+                )
+
+    batch_messages = batch_payloads()
+    batch_parts = itertools.cycle(("[nh] Ask, don't write", "[nh] Approved batch"))
+
+    def asked_or_approved(run: HookRun) -> bool:
+        return next(batch_parts) in run.context
+
     launch = {"name": "nh:qa-cell", "args": "go"}
     launched = {
         "status": "async_launched",
@@ -402,6 +418,13 @@ def test_hook_latency_p95(sandbox: Sandbox) -> None:
                 prompt="Load the sales data, then run the next 3 steps of the plan.",
             ),
             has_context,
+        ),
+        # A batch ask, then its yes (C6b): each reads the turn record and harness.toml.
+        "prompt-submit-batch": (
+            "UserPromptSubmit",
+            None,
+            lambda: next(batch_messages),
+            asked_or_approved,
         ),
         "file": ("PreToolUse", "Edit", sandbox.tool_payload("Edit", {"file_path": nb}), denied),
         "file-skip": (

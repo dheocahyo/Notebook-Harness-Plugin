@@ -582,6 +582,41 @@ def test_run_for_agent_gives_up_after_the_wait(layout: Layout) -> None:
     assert sum(slept) == pytest.approx(tr.META_WAIT_S)
 
 
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (2, True),
+        (5, True),
+        (20, True),
+        (1, False),  # a batch is two or more steps
+        (21, False),  # past the run registry's MAX_RUNS
+        (0, False),
+        (-3, False),
+        (True, False),
+        (2.0, False),
+        ("5", False),
+        (None, False),
+    ],
+)
+def test_valid_max_batch_is_2_to_the_registrys_size(value: object, valid: bool) -> None:
+    """``[turn] max_batch`` as both the gateway and the hooks take it (design §6.3, C6b)."""
+    assert tr.MAX_BATCH_RANGE == (2, tr.MAX_RUNS) == (2, 20)
+    assert tr.valid_max_batch(value) is valid
+
+
+def test_tomlread_reads_a_file_that_isnt_utf8_as_none(tmp_path: Path) -> None:
+    """The hooks' and nhctl's reader: a file that isn't UTF-8 is no file, never an exception
+    (C6b review: the prompt hook lost its whole reminder to a ``UnicodeDecodeError``)."""
+    from nh_gateway._shared import tomlread
+
+    path = tmp_path / "harness.toml"
+    path.write_bytes(b"[turn]\nmax_batch = 2\n# \xff\n")
+    assert tomlread.load(path) == {}
+    path.write_text("[turn]\nmax_batch = 2\n")
+    assert tomlread.load(path) == {"turn": {"max_batch": 2}}
+    assert tomlread.load(tmp_path / "missing.toml") == {}
+
+
 def test_approved_batch_is_the_previous_requests_n_in_a_yes_turn(layout: Layout) -> None:
     """The batch grant's record part (design §6.3): a yes message right after a batch request,
     for the record's own turn (an alias passed as its canonical turn)."""

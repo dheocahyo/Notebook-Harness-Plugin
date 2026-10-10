@@ -22,6 +22,37 @@ EXPLAIN = (
     "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; "
     "change nothing."
 )
+# Design §6.3's ask and approved-batch parts (C6b), pinned: the model reads them each message.
+ASK = "[nh] Ask, don't write: one question in chat, then stop."
+ASK_BATCH = (
+    '[nh] Ask, don\'t write: one question in chat, "Run steps a-b in one reply?", for the plan '
+    "steps the user asked for; then stop."
+)
+
+
+def ask_batch(cap: int | None = None) -> str:
+    """``ASK_BATCH`` for an ask of more steps than ``[turn] max_batch`` (``cap``)."""
+    if cap is None:
+        return ASK_BATCH
+    clause = f" (nh runs at most {cap} at once: ask about the first {cap})"
+    return ASK_BATCH.replace("; then stop.", f"{clause}; then stop.")
+
+
+def batch(k: int) -> str:
+    return (
+        f"[nh] Approved batch, for this reply in place of one new cell: up to {k} new cells, one "
+        "plan step each, in order (ultracode: one nh:qa-cell run per step, each after the last "
+        "report), a short report after each; stop at the first error or 'check this' and wait."
+    )
+
+
+BATCH_STOP = (
+    "[nh] The user said stop: write no more batch steps this reply; report what ran and wait."
+)
+ASK_HEADLESS = (
+    "[nh] No one can answer here (NH_HEADLESS=1): write nothing, and tell the user this needs "
+    "their yes in an interactive session."
+)
 
 
 def submit(sandbox: Sandbox, **fields):
@@ -381,9 +412,9 @@ def intent_of(record: dict) -> tuple:
 
 def test_a_new_turn_records_the_message_intent(sandbox: Sandbox) -> None:
     secret = "run the next 3 on the zq_private_ledger table"
-    assert say(sandbox, secret, "p1").context == RULE
+    assert say(sandbox, secret, "p1").context == f"{RULE} {ASK_BATCH}"  # design §6.3 (C6b)
     assert intent_of(turn(sandbox)) == ("ask", BATCH3, None, None, None)
-    assert say(sandbox, "Yes, please!", "p2").context == RULE
+    assert say(sandbox, "Yes, please!", "p2").context == f"{RULE} {batch(3)}"
     assert intent_of(turn(sandbox)) == (None, None, "yes", "p1", BATCH3)
     say(sandbox, "explain the fixed-width parse", "p3")
     assert intent_of(turn(sandbox)) == ("explain", None, None, "p2", None)
@@ -421,7 +452,8 @@ def test_a_mid_turn_message_is_absorbed(sandbox: Sandbox) -> None:
     notify(sandbox, "note-1")
     opened = turn(sandbox)
     run = say(sandbox, "yes", "p1")  # typed while Claude works: the running turn's prompt_id
-    assert run.returncode == 0 and run.stdout == ""  # no RULE, and nothing else to say
+    # No RULE, only the turn's own ask part (design §6.3): no budget of its own.
+    assert run.returncode == 0 and run.context == ASK_BATCH
     record = turn(sandbox)
     assert record["answer"] is None  # a mid-turn "yes" answers nothing
     assert (record["turn_id"], record["prompt_id"]) == ("p1", "p1")
@@ -489,7 +521,8 @@ def test_a_mid_turn_yes_in_a_notifications_turn_answers_nothing(sandbox: Sandbox
     notify(sandbox, "note-1")
     opened = turn(sandbox)
     run = say(sandbox, "yes", "note-1")
-    assert run.returncode == 0 and run.stdout == ""  # no RULE: no budget of its own
+    # No RULE: no budget of its own; the turn's ask part only (design §6.3).
+    assert run.returncode == 0 and run.context == ASK_BATCH
     record = turn(sandbox)
     assert (record["turn_id"], record["prompt_id"], record["answer"]) == ("p1", "note-1", None)
     for key in ("aliases", "ts", "alias_ts", "earlier", "mode", "request", "prev_turn_id"):
@@ -510,7 +543,8 @@ def test_a_mid_turn_yes_in_a_notifications_turn_answers_nothing(sandbox: Sandbox
 def test_a_message_typed_into_an_orphans_turn_gets_no_budget(sandbox: Sandbox) -> None:
     notify(sandbox, "o1")  # no human turn open: an orphan
     run = say(sandbox, "run the next 3", "o1")
-    assert run.returncode == 0 and run.stdout == ""
+    # No RULE (no budget); its mode's part, as for any absorbed message (design §6.3).
+    assert run.returncode == 0 and run.context == ASK_BATCH
     record = turn(sandbox)
     assert (record["turn_id"], record["human"], record["aliases"]) == (None, False, ["o1"])
     assert (record["mode"], record["request"], record["answer"]) == ("ask", BATCH3, None)
@@ -630,6 +664,207 @@ def test_a_drift_line_too_long_for_the_room_is_cut_last(sandbox: Sandbox) -> Non
     assert "Restart Kernel" not in text and "Last cell" not in text
 
 
+# --- the ask and approved-batch parts (design §6.3, C6b) ----------------------------------
+
+
+def say_env(sandbox: Sandbox, prompt: str, prompt_id: str | None, **env: str):
+    payload = sandbox.payload("UserPromptSubmit", prompt=prompt, prompt_id=prompt_id)
+    return sandbox.run("UserPromptSubmit", payload, env=dict(sandbox.env, **env))
+
+
+def test_the_ask_and_batch_heads_for_new_messages(sandbox: Sandbox) -> None:
+    assert say(sandbox, "run the next 3", "p1").context == f"{RULE} {ASK_BATCH}"
+    assert say(sandbox, "yes", "p2").context == f"{RULE} {batch(3)}"
+    # The grant is single use: the yes message's own request (none) is the next one's.
+    assert say(sandbox, "yes", "p3").context == RULE
+    assert say(sandbox, "run steps 3-5", "p4").context == f"{RULE} {ASK_BATCH}"
+    assert say(sandbox, "go", "p5").context == f"{RULE} {batch(3)}"  # "go" alone is a yes
+    for answer in ("no", "go on", "yes, but drop the nulls", "what would that change?"):
+        say(sandbox, "run the next 3", "p6")
+        assert say(sandbox, answer, "p7").context == RULE, answer
+    say(sandbox, "run the next 3", "p8")
+    say(sandbox, "no", "p9")
+    assert say(sandbox, "yes", "p10").context == RULE  # two messages later: nothing to answer
+    # C7's re-run request asks too, without a batch: the plain ask part; its yes has no batch.
+    assert say(sandbox, "re-run the stale cells", "p11").context == f"{RULE} {ASK}"
+    assert say(sandbox, "yes", "p12").context == RULE
+    # An explain or plan message has its own part (or none): no ask part.
+    assert say(sandbox, "/nh:plan a churn model", "p13").context == RULE
+    assert say(sandbox, "explain the parse", "p14").context == f"{RULE} {EXPLAIN}"
+
+
+def test_more_steps_than_max_batch_ask_about_the_first_max(sandbox: Sandbox) -> None:
+    assert say(sandbox, "run the next 7", "p1").context == f"{RULE} {ask_batch(5)}"
+    assert say(sandbox, "yes", "p2").context == f"{RULE} {batch(5)}"
+    assert say(sandbox, "run the next 5", "p3").context == f"{RULE} {ASK_BATCH}"  # no cap at max
+    assert say(sandbox, "yes", "p4").context == f"{RULE} {batch(5)}"
+
+
+def test_max_batch_is_read_from_harness_toml(sandbox: Sandbox) -> None:
+    (sandbox.project / "harness.toml").write_text("[turn]\nmax_batch = 2\n")
+    assert say(sandbox, "run the next 3", "p1").context == f"{RULE} {ask_batch(2)}"
+    assert say(sandbox, "yes", "p2").context == f"{RULE} {batch(2)}"
+    (sandbox.project / "harness.toml").write_text("[turn]\nmax_batch = 12\n")
+    assert say(sandbox, "run the next 9", "p3").context == f"{RULE} {ASK_BATCH}"
+    assert say(sandbox, "yes", "p4").context == f"{RULE} {batch(9)}"
+    # The range's top (design §6.3: the run registry keeps a session's last 20 runs).
+    (sandbox.project / "harness.toml").write_text("[turn]\nmax_batch = 20\n")
+    assert say(sandbox, "run the next 25", "p5").context == f"{RULE} {ask_batch(20)}"
+    assert say(sandbox, "yes", "p6").context == f"{RULE} {batch(20)}"
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [
+        "[turn]\nmax_batch = 0\n",
+        "[turn]\nmax_batch = -2\n",
+        "[turn]\nmax_batch = 1\n",  # a batch is two or more steps
+        "[turn]\nmax_batch = 21\n",  # past the run registry's 20 runs
+        "[turn]\nmax_batch = 100000000000000000000000\n",
+        "[turn]\nmax_batch = true\n",
+        "[turn]\nmax_batch = 2.0\n",
+        '[turn]\nmax_batch = "2"\n',
+        "[turn]\nmax_batch = [2]\n",
+        "[turn\nmax_batch = 2\n",  # unreadable
+        "turn = 2\n",
+    ],
+)
+def test_a_bad_max_batch_reads_as_five_as_the_gateway_reads_it(sandbox: Sandbox, toml: str) -> None:
+    """``config.load``'s check (design §6.3): an integer from 2 to 20, else 5."""
+    (sandbox.project / "harness.toml").write_text(toml)
+    assert say(sandbox, "run the next 6", "p1").context == f"{RULE} {ask_batch(5)}"
+    assert say(sandbox, "yes", "p2").context == f"{RULE} {batch(5)}"
+
+
+def test_a_harness_toml_that_isnt_utf8_reads_as_none(sandbox: Sandbox) -> None:
+    """Before C6b's review the read raised (``UnicodeDecodeError`` is no ``OSError``), so the
+    batch ask and its yes lost the whole reminder; now the file reads as no file (5)."""
+    (sandbox.project / "harness.toml").write_bytes(b"[turn]\nmax_batch = 2\n# \xff\n")
+    assert say(sandbox, "run the next 7", "p1").context == f"{RULE} {ask_batch(5)}"
+    assert say(sandbox, "yes", "p2").context == f"{RULE} {batch(5)}"
+    log = sandbox.nh / "logs" / "hooks.log"
+    assert not log.exists() or "UnicodeDecodeError" not in log.read_text()
+
+
+def test_headless_shows_no_batch_part(sandbox: Sandbox) -> None:
+    """``NH_HEADLESS=1``: no yes can arrive and the gateway grants no batch, so an ask message
+    gets ``ASK_HEADLESS`` (it neither promises a batch nor asks a question nobody answers),
+    its notifications too, and the yes no batch part."""
+    write_runs(sandbox, qa_run("wf_1", "p2", "toolu_launch"))
+    headless = dict(sandbox.env, NH_HEADLESS="1")
+    assert say_env(sandbox, "re-run the stale cells", "p0", NH_HEADLESS="1").context == (
+        f"{RULE} {ASK_HEADLESS}"
+    )
+    assert say_env(sandbox, "run the next 3", "p1", NH_HEADLESS="1").context == (
+        f"{RULE} {ASK_HEADLESS}"
+    )
+    payload = sandbox.payload(
+        "UserPromptSubmit", prompt=notification_prompt(tool_use_id="toolu_bash"), prompt_id="n0"
+    )
+    assert sandbox.run("UserPromptSubmit", payload, env=headless).context == (
+        f"{BACKGROUND} {ASK_HEADLESS}"
+    )
+    assert say_env(sandbox, "yes", "p2", NH_HEADLESS="1").context == RULE
+    payload = sandbox.payload(
+        "UserPromptSubmit", prompt=notification_prompt(tool_use_id="toolu_launch"), prompt_id="n1"
+    )
+    assert sandbox.run("UserPromptSubmit", payload, env=headless).context == QA_REPORT
+    assert notify(sandbox, "n2", tool_use_id="toolu_bash").context == f"{BACKGROUND} {batch(3)}"
+    assert say_env(sandbox, "stop", "p2", NH_HEADLESS="1").stdout == ""  # no BATCH to stop
+    assert say_env(sandbox, "stop", "p2", NH_HEADLESS="0").context == BATCH_STOP
+
+
+def test_messages_typed_into_the_yes_message(sandbox: Sandbox) -> None:
+    """Absorbed messages (6.1): a whole-message no gets BATCH_STOP, with that message only (the
+    record keeps no trace of it, so a later notification shows BATCH again: Known gaps). Any
+    other message with no mode gets no part, as before C6b: BATCH would read as leave to go on,
+    so "please stop" or "wait" stand alone (C6b review)."""
+    say(sandbox, "run the next 3", "p1")
+    say(sandbox, "yes", "p2")
+    write_runs(sandbox, qa_run("wf_1", "p2", "toolu_launch"))
+    for no in ("stop", "no", "cancel", "Stop!", "STOP."):
+        assert say(sandbox, no, "p2").context == BATCH_STOP, no
+    for other in (
+        "please stop",
+        "no, stop",
+        "stop it",
+        "wait",
+        "hold on",
+        "and keep the plot small",
+        "yes",  # a mid-turn yes is no new answer
+    ):
+        assert say(sandbox, other, "p2").stdout == "", other
+    notified = notify(sandbox, "note-1", tool_use_id="toolu_launch").context
+    assert notified == f"{QA_REPORT} {batch(3)}"
+    assert say(sandbox, "stop", "note-1").context == BATCH_STOP  # typed into the alias's turn
+    assert notify(sandbox, "note-2", tool_use_id="toolu_bash").context == f"{BACKGROUND} {batch(3)}"
+    record = turn(sandbox)
+    assert intent_of(record) == (None, None, "yes", "p1", BATCH3)  # a no changes nothing
+
+
+@pytest.mark.parametrize(
+    ("typed", "part"),
+    [("explain what it does", EXPLAIN), ("run the next 2", ASK_BATCH), ("/nh:plan the rest", "")],
+)
+def test_a_mode_typed_into_the_yes_message_replaces_the_batch_part(
+    sandbox: Sandbox, typed: str, part: str
+) -> None:
+    """6.1: tighten only. The gateway's E109 refuses the batch's later writes."""
+    say(sandbox, "run the next 3", "p1")
+    say(sandbox, "yes", "p2")
+    assert say(sandbox, typed, "p2").context == part
+    assert notify(sandbox, "note-1", tool_use_id="toolu_bash").context == (
+        f"{BACKGROUND} {part}".strip()
+    )
+    assert say(sandbox, "stop", "p2").context == part  # no BATCH left to stop
+
+
+def test_a_no_typed_into_another_message_has_no_part(sandbox: Sandbox) -> None:
+    say(sandbox, "load the sales data", "p1")
+    assert say(sandbox, "stop", "p1").stdout == ""
+    say(sandbox, "run the next 3", "p2")
+    assert say(sandbox, "stop", "p2").context == ASK_BATCH  # the ask turn's part
+
+
+def test_notifications_in_the_ask_and_the_yes_message(sandbox: Sandbox) -> None:
+    write_runs(sandbox, qa_run("wf_0", "p0", "toolu_old"), qa_run("wf_2", "p2", "toolu_2"))
+    say(sandbox, "run the next 7", "p1")
+    assert notify(sandbox, "n1", tool_use_id="toolu_bash").context == (
+        f"{BACKGROUND} {ask_batch(5)}"
+    )
+    say(sandbox, "go", "p2")
+    assert notify(sandbox, "n2", tool_use_id="toolu_2").context == f"{QA_REPORT} {batch(5)}"
+    assert notify(sandbox, "n3", tool_use_id="toolu_old").context == f"{QA_EARLIER} {batch(5)}"
+    say(sandbox, "thanks", "p3")  # the next message: no batch
+    assert notify(sandbox, "n4", tool_use_id="toolu_bash").context == BACKGROUND
+
+
+def test_the_reminder_order_and_clip_with_the_batch_parts(sandbox: Sandbox) -> None:
+    """[NO_PROMPT_ID] + head + the part + drift + the last cell; the clip cuts the last cell,
+    then the drift line, never a part of a head with a prompt id (each fits in 400), and
+    leaves out a part of which fewer than 24 characters would show (C6b review: no "L…")."""
+    write_last_cell_and_drift(sandbox)
+    asked = say(sandbox, "run the next 3", "p1").context
+    full = f"{RULE} {ASK_BATCH} {DRIFT_LINE} {LAST_FAILING}"
+    assert len(full) > 400 and asked == full[:399].rstrip() + "…"
+    assert asked.startswith(f"{RULE} {ASK_BATCH} {DRIFT_LINE} Last cell: ")
+    yes = say(sandbox, "yes", "p2").context
+    full = f"{RULE} {batch(3)} {DRIFT_LINE} {LAST_FAILING}"
+    assert yes == full[:399].rstrip() + "…" and yes.startswith(f"{RULE} {batch(3)} Kernel ≠")
+    write_runs(sandbox, qa_run("wf_1", "p2", "toolu_launch"))
+    head = f"{QA_REPORT} {batch(3)}"
+    notified = notify(sandbox, "note-1", tool_use_id="toolu_launch").context
+    # A batch step's report: 2 characters of the drift line would show, so it goes, and the
+    # last cell after it.
+    assert len(head) == 397 and notified == head
+    # Without a prompt id: the warning, RULE and the longest ask part, all whole; 5
+    # characters of the last cell would show, so it goes too.
+    write_state(sandbox, "kernel_drift.json", {})
+    longest = f"{NO_PROMPT_ID} {RULE} {ask_batch(5)}"
+    assert len(longest) == 393
+    assert say(sandbox, "run the next 9", None).context == longest
+
+
 # --- in process: the hook module itself ----------------------------------------------------
 
 
@@ -653,6 +888,62 @@ def test_the_pinned_reminders_are_unchanged(prompt_submit: ModuleType) -> None:
     assert prompt_submit.NO_PROMPT_ID == NO_PROMPT_ID
     assert prompt_submit.EXPLAIN == EXPLAIN
     assert prompt_submit.MODE_PARTS == {"explain": EXPLAIN}
+
+
+def test_the_ask_and_batch_parts_are_pinned(prompt_submit: ModuleType) -> None:
+    """Design §6.3's texts (C6b), and the longest heads they make: each head of a message with
+    a prompt id fits in 400 whole (max_batch is 2 to 20, so k and the cap clause's max are at
+    most 20). Without a prompt id a human message gets no BATCH (its record has no turn), and
+    NO_PROMPT_ID + RULE + its part fits too; a notification's NO_PROMPT_ID + first line + part
+    doesn't, and the clip cuts the part (nh refuses that session's writes anyway)."""
+    assert prompt_submit.ASK == ASK
+    assert prompt_submit.ASK_HEADLESS == ASK_HEADLESS
+    assert prompt_submit.ASK_BATCH.format(cap="") == ASK_BATCH
+    assert prompt_submit.ASK_BATCH.format(
+        cap=prompt_submit.ASK_BATCH_CAP.format(max=5)
+    ) == ask_batch(5)
+    assert prompt_submit.BATCH.format(k=4) == batch(4)
+    assert prompt_submit.BATCH_STOP == BATCH_STOP
+    assert prompt_submit.CLIP_MIN_CHARS == 24
+    for part in (ask_batch(20), ASK, ASK_HEADLESS, EXPLAIN):
+        assert len(f"{NO_PROMPT_ID} {RULE} {part}") <= 400, part
+    for first in (QA_REPORT, QA_EARLIER, BACKGROUND):
+        assert len(f"{first} {batch(20)}") <= 400
+        assert len(f"{first} {ask_batch(20)}") <= 400
+    assert len(f"{RULE} {batch(20)}") <= 400
+    for first in (QA_REPORT, QA_EARLIER, BACKGROUND):  # cut: the docstring's case
+        assert len(f"{NO_PROMPT_ID} {first} {batch(2)}") > 400
+
+
+@pytest.mark.parametrize(
+    ("room", "kept"),
+    [(24, True), (23, False), (1, False)],
+    ids=["24 shown: cut", "23 shown: left out", "1 shown: left out"],
+)
+def test_the_clip_leaves_out_a_part_too_short_to_say_anything(
+    prompt_submit: ModuleType, room: int, kept: bool
+) -> None:
+    """The part that runs past 400 is cut with "…" when at least 24 of its characters show,
+    else left out with every part after it (design §6.3, C6b)."""
+    head = "h" * (399 - room - 1)  # then a space, then ``room`` characters before the "…"
+    tail = "t" * 50
+    text = prompt_submit.clip([head, tail, "after"])
+    assert text == (f"{head} {'t' * room}…" if kept else head)
+    assert prompt_submit.clip([head]) == head  # under 400: whole
+    assert prompt_submit.clip(["x" * 500]) == "x" * 399 + "…"  # one long part: cut
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [{"batch": True, "n": "3"}, {"batch": True}, {"batch": True, "n": 0}, ["batch"], None],
+)
+def test_an_ask_with_a_bad_stored_request_gets_ask(
+    sandbox: Sandbox, prompt_submit: ModuleType, request_: object
+) -> None:
+    """A turn record changed on disk can't make the hook raise: a request that isn't one of
+    intent's shapes reads as none."""
+    record = {"turn_id": "p1", "mode": "ask", "request": request_}
+    assert prompt_submit.mode_parts(Layout(sandbox.project), record) == [ASK]
 
 
 def test_a_failing_classifier_still_opens_the_turn(

@@ -308,6 +308,10 @@ async def test_the_writer_writes_the_messages_one_cell(nh: Harness) -> None:
     body = text(second)
     assert second.is_error and "nh: E110" in body
     assert body.splitlines()[-1] == NEXT_RETURN and "Writer:" not in body
+    # One cell per nh:qa-cell run, in a batch or not (design §6.3, C6b): its own first line.
+    assert body.splitlines()[0] == (
+        "Not written (by design): one new cell per nh:qa-cell run, and this run already wrote one."
+    )
     # The report arrives: the main conversation may write again, and shares the used budget.
     nh.turns.notification("note-1")
     main = await nh.call("nh_add_cell", "note-1", **DROP)
@@ -1010,6 +1014,126 @@ async def test_the_writers_question_reaches_the_main_conversation_and_its_call_i
     again = await nh.call(approval["tool"], "p2", **approval["args"])  # granted once
     code = "nh: E110" if approval["tool"] == "nh_add_cell" else "nh: E112"
     assert again.is_error and code in text(again) and "nh: E122" not in text(again), text(again)
+
+
+# --- an approved batch: one nh:qa-cell run per step (design §6.3, C6b) ------------------------
+
+BATCH_OPEN = "the approved batch's last step is still being written and checked"
+
+
+def step_answer(result: object, title: str) -> dict:
+    """The writer's answer for a step it wrote that ran OK, from the gateway's real result."""
+    return {
+        "status": "ok",
+        "wrote": True,
+        "result": text(result),
+        "changes": f"Wrote {title}.",
+        "cell_title": title,
+        "cell_id": result.meta["nh/cell_id"],  # type: ignore[attr-defined]
+        "exec_count": None,
+        "notebook": NOTEBOOK,
+        "lead_lines": [],
+    }
+
+
+def denial(hook_output: dict | None) -> str:
+    assert hook_output is not None, "the launch guard let it through"
+    return hook_output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@needs_node
+async def test_an_approved_batch_runs_one_qa_cell_run_per_step_end_to_end(nh: Harness) -> None:
+    """Through the real hooks, the gateway and qa-cell.js: the launch guard lets one run per
+    step through, each after the last one's report; each run's writer writes its own step, and
+    the writer learns its slot only from the context the main conversation passes."""
+    nh.turns.prompt("p1", text="run the next 2")
+    nh.turns.prompt("p2", text="yes")
+    at = "p2"
+    for k, (step, run) in enumerate(((LOAD, "wf_step-1"), (DROP, "wf_step-2")), start=1):
+        context = f"step {k} of 2 of the approved batch"
+        assert nh.turns.workflow_launch(at, {"ask": step["intent"], "context": context}) is None
+        nh.turns.workflow_launched(at, run, tool_use_id=f"toolu_{run}", task_id=f"task-{run}")
+        # Strictly one at a time; with the last step's run the count comes first.
+        held = BATCH_OPEN if k < 2 else "approved batch already had its 2 nh:qa-cell runs"
+        assert held in denial(nh.turns.workflow_launch(at))
+        wrote = await nh.turns.writer_call(nh.client, f"w-{k}", run, "nh_add_cell", step, "p2")
+        assert not wrote.is_error and f"turn={k}/2 batch" in text(wrote), text(wrote)
+        out = run_script(
+            [step_answer(wrote, step["title"]), qa("pass")],
+            args={"ask": step["intent"], "context": context, "notebook": NOTEBOOK},
+        )
+        assert f"What the main conversation already knows:\n{context}" in out["calls"][0]["prompt"]
+        assert out["result"]["outcome"] == "checked" and out["result"]["status"] == "ok"
+        at = f"note-{k}"
+        nh.turns.notification(at, tool_use_id=f"toolu_{run}", task_id=f"task-{run}")
+    assert "approved batch already had its 2 nh:qa-cell runs" in denial(
+        nh.turns.workflow_launch(at)
+    )
+    assert [c["source"] for c in nh_code_cells(nh)] == [LOAD["code"], DROP["code"]]
+    ledger = json.loads(Layout(nh.project).ledger_file("sess-1").read_text())
+    state = ledger["turns"]["p2"]
+    assert [state["writer_runs"][uid] for uid in state["claims"]] == ["wf_step-1", "wf_step-2"]
+
+
+def test_the_batch_runs_are_documented_where_the_model_reads_it() -> None:
+    def flat(path: Path) -> str:
+        return " ".join(path.read_text(encoding="utf-8").split())
+
+    qa_md = flat(PLUGIN / "skills" / "notebook" / "reference" / "qa-workflow.md")
+    for phrase in (
+        "One run per message: nh refuses a second launch (an approved batch: one run per step, "
+        "below).",
+        "## In an approved batch",
+        "one nh:qa-cell run per step, in order.",
+        "Launch one run per step, and the next only after the last one's report: nh refuses a "
+        "launch while a run is still open, and after the batch's runs.",
+        'Pass the step\'s text as `ask` and "step k of N of the approved batch" in `context`.',
+        "After each report, give the user a short report on that step",
+        "Stop launching at a report whose `status` isn't `ok`, whose `result` has a \"check "
+        'this" section, whose `outcome` is `needs_approval`, `not_written`, `refused` or '
+        "`writer_failed`, or whose `qa.verdict` is `revise` or `fail`",
+        # C6b review: the batch section overrides "When the report arrives" for its steps.
+        'Don\'t write that step yourself in this message, whatever "When the report arrives" says.',
+        "in an approved batch, stop instead: above",
+        "if this message has no cell yet, write it yourself (in an approved batch, stop instead: "
+        "above).",
+        # What nh enforces itself, and what only the main conversation does.
+        "nh stops the batch itself (E123 for every later write) only at a step whose cell isn't "
+        'ok or has a "check this" section, or that nh refused with an E12x (its question '
+        "included). At the other reports only you stop it.",
+        "(an approved batch: one per step, each written by its own run)",
+        "| E123 | the approved batch stopped earlier in this message: report the batch and wait |",
+    ):
+        assert phrase in qa_md, phrase
+
+
+def test_the_batch_refusals_are_in_troubleshooting() -> None:
+    """Each user-visible text of C6b (design §6.3) has its troubleshooting row: the writer's
+    E110 first lines, E112's later step, and both launch denials, quoted as nh prints them."""
+    from nh_gateway.tools import batch
+
+    root = PLUGIN.parents[1]
+    trouble = (root / "docs" / "troubleshooting.md").read_text(encoding="utf-8").splitlines()
+    e110 = next(line for line in trouble if line.startswith("| **E110** "))
+    assert '"one new cell per nh:qa-cell run, and this run already wrote one"' in e110
+    assert batch.RUN_HEAD.endswith(
+        "one new cell per nh:qa-cell run, and this run already wrote one."
+    )
+    assert '"step k of the approved batch is still being written and checked"' in e110
+    assert '"… is step k of the approved batch"' in e110
+    assert batch.OTHER_STEP_HEAD.endswith("is step {step} of the approved batch.")
+    e112 = next(line for line in trouble if line.startswith("| **E112**, **E113** "))
+    assert '"a later step of this message builds on" that cell' in e112
+    assert "a later step of this message builds on {cell}" in batch.LATER_HEAD
+    launch_rows = [
+        line for line in trouble if line.startswith("| The nh:qa-cell launch is refused")
+    ]
+    assert any(
+        '"the approved batch\'s last step is still being written and checked"' in row
+        for row in launch_rows
+    )
+    done = next(row for row in launch_rows if "approved batch already had its N" in row)
+    assert "at most the number of steps you approved, capped at `[turn] max_batch` (5)" in done
 
 
 QA_EARLIER_PART = "An nh:qa-cell report for an earlier message arrived"  # QA_EARLIER

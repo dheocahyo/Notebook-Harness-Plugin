@@ -31,7 +31,7 @@ def loads(text: str) -> dict[str, Any]:
 def load(path: Path) -> dict[str, Any]:
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):  # missing, unreadable, or not UTF-8: no settings
         return {}
     try:
         return loads(text)

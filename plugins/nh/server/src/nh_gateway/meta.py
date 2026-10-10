@@ -42,8 +42,10 @@ def code_metadata(
     source: str,
     host: str = "claude-code",
     agent: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    """``agent``: the subagent that wrote the cell (nh:cell-writer), kept only when set."""
+    """``agent``: the subagent that wrote the cell (nh:cell-writer), kept only when set;
+    ``run_id``: its nh:qa-cell run (``run_metadata``)."""
     data: dict[str, Any] = {
         "v": META_VERSION,
         "role": "code",
@@ -60,7 +62,15 @@ def code_metadata(
     }
     if agent:
         data["agent"] = agent
+    if run_id:
+        data["run"] = run_metadata(turn_id, run_id)
     return data
+
+
+def run_metadata(turn_id: str, run_id: str) -> dict[str, str]:
+    """``metadata.nh.run``: the nh:qa-cell run whose writer last wrote the cell, in which
+    message, so a ledger rebuilt from the notebook knows each step's run (design §6.3)."""
+    return {"turn": turn_id, "id": run_id}
 
 
 def note_metadata(*, uid: str, turn_id: str, source: str) -> dict[str, Any]:

@@ -49,7 +49,9 @@ class TurnState:
     status: dict[str, str] = field(default_factory=dict)  # uid -> last execution status
     retries: dict[str, int] = field(default_factory=dict)
     revisions: dict[str, int] = field(default_factory=dict)  # uid -> nh:cell-writer's revisions
-    writer_run: str | None = None  # the nh:qa-cell run that wrote first; it owns the turn's cell
+    # uid -> the nh:qa-cell run whose writer added the cell or last edited it (design §6.3: one
+    # step per run); a cell the main conversation wrote has none.
+    writer_runs: dict[str, str] = field(default_factory=dict)
     waits: int = 0
     undos: int = 0
     lint_rejects: int = 0
@@ -67,7 +69,32 @@ class TurnState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TurnState:
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        fields = {k: v for k, v in data.items() if k in known}
+        fields["writer_runs"] = _writer_runs(data)
+        return cls(**fields)
+
+    def owner(self, uid: str) -> str | None:
+        """The nh:qa-cell run that owns the claimed cell ``uid``, or None (no run's)."""
+        return self.writer_runs.get(uid) if uid in self.claims else None
+
+    def owns(self, run_id: str | None) -> list[str]:
+        """The claimed cells ``run_id`` owns, in claim order."""
+        return [uid for uid in self.claims if run_id and self.writer_runs.get(uid) == run_id]
+
+
+def _writer_runs(data: dict[str, Any]) -> dict[str, str]:
+    """``writer_runs`` from a saved turn: string to string entries only. A ledger saved before
+    C6b has one ``writer_run`` (the first run that wrote owned the message's cell): it becomes
+    the first claim's owner."""
+    stored = data.get("writer_runs")
+    if isinstance(stored, dict):
+        return {k: v for k, v in stored.items() if isinstance(k, str) and isinstance(v, str) and v}
+    old, claims = data.get("writer_run"), data.get("claims")
+    if isinstance(old, str) and old and isinstance(claims, list) and claims:
+        first = claims[0]
+        if isinstance(first, str):
+            return {first: old}
+    return {}
 
 
 def pending_key(text: str) -> str:

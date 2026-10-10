@@ -10,7 +10,7 @@ import contextlib
 import inspect
 import json
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -2060,6 +2060,55 @@ async def test_only_a_yes_in_the_next_message_grants_the_batch(
     assert pending(nh) is None
 
 
+@pytest.mark.parametrize("when", ["same message", "next message", "two messages later"])
+@pytest.mark.parametrize("answer", ANSWERS)
+async def test_only_a_yes_in_the_next_message_grants_the_batch_to_its_step_runs(
+    nh: Harness, answer: str, when: str
+) -> None:
+    """The writer column (C6b): under ultracode each step is its own nh:qa-cell run, launched
+    after the last one's report. Only a whole-message yes in the very next message lets those
+    runs write the 3 steps; otherwise the first run writes the message's one cell and any other
+    run is held back (6.4)."""
+    nh.turns.prompt("p1", text="run the next 3")
+    if when == "same message":
+        nh.turns.prompt("p1", text=answer)
+        turn = "p1"
+    elif when == "next message":
+        nh.turns.prompt("p2", text=answer)
+        turn = "p2"
+    else:
+        nh.turns.prompt("p2", text=answer)
+        nh.turns.prompt("p3", text=answer)
+        turn = "p3"
+    first = await add(nh, "writer", turn, "wf_s1", **STEPS[0])
+    if when == "same message":  # still the ask message: the writer's E109
+        assert lines(first)[1:] == ["nh: E109", f"Next: {RETURN_TO_WORKFLOW}"], text(first)
+        assert not nh_code_cells(nh) and events(nh, "batch_granted") == []
+        return
+    assert_written(first)
+    reported(nh, "wf_s1")
+    second = await add(nh, "writer", turn, "wf_s2", **STEPS[1])
+    if answer in YES_ANSWERS and when == "next message":
+        assert_written(second)
+        assert "turn=1/3 batch" in machine(first) and "turn=2/3 batch" in machine(second)
+        reported(nh, "wf_s2")
+        third = await add(nh, "writer", turn, "wf_s3", **STEPS[2])
+        assert_written(third)
+        assert "turn=3/3 batch" in machine(third)
+        reported(nh, "wf_s3")
+        late = await add(nh, "writer", turn, "wf_s4", **STEPS[3])
+        assert lines(late)[1:] == ["nh: E110", batch.FULL_LINE, f"Next: {RETURN_TO_WORKFLOW}"]
+        assert owners(nh, turn) == ["wf_s1", "wf_s2", "wf_s3"]
+        assert [(e["turn_id"], e["total"]) for e in events(nh, "batch_granted")] == [(turn, 3)]
+    else:
+        assert "turn=1/1 retries" in machine(first)
+        assert lines(second)[1:] == ["nh: E110", OTHER_RUN_LINE, f"Next: {RETURN_TO_WORKFLOW}"]
+        assert lines(second)[0].startswith("Not written (by design): one new cell per message")
+        assert owners(nh, turn) == ["wf_s1"] and turn_state(nh, turn)["batch_total"] == 0
+        assert events(nh, "batch_granted") == []
+    assert pending(nh) is None
+
+
 @pytest.mark.parametrize("request_text", ["run steps 3-5", "run the next three"])
 async def test_both_request_forms_grant_the_batch(nh: Harness, request_text: str) -> None:
     await ask_and_answer(nh, request=request_text)
@@ -2651,21 +2700,78 @@ async def test_an_undo_outside_a_batch_is_unchanged(nh: Harness) -> None:
     assert not undone.is_error and "batch" not in text(undone)
 
 
-# --- nh:cell-writer in a batch (C6a; the writer column comes in C6b) --------------------------
+# --- nh:cell-writer in a batch: one run per step (design §6.3, C6b: per-slot writer runs) -----
 
 
-async def test_one_qa_cell_run_writes_one_cell_of_a_batch(nh: Harness) -> None:
-    """Before C6a the cap of 1 kept a run to one cell; a batch's cap of N doesn't let one run
-    (one QA pass) write N cells. C6b's per-slot runs give each step its own run."""
+def owners(h: Harness, turn: str) -> list[str | None]:
+    """Each claimed cell's run, in step order (None: no run's)."""
+    state = turn_state(h, turn)
+    return [state["writer_runs"].get(uid) for uid in state["claims"]]
+
+
+OTHER_RUN_LINE = "- Another nh:qa-cell run owns this message's cell."
+
+
+def run_open_lines(step: int) -> list[str]:
+    """E110 for the next step's run while step ``step``'s run hasn't reported (design §6.3)."""
+    return [
+        f"Not written (by design): step {step} of the approved batch is still being written and "
+        "checked.",
+        "nh: E110",
+        OTHER_RUN_LINE,
+        f"Next: {RETURN_TO_WORKFLOW}",
+    ]
+
+
+RUN_HEAD_LINES = [batch.RUN_HEAD, "nh: E110", f"Next: {RETURN_TO_WORKFLOW}"]
+
+
+def test_the_per_slot_texts_are_pinned() -> None:
+    assert batch.RUN_OPEN_HEAD == (
+        "Not written (by design): step {step} of the approved batch is still being written and "
+        "checked."
+    )
+    assert (
+        batch.OTHER_STEP_HEAD
+        == "Not written (by design): {cell} is step {step} of the approved batch."
+    )
+    assert batch.LATER_HEAD == (
+        "Not written (by design): a later step of this message builds on {cell}, so it stays as "
+        "it is."
+    )
+    from nh_gateway.tools import write
+
+    assert write.OTHER_RUN_LINE == OTHER_RUN_LINE
+
+
+async def test_each_step_is_its_own_runs_one_cell(nh: Harness) -> None:
+    """C6b's per-slot runs (replacing C6a's one run per batch message): a run writes one cell,
+    the next step's run writes only once the last step's run reported, and a full batch's next
+    run gets E110 as any step beyond N would."""
     await ask_and_answer(nh)
     first = await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])
     assert_written(first)
     assert "turn=1/3 batch" in machine(first)
-    second = await add(nh, "writer", "p2", "wf_run-1", **STEPS[1])
-    assert lines(second) == [batch.RUN_HEAD, "nh: E110", f"Next: {RETURN_TO_WORKFLOW}"]
-    other = await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])
-    assert lines(other)[1:3] == ["nh: E110", "- Another nh:qa-cell run owns this message's cell."]
-    assert len(nh_code_cells(nh)) == 1 and events(nh, "batch_stopped") == []
+    assert lines(await add(nh, "writer", "p2", "wf_run-1", **STEPS[1])) == RUN_HEAD_LINES
+    assert lines(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])) == run_open_lines(1)
+    assert len(nh_code_cells(nh)) == 1 and turn_state(nh, "p2")["batch_stop"] == 0
+    for k, run in ((2, "wf_run-2"), (3, "wf_run-3")):
+        reported(nh, f"wf_run-{k - 1}")
+        step = await add(nh, "writer", "p2", run, **STEPS[k - 1])
+        assert_written(step)
+        assert f"turn={k}/3 batch" in machine(step)
+        assert lines(await add(nh, "writer", "p2", run, **STEPS[k])) == RUN_HEAD_LINES
+    reported(nh, "wf_run-3")
+    late = await add(nh, "writer", "p2", "wf_run-4", **STEPS[3])
+    assert lines(late) == [
+        "Not written (by design): the approved batch's 3 cells are written; the last is \"Count "
+        'rows per region" [3].',
+        "nh: E110",
+        batch.FULL_LINE,
+        f"Next: {RETURN_TO_WORKFLOW}",
+    ]
+    assert owners(nh, "p2") == ["wf_run-1", "wf_run-2", "wf_run-3"]
+    assert len(nh_code_cells(nh)) == 3 and events(nh, "batch_stopped") == []
 
 
 async def test_a_writers_failed_step_gets_no_retry(nh: Harness) -> None:
@@ -2699,15 +2805,324 @@ async def test_a_writers_step_sent_too_early_returns_to_the_workflow(nh: Harness
     assert turn_state(nh, "p2")["batch_stop"] == 0
 
 
-async def test_after_the_runs_step_the_main_conversation_writes_the_next(nh: Harness) -> None:
-    """§6.3 Known gaps, "Ultracode until C6b": one run writes step 1, and once its report is
-    in the main conversation may write the next step itself."""
+async def test_after_a_runs_report_the_next_steps_run_or_the_main_conversation_writes(
+    nh: Harness,
+) -> None:
+    """Replaces C6a's interim (the main conversation wrote every step after the first run's):
+    the next step's run writes it once the last run reported. nh counts the batch's cells, not
+    who writes them, so the main conversation's own step still counts toward N; E108 holds it
+    only while a run is open."""
     await ask_and_answer(nh)
-    assert_written(await add(nh, "writer", "p2", "wf_run-1", **STEPS[0]))
-    reported(nh, "wf_run-1")
-    second = await nh.call("nh_add_cell", "p2", **STEPS[1])
+    assert_written(await nh.call("nh_add_cell", "p2", **STEPS[0]))  # the main conversation's
+    second = await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])  # no run owned step 1
     assert_written(second)
     assert "turn=2/3 batch" in machine(second)
+    held = await nh.call("nh_add_cell", "p2", **STEPS[2])
+    assert held.is_error and "nh: E108" in text(held), text(held)
+    reported(nh, "wf_run-2")
+    third = await nh.call("nh_add_cell", "n-wf_run-2", **STEPS[2])  # replying to the report
+    assert_written(third)
+    assert "turn=3/3 batch" in machine(third)
+    assert owners(nh, "p2") == [None, "wf_run-2", None]
+
+
+async def test_a_run_k_plus_1_sent_before_ks_report_waits_and_nothing_stops(nh: Harness) -> None:
+    """Two launches in one reply both pass the advisory guard: the second run's add and edit
+    get E110 while the first is open; after its report the second writes step 2."""
+    await ask_and_answer(nh)
+    first = await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])
+    uid = first.meta["nh/cell_id"]
+    assert lines(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])) == run_open_lines(1)
+    edit = await as_writer(nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code="1"))
+    assert lines(edit) == run_open_lines(1)
+    assert turn_state(nh, "p2")["batch_stop"] == 0 and len(nh_code_cells(nh)) == 1
+    reported(nh, "wf_run-1")
+    second = await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])
+    assert_written(second)
+    assert "turn=2/3 batch" in machine(second)
+
+
+async def test_a_run_revises_its_own_step_but_not_another_runs(nh: Harness) -> None:
+    await ask_and_answer(nh)
+    first = await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])
+    uid = first.meta["nh/cell_id"]
+    revised = await as_writer(
+        nh, "p2", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+    )
+    assert_written(revised)  # its own step: a revision, the batch goes on
+    assert "turn=1/3 batch" in machine(revised) and "revisions=1/2" in machine(revised)
+    reported(nh, "wf_run-1")
+    other = await as_writer(nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code="1"))
+    assert lines(other) == [
+        'Not written (by design): "Load sales data" [2] is step 1 of the approved batch.',
+        "nh: E110",
+        OTHER_RUN_LINE,
+        f"Next: {RETURN_TO_WORKFLOW}",
+    ]
+    assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+    assert owners(nh, "p2") == ["wf_run-1", "wf_run-2"]
+    assert [c["source"] for c in nh_code_cells(nh)][0] == STEPS[0]["code"] + "\ndf"
+
+
+MAIN_STEP_LINES = [
+    'Not written (by design): "Load sales data" [1] is step 1 of the approved batch.',
+    "nh: E110",
+    "- The main conversation wrote this step; an nh:qa-cell run changes only its own.",
+    f"Next: {RETURN_TO_WORKFLOW}",
+]
+
+
+async def test_a_run_doesnt_change_the_main_conversations_step(nh: Harness) -> None:
+    """A run changes only the step it wrote (design §6.3): in a batch a writer's revision of a
+    step the main conversation wrote is E110, so the run doesn't take it over and its own step
+    is still its one cell (C6b review: before, it revised step 1 and then got RUN_HEAD)."""
+    await ask_and_answer(nh)
+    uid = (await nh.call("nh_add_cell", "p2", **STEPS[0])).meta["nh/cell_id"]
+    taken = await as_writer(
+        nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+    )
+    assert lines(taken) == MAIN_STEP_LINES
+    assert owners(nh, "p2") == [None] and turn_state(nh, "p2")["batch_stop"] == 0
+    assert [c["source"] for c in nh_code_cells(nh)] == [STEPS[0]["code"]]
+    assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+    assert owners(nh, "p2") == [None, "wf_run-2"]
+
+
+async def test_no_revision_once_a_later_step_builds_on_the_cell(nh: Harness) -> None:
+    """The later-step check, a backstop: the run registry reads run 1 open again after run 2
+    wrote step 2 on top of its step (every other way there is held earlier: E107, E108,
+    RUN_OPEN_HEAD), so run 1's revision would change what step 2 built on: E112."""
+    await ask_and_answer(nh)
+    uid = (await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])).meta["nh/cell_id"]
+    reported(nh, "wf_run-1")
+    assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+    reported(nh, "wf_run-2")
+    layout = Layout(nh.project)
+    data = json.loads(layout.workflow_file(SESSION).read_text())
+    for entry in data["runs"]:
+        if entry["run_id"] == "wf_run-1":
+            entry.update(done_ts=None, done_turn=None, status=None)
+    atomic_write_json(layout.workflow_file(SESSION), data)
+    late = await as_writer(
+        nh, "p2", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+    )
+    assert lines(late) == [
+        'Not written (by design): a later step of this message builds on "Load sales data" [1], '
+        "so it stays as it is.",
+        "nh: E112",
+        f"Next: {RETURN_TO_WORKFLOW}",
+    ]
+    assert [c["source"] for c in nh_code_cells(nh)][0] == STEPS[0]["code"]
+    assert turn_state(nh, "p2")["batch_stop"] == 0  # E112 stops nothing
+
+
+async def test_the_later_step_check_is_only_a_batchs(tmp_path: Path) -> None:
+    """Outside a batch (here two cells by hand) C5's revision stands: the message's run may
+    revise the main conversation's earlier cell after writing its own."""
+    async with batch_harness(tmp_path, "[turn]\nmax_code_cells = 2\n") as h:
+        h.turns.prompt("p1", text="load the sales data and total it")
+        uid = (await h.call("nh_add_cell", "p1", **STEPS[0])).meta["nh/cell_id"]
+        assert_written(await add(h, "writer", "p1", "wf_run-1", **STEPS[1]))
+        revised = await as_writer(
+            h, "p1", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+        )
+        assert_written(revised)
+        assert "revisions=1/2" in machine(revised)
+
+
+async def test_another_runs_step_is_e110_before_the_later_step(nh: Harness) -> None:
+    """The edit table's order: another run's step (E110) before a later step's (E112), when
+    both apply."""
+    await ask_and_answer(nh)
+    uid = (await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])).meta["nh/cell_id"]
+    reported(nh, "wf_run-1")
+    assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+    other = await as_writer(nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code="1"))
+    assert lines(other) == [
+        'Not written (by design): "Load sales data" [1] is step 1 of the approved batch.',
+        "nh: E110",
+        OTHER_RUN_LINE,
+        f"Next: {RETURN_TO_WORKFLOW}",
+    ]
+
+
+async def test_another_runs_step_comes_before_the_users_change(nh: Harness) -> None:
+    """The per-slot checks come before 6.4's: another run's step the user since changed is
+    E110, not E141."""
+    await ask_and_answer(nh)
+    uid = (await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])).meta["nh/cell_id"]
+    reported(nh, "wf_run-1")
+    nh.backend.user_edit(NOTEBOOK, uid, STEPS[0]["code"] + "\n# mine")
+    other = await as_writer(nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code="1"))
+    assert lines(other)[1:3] == ["nh: E110", OTHER_RUN_LINE], text(other)
+
+
+async def test_a_run_past_its_hour_holds_no_step(nh: Harness) -> None:
+    """Open is the registry's ``run_open``: a step's run that never reported stops holding the
+    next step's run an hour after its launch."""
+    await ask_and_answer(nh)
+    assert_written(await add(nh, "writer", "p2", "wf_run-1", **STEPS[0]))
+    assert lines(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])) == run_open_lines(1)
+    past_its_hour(nh, "wf_run-1")
+    assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+
+
+async def test_a_writers_edit_makes_the_cell_its_runs(nh: Harness) -> None:
+    """The owner is the run whose writer added the cell or last edited it: in a batch a launch
+    edit of an earlier message's cell makes it step 1 of that run, which then writes no second
+    cell and holds the next step's run until it reports; the cell's metadata says so too."""
+    nh.turns.prompt("p0", text="load the sales data")
+    uid = (await nh.call("nh_add_cell", "p0", **STEPS[0])).meta["nh/cell_id"]
+    await ask_and_answer(nh)
+    edited = await as_writer(
+        nh, "p2", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+    )
+    assert_written(edited)
+    assert "turn=1/3 batch" in machine(edited)
+    assert owners(nh, "p2") == ["wf_run-1"]
+    assert nh_code_cells(nh)[0]["metadata"]["nh"]["run"] == {"turn": "p2", "id": "wf_run-1"}
+    assert lines(await add(nh, "writer", "p2", "wf_run-1", **STEPS[1])) == RUN_HEAD_LINES
+    assert lines(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])) == run_open_lines(1)
+
+
+async def test_a_launch_edit_owns_the_message_for_its_run(nh: Harness) -> None:
+    """C5's rule outside a batch: run 1's writer edits an earlier message's cell, which makes
+    the message's cell run 1's; a second run of the message changes nothing, not even it."""
+    nh.turns.prompt("p1", text="load the sales data")
+    uid = (await nh.call("nh_add_cell", "p1", **STEPS[0])).meta["nh/cell_id"]
+    nh.turns.prompt("p2", text="also show the frame")
+    edited = await as_writer(
+        nh, "p2", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+    )
+    assert_written(edited)
+    assert owners(nh, "p2") == ["wf_run-1"]
+    other = await as_writer(
+        nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\n1")
+    )
+    assert lines(other)[1:3] == ["nh: E110", OTHER_RUN_LINE], text(other)
+
+
+def _failing_start(h: Harness) -> Callable[[], None]:
+    """The next execution can't start (E134), so the write is rolled back; returns the undo."""
+    real = h.backend.start_execution
+
+    async def fail(ref: Any, cell_id: str, **kw: Any) -> Any:
+        raise NhError("E134")
+
+    h.backend.start_execution = fail  # type: ignore[method-assign]
+
+    def restore() -> None:
+        h.backend.start_execution = real  # type: ignore[method-assign]
+
+    return restore
+
+
+async def test_a_rolled_back_edit_gives_the_cell_back(tmp_path: Path) -> None:
+    """A writer's revision that can't start restores the cell's owner (none: the main
+    conversation's cell), so the run still owns no cell and may write its own (C5's revision of
+    the main conversation's cell, outside a batch)."""
+    async with batch_harness(tmp_path, "[turn]\nmax_code_cells = 2\n") as h:
+        h.turns.prompt("p1", text="load the sales data and total it")
+        uid = (await h.call("nh_add_cell", "p1", **STEPS[0])).meta["nh/cell_id"]
+        restore = _failing_start(h)
+        failed = await as_writer(
+            h, "p1", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+        )
+        restore()
+        assert "nh: E134" in text(failed), text(failed)
+        assert owners(h, "p1") == [None] and turn_state(h, "p1")["writer_runs"] == {}
+        assert "run" not in nh_code_cells(h)[0]["metadata"]["nh"]
+        assert_written(await add(h, "writer", "p1", "wf_run-1", **STEPS[1]))
+
+
+async def test_a_rolled_back_add_leaves_no_owner(nh: Harness) -> None:
+    """A writer's add that can't start is rolled back, its owner entry too."""
+    await ask_and_answer(nh)
+    restore = _failing_start(nh)
+    failed = await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])
+    restore()
+    assert "nh: E134" in text(failed), text(failed)
+    assert turn_state(nh, "p2")["claims"] == [] and turn_state(nh, "p2")["writer_runs"] == {}
+    assert_written(await add(nh, "writer", "p2", "wf_run-1", **STEPS[0]))
+    assert owners(nh, "p2") == ["wf_run-1"]
+
+
+async def test_the_cells_metadata_names_its_run(nh: Harness) -> None:
+    """``metadata.nh.run`` (design §6.3): a writer's add and edit write it, the main
+    conversation's write leaves what is there."""
+    await ask_and_answer(nh)
+    first = await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])
+    reported(nh, "wf_run-1")
+    second = await nh.call("nh_add_cell", "n-wf_run-1", **STEPS[1])
+    assert_written(second)
+    first_nh, second_nh = (cell["metadata"]["nh"] for cell in nh_code_cells(nh))
+    assert first_nh["uid"] == first.meta["nh/cell_id"]
+    assert first_nh["run"] == {"turn": "p2", "id": "wf_run-1"}
+    assert "run" not in second_nh and owners(nh, "p2") == ["wf_run-1", None]
+
+
+@contextlib.asynccontextmanager
+async def restart_without_ledger(h: Harness) -> AsyncIterator[None]:
+    """The ledger file lost (a plain restart keeps it): a new gateway rebuilds the message's
+    claims from the notebook."""
+    Layout(h.project).ledger_file(SESSION).unlink()
+    async with Client(create_server(h.project, h.backend)) as client:
+        h.client = client
+        yield
+
+
+async def test_a_lost_ledger_keeps_each_steps_run(nh: Harness) -> None:
+    """The rebuilt claims get their owners back from ``metadata.nh.run``, so one open run still
+    writes one step, the next step's run still waits for its report, and a step stays its own
+    run's (C6b review: before, a rebuilt ledger dropped every hold)."""
+    await ask_and_answer(nh)
+    uid = (await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])).meta["nh/cell_id"]
+    async with restart_without_ledger(nh):
+        assert lines(await add(nh, "writer", "p2", "wf_run-1", **STEPS[1])) == RUN_HEAD_LINES
+        assert owners(nh, "p2") == ["wf_run-1"]
+        assert lines(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])) == run_open_lines(1)
+        revised = await as_writer(
+            nh, "p2", "wf_run-1", "nh_edit_cell", dict(cell_id=uid, code=STEPS[0]["code"] + "\ndf")
+        )
+        assert_written(revised)  # its own step: a revision
+        reported(nh, "wf_run-1")
+        assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+        other = await as_writer(nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code="1"))
+        assert lines(other)[1:3] == ["nh: E110", OTHER_RUN_LINE], text(other)
+    assert owners(nh, "p2") == ["wf_run-1", "wf_run-2"]
+
+
+@pytest.mark.parametrize("batched", [True, False], ids=["batch", "no batch"])
+async def test_an_old_ledgers_writer_run_owns_the_first_claim(nh: Harness, batched: bool) -> None:
+    """A ledger saved before C6b has one ``writer_run``: it loads as the first claim's owner,
+    so another run is still held back (C5's rule with no batch, C6b's in one)."""
+    if batched:
+        await ask_and_answer(nh)
+    else:
+        nh.turns.prompt("p2", text="load the sales data")
+    uid = (await add(nh, "writer", "p2", "wf_run-1", **STEPS[0])).meta["nh/cell_id"]
+    reported(nh, "wf_run-1")
+    path = Layout(nh.project).ledger_file(SESSION)
+    saved = json.loads(path.read_text())
+    state = saved["turns"]["p2"]
+    assert state.pop("writer_runs") == {uid: "wf_run-1"}
+    state["writer_run"] = "wf_run-1"
+    path.write_text(json.dumps(saved))
+    async with Client(create_server(nh.project, nh.backend)) as client:
+        nh.client = client
+        other = await as_writer(nh, "p2", "wf_run-2", "nh_edit_cell", dict(cell_id=uid, code="1"))
+        assert lines(other)[1:3] == ["nh: E110", OTHER_RUN_LINE], text(other)
+        if batched:
+            assert lines(other)[0] == (
+                'Not written (by design): "Load sales data" [1] is step 1 of the approved batch.'
+            )
+            assert_written(await add(nh, "writer", "p2", "wf_run-2", **STEPS[1]))
+        else:
+            again = await add(nh, "writer", "p2", "wf_run-2", **STEPS[1])
+            assert lines(again)[1:3] == ["nh: E110", OTHER_RUN_LINE], text(again)
+    if batched:  # saved again in the new shape
+        assert "writer_run" not in turn_state(nh, "p2")
+        assert owners(nh, "p2") == ["wf_run-1", "wf_run-2"]
 
 
 # --- C1's rule in a batch (design §6.3, Known gaps) --------------------------------------------

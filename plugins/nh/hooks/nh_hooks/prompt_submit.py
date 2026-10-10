@@ -14,7 +14,9 @@ One typed while Claude works arrives with the running turn's prompt id (``turn_r
 the human turn's own, or a notification's alias): it opens no turn and only tightens the
 running one (``turn_record.absorbed``), so the reminder skips ``RULE``. An explain message
 (or one absorbed into a turn that became explain, or a notification of such a turn) gets
-``EXPLAIN``: the gateway refuses its writes (E109).
+``EXPLAIN``: the gateway refuses its writes (E109). An ask message gets ``ASK_BATCH`` (a batch
+request) or ``ASK`` (headless: ``ASK_HEADLESS``); the yes to a batch request gets ``BATCH``, and a
+whole-message no typed into that reply ``BATCH_STOP`` (design §6.3).
 """
 
 from __future__ import annotations
@@ -24,12 +26,13 @@ import os
 import time
 from typing import Any
 
-from common import Payload, context, text_field
+from common import Payload, context, headless, max_batch, settings, text_field
 
 from nh_gateway._shared import intent, secrets, turn_record
 from nh_gateway._shared.paths import Layout, append_jsonl, atomic_write_json, read_json
 
 REMINDER_MAX_CHARS = 400
+CLIP_MIN_CHARS = 24  # a part the clip would cut shorter than this is left out (design §6.3)
 TITLE_MAX_CHARS = 60
 DRIFT_MAX_NAMES = 4
 
@@ -42,8 +45,26 @@ EXPLAIN = (
     "[nh] Explain only this message: a numbered walkthrough in chat, never in the notebook; "
     "change nothing."
 )
-# The reminder part for a turn's mode (design §6.2). C6 adds the ask-turn part here.
+# The reminder part for a turn's mode (design §6.2); the ask and batch parts below (§6.3).
 MODE_PARTS = {"explain": EXPLAIN}
+ASK = "[nh] Ask, don't write: one question in chat, then stop."
+ASK_HEADLESS = (
+    "[nh] No one can answer here (NH_HEADLESS=1): write nothing, and tell the user this needs "
+    "their yes in an interactive session."
+)
+ASK_BATCH = (
+    '[nh] Ask, don\'t write: one question in chat, "Run steps a-b in one reply?", for the plan '
+    "steps the user asked for{cap}; then stop."
+)
+ASK_BATCH_CAP = " (nh runs at most {max} at once: ask about the first {max})"
+BATCH = (
+    "[nh] Approved batch, for this reply in place of one new cell: up to {k} new cells, one plan "
+    "step each, in order (ultracode: one nh:qa-cell run per step, each after the last report), a "
+    "short report after each; stop at the first error or 'check this' and wait."
+)
+BATCH_STOP = (
+    "[nh] The user said stop: write no more batch steps this reply; report what ran and wait."
+)
 QA_REPORT = (
     "[nh] The nh:qa-cell report for this message arrived (not a new user message): reply "
     "from it; write no new cell unless its writer wrote none."
@@ -88,7 +109,7 @@ def handle(layout: Layout, payload: Payload) -> Payload | None:
     # Drift before the last cell (design §6.2): the clip cuts the last cell's tail first.
     parts.append(drift_line(read_json(layout.drift_json), notebook) or "")
     parts.append(last_cell_line(last, now) or "")
-    text = clip(redactor.redact(" ".join(part for part in parts if part)))
+    text = clip([redactor.redact(part) for part in parts if part])
     return context("UserPromptSubmit", text) if text else None
 
 
@@ -98,7 +119,7 @@ def human_message(
     """Open the turn (or tighten the running one, for a message typed mid-turn) and return
     the reminder's head."""
     if not session_id:
-        return human_head(None, absorbed=False)
+        return human_head(layout, None, absorbed=False)
     previous = turn_record.read(layout, session_id)
     absorbed = turn_record.running(previous, prompt_id)
     # The human turn the message belongs to (None when absorbed into an orphan).
@@ -125,23 +146,58 @@ def human_message(
         request=classified["request"],
         answer=classified["answer"],
     )
-    return human_head(record, absorbed=absorbed)
+    said_no = classified["answer"] == "no"
+    return human_head(layout, record, absorbed=absorbed, said_no=said_no)
 
 
-def human_head(record: dict[str, Any] | None, *, absorbed: bool) -> list[str]:
+def human_head(
+    layout: Layout, record: dict[str, Any] | None, *, absorbed: bool, said_no: bool = False
+) -> list[str]:
     """The reminder's head for a human message: the one-cell rule for a new turn, nothing for
     a message folded into the running turn (it has no budget of its own), then the turn's
-    mode parts."""
-    return ([] if absorbed else [RULE]) + mode_parts(record)
+    mode parts (``said_no``: the message is a whole-message no)."""
+    if not absorbed:
+        return [RULE] + mode_parts(layout, record)
+    return mode_parts(layout, record, absorbed=True, said_no=said_no)
 
 
-def mode_parts(record: dict[str, Any] | None) -> list[str]:
-    """What the turn's record asks of this reply: ``EXPLAIN`` for an explain turn (a mode
-    absorbed mid-turn included), else nothing. The seam for C6's ask-turn part (mode ask)
-    and approved-batch part (a yes to the previous turn's request)."""
-    mode = record.get("mode") if record else None
+def mode_parts(
+    layout: Layout,
+    record: dict[str, Any] | None,
+    *,
+    absorbed: bool = False,
+    said_no: bool = False,
+) -> list[str]:
+    """What the turn's record asks of this reply (design §6.3; a mode absorbed mid-turn
+    included): ``EXPLAIN`` for an explain turn; for an ask ``ASK_HEADLESS`` headless, else
+    ``ASK_BATCH`` with a batch request and ``ASK`` without; and for a yes to the previous
+    message's batch request (not headless) ``BATCH``. A message ``absorbed`` into that reply
+    gets ``BATCH_STOP`` when ``said_no`` (a whole-message no), else no batch part: ``BATCH``
+    would read as leave to go on. Else nothing. ``[turn] max_batch`` is read from harness.toml
+    only for a part that names it."""
+    if not record:
+        return []
+    mode = record.get("mode")
     part = MODE_PARTS.get(mode) if isinstance(mode, str) else None
-    return [part] if part else []
+    if part:
+        return [part]
+    if mode == "ask":
+        if headless():  # no yes can arrive, so nh grants nothing (design §6.0 b)
+            return [ASK_HEADLESS]
+        request = intent.valid_request(record.get("request"))
+        if request is None or not request.get("batch"):
+            return [ASK]
+        most = max_batch(settings(layout))
+        cap = ASK_BATCH_CAP.format(max=most) if int(request["n"]) > most else ""
+        return [ASK_BATCH.format(cap=cap)]
+    if mode is not None or headless():
+        return []
+    n = turn_record.approved_batch(record, record.get("turn_id"))
+    if n is None:
+        return []
+    if absorbed:
+        return [BATCH_STOP] if said_no else []
+    return [BATCH.format(k=min(n, max_batch(settings(layout))))]
 
 
 def log_event(layout: Layout, now: float, event: str, **fields: Any) -> None:
@@ -201,7 +257,7 @@ def notification(
         first = QA_EARLIER
     else:
         first = BACKGROUND
-    return [first] + mode_parts(current)  # aliased() keeps the turn's mode
+    return [first] + mode_parts(layout, current)  # aliased() keeps the turn's intent
 
 
 def last_cell_line(last: Any, now: float) -> str | None:
@@ -283,7 +339,17 @@ def drift_line(drift: Any, notebook: Any) -> str | None:
     )
 
 
-def clip(text: str) -> str:
-    if len(text) <= REMINDER_MAX_CHARS:
-        return text
-    return text[: REMINDER_MAX_CHARS - 1].rstrip() + "…"
+def clip(parts: list[str]) -> str:
+    """The parts joined by spaces, at most REMINDER_MAX_CHARS: the part that runs past it is
+    cut with "…", or left out when fewer than CLIP_MIN_CHARS of it would show (a stub like
+    "L…" says nothing; design §6.3), and every part after it goes too."""
+    text = ""
+    for part in parts:
+        joined = f"{text} {part}" if text else part
+        if len(joined) <= REMINDER_MAX_CHARS:
+            text = joined
+            continue
+        cut = joined[: REMINDER_MAX_CHARS - 1].rstrip()
+        shown = len(cut) - len(text) - (1 if text else 0)
+        return cut + "…" if shown >= CLIP_MIN_CHARS else text
+    return text

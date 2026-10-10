@@ -60,6 +60,23 @@ def setting(data: dict[str, Any], section: str, key: str, default: Any) -> Any:
     return value if isinstance(value, type(default)) else default
 
 
+MAX_BATCH_DEFAULT = 5
+
+
+def max_batch(data: dict[str, Any]) -> int:
+    """``[turn] max_batch`` as the gateway's ``config.load`` reads it (design §6.3): an integer
+    from 2 to 20, not a bool; anything else (a float, a string, out of range, no file) is 5."""
+    from nh_gateway._shared import turn_record
+
+    value = setting(data, "turn", "max_batch", MAX_BATCH_DEFAULT)
+    return value if turn_record.valid_max_batch(value) else MAX_BATCH_DEFAULT
+
+
+def headless() -> bool:
+    """``NH_HEADLESS=1``: nobody can answer, as the gateway's ``config.headless`` reads it."""
+    return os.environ.get("NH_HEADLESS") == "1"
+
+
 def text_field(payload: Payload, key: str) -> str:
     value = payload.get(key)
     return value if isinstance(value, str) else ""

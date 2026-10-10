@@ -41,6 +41,9 @@ MAX_ALIASES = 1000  # reset by every human message
 MAX_EARLIER = 1000  # aliases of earlier turns remembered across human messages
 MAX_RUNS = 20
 RUN_OPEN_TTL_S = 3600.0  # a run that never reported stops counting as open
+# ``[turn] max_batch``'s range (design §6.3): a batch request is two or more steps, and the
+# workflow guard counts a batch's runs in the registry, which keeps the session's last MAX_RUNS.
+MAX_BATCH_RANGE = (2, MAX_RUNS)
 # The status a TaskStop marks a run done with (hooks/nh_hooks/post_tool.py): a stopped run
 # sends no report, so its writer's question never reached the user (design §6.4, C5d2).
 STOPPED = "killed"
@@ -175,6 +178,13 @@ def approved_batch(record: dict[str, Any] | None, turn_id: str | None) -> int | 
     if request is None or not request.get("batch"):
         return None
     return int(request["n"])
+
+
+def valid_max_batch(value: Any) -> bool:
+    """``[turn] max_batch`` as nh takes it, in the gateway's ``config.load`` and the hooks alike
+    (design §6.3): an integer from 2 to 20, not a bool; anything else reads as the default."""
+    least, most = MAX_BATCH_RANGE
+    return isinstance(value, int) and not isinstance(value, bool) and least <= value <= most
 
 
 def running(record: dict[str, Any] | None, prompt_id: str | None) -> bool:
