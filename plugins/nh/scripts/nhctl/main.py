@@ -27,6 +27,7 @@ import envsync  # noqa: E402
 import freshrun  # noqa: E402
 import lab  # noqa: E402
 import metrics  # noqa: E402
+import preset  # noqa: E402
 import scaffold  # noqa: E402
 import settings  # noqa: E402
 
@@ -61,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser = Parser(prog="nhctl", description=__doc__, parents=[common_opts])
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
-    for module in (doctor, scaffold, envsync, lab, settings, metrics, freshrun):
+    for module in (doctor, scaffold, envsync, lab, settings, preset, metrics, freshrun):
         module.add_parsers(sub, common_opts)
     return parser
 

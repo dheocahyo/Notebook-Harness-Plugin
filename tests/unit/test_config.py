@@ -171,3 +171,187 @@ def test_a_harness_toml_that_isnt_utf8_is_a_problem_not_a_crash(tmp_path: Path) 
     assert cfg["turn"]["max_batch"] == 5
     assert len(cfg.problems) == 1 and cfg.problems[0].startswith("harness.toml unreadable: ")
     assert "utf-8" in cfg.problems[0]
+
+
+# --- [preset] level and its overlay (design §6.9) --------------------------------------------
+
+
+def test_load_without_a_project_reads_the_junior_preset() -> None:
+    """The load() trap (design §6.9): ``user`` was bound only for a project, and the overlay
+    reads the level for ``load(None)`` too."""
+    cfg = config.load(None)
+    assert cfg.problems == []
+    assert cfg["preset"]["level"] == "junior"
+    assert cfg["lint"]["comment_ratio"] == 8
+
+
+# defaults < the preset's overlay < explicit harness.toml keys < NH_* (design §6.0 e, §6.9):
+# (harness.toml after `version = 1`, the level, comment_ratio).
+PRECEDENCE = [
+    ("", "junior", 8),
+    ("[preset]\n", "junior", 8),
+    ('[preset]\nlevel = "junior"\n', "junior", 8),
+    ('[preset]\nlevel = "senior"\n', "senior", 16),
+    ("[lint]\ncomment_ratio = 12\n", "junior", 12),
+    ('[preset]\nlevel = "senior"\n[lint]\ncomment_ratio = 8\n', "senior", 8),
+    ('[preset]\nlevel = "junior"\n[lint]\ncomment_ratio = 16\n', "junior", 16),
+    ('[preset]\nlevel = "senior"\n[lint]\ncomment_ratio = 0\n', "senior", 0),
+    ('[lint]\ncomment_ratio = 4\n[preset]\nlevel = "senior"\n', "senior", 4),
+    ('[preset]\nlevel = "senior"\n[lint]\nmode = "strict"\n', "senior", 16),
+]
+
+
+@pytest.mark.parametrize(("toml", "level", "ratio"), PRECEDENCE)
+def test_the_preset_overlay_sits_between_the_defaults_and_explicit_keys(
+    tmp_path: Path, toml: str, level: str, ratio: int
+) -> None:
+    cfg = config.load(project(tmp_path, toml))
+    assert cfg.problems == []
+    assert cfg["preset"]["level"] == level
+    assert cfg["lint"]["comment_ratio"] == ratio
+
+
+def test_the_preset_changes_only_the_comment_ratio(tmp_path: Path) -> None:
+    """The note stays a title plus 2-5 bullets in both presets (plan D9): the overlay touches
+    [lint] comment_ratio and nothing else."""
+    junior = config.load(project(tmp_path, '[preset]\nlevel = "junior"\n'))
+    senior = config.load(project(tmp_path, '[preset]\nlevel = "senior"\n'))
+    for section in config.DEFAULTS:
+        if section in ("preset", "lint"):
+            continue
+        assert junior[section] == senior[section] == config.DEFAULTS[section], section
+    assert {k: v for k, v in junior["lint"].items() if k != "comment_ratio"} == {
+        k: v for k, v in senior["lint"].items() if k != "comment_ratio"
+    }
+    assert (junior["lint"]["comment_ratio"], senior["lint"]["comment_ratio"]) == (8, 16)
+
+
+def test_nh_variables_stay_on_top_of_a_senior_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = project(
+        tmp_path,
+        '[preset]\nlevel = "senior"\n[approval]\napprove_before_run = true\n'
+        '[jupyter]\nurl = "http://127.0.0.1:8890/"\n',
+    )
+    monkeypatch.setenv("NH_HEADLESS", "1")
+    monkeypatch.setenv("NH_JUPYTER_URL", "http://10.0.0.5:8888/")
+    cfg = config.load(root)
+    assert cfg.problems == []
+    assert cfg["approval"]["approve_before_run"] is False
+    assert cfg["jupyter"]["url"] == "http://10.0.0.5:8888/"
+    assert (cfg["preset"]["level"], cfg["lint"]["comment_ratio"]) == ("senior", 16)
+
+
+LEVEL_PROBLEM = "preset.level must be junior|senior"
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        '"expert"',
+        '""',
+        '"Senior"',
+        '" senior"',
+        '"junior "',
+        "1",
+        "1.5",
+        "true",
+        "16",
+        "[]",
+        "{}",  # a table: without _without_level, _merge would add "must be str" too
+        '{ name = "senior" }',
+        "1979-05-27",
+        "1979-05-27T07:32:00Z",
+    ],
+)
+def test_a_bad_level_reads_as_junior_with_one_problem(tmp_path: Path, written: str) -> None:
+    """Any value but "junior" or "senior", non-strings too: one problem, not _merge's "must be
+    str" as well (design §6.9)."""
+    cfg = config.load(project(tmp_path, f"[preset]\nlevel = {written}\n"))
+    assert cfg.problems == [LEVEL_PROBLEM]
+    assert (cfg["preset"]["level"], cfg["lint"]["comment_ratio"]) == ("junior", 8)
+
+
+def test_a_preset_level_table_reads_as_junior_with_one_problem(tmp_path: Path) -> None:
+    cfg = config.load(project(tmp_path, "[preset.level]\nx = 1\n"))
+    assert cfg.problems == [LEVEL_PROBLEM]
+    assert (cfg["preset"]["level"], cfg["lint"]["comment_ratio"]) == ("junior", 8)
+
+
+def test_a_bad_level_keeps_the_users_own_ratio(tmp_path: Path) -> None:
+    cfg = config.load(project(tmp_path, '[preset]\nlevel = "expert"\n[lint]\ncomment_ratio = 3\n'))
+    assert cfg.problems == [LEVEL_PROBLEM]
+    assert (cfg["preset"]["level"], cfg["lint"]["comment_ratio"]) == ("junior", 3)
+
+
+def test_a_preset_that_isnt_a_table_reads_as_junior(tmp_path: Path) -> None:
+    cfg = config.load(project(tmp_path, 'preset = "senior"\n'))
+    assert cfg.problems == ["preset must be a table"]
+    assert (cfg["preset"]["level"], cfg["lint"]["comment_ratio"]) == ("junior", 8)
+
+
+def test_preset_is_a_section_like_any_other_now(tmp_path: Path) -> None:
+    """The preset left RESERVED_SECTIONS: another key in it is an unknown key."""
+    cfg = config.load(project(tmp_path, '[preset]\nlevel = "senior"\nname = "x"\n'))
+    assert cfg.problems == ["unknown key preset.name"]
+    assert cfg["preset"]["level"] == "senior"
+    reserved = config.load(project(tmp_path, '[guardrails]\nname = "x"\n'))
+    assert reserved.problems == []
+
+
+def test_reserved_sections_have_one_definition() -> None:
+    from nh_gateway._shared import harness_toml
+
+    assert config.RESERVED_SECTIONS is harness_toml.RESERVED_SECTIONS
+    assert "preset" not in harness_toml.RESERVED_SECTIONS
+    assert {"guardrails", "secrets", "libraries", "comprehension"} == harness_toml.RESERVED_SECTIONS
+
+
+def test_the_overlay_sets_defaults_keys_of_the_same_type() -> None:
+    from nh_gateway._shared import harness_toml
+
+    assert config.DEFAULTS["preset"] == {"level": harness_toml.DEFAULT_LEVEL}
+    assert harness_toml.PRESET_LEVELS == ("junior", "senior")
+    assert set(harness_toml.PRESET_OVERLAY) == set(harness_toml.PRESET_LEVELS)
+    for overlay in harness_toml.PRESET_OVERLAY.values():
+        for section, keys in overlay.items():
+            for key, value in keys.items():
+                assert type(value) is type(config.DEFAULTS[section][key]), (section, key)
+    assert harness_toml.PRESET_OVERLAY["junior"]["lint"]["comment_ratio"] == 8
+    assert config.DEFAULTS["lint"]["comment_ratio"] == 8  # junior's is today's default
+    assert harness_toml.PRESET_OVERLAY["senior"]["lint"]["comment_ratio"] == 16
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [toml for toml, _, _ in PRECEDENCE]
+    + [
+        '[preset]\nlevel = "expert"\n',
+        "[preset]\nlevel = 2\n[lint]\ncomment_ratio = 2.5\n",
+        '[preset]\nlevel = "senior"\n[lint]\ncomment_ratio = true\n',
+        '[preset]\nlevel = "senior"\n[lint]\ncomment_ratio = "4"\n',
+        'preset = "senior"\n',
+        'lint = 3\n[preset]\nlevel = "senior"\n',
+    ],
+)
+def test_the_shared_reading_agrees_with_config_load(tmp_path: Path, toml: str) -> None:
+    """``harness_toml.preset_level`` and ``comment_ratio`` (nhctl's doctor and preset, and C9b's
+    SessionStart hook) read what ``config.load`` uses."""
+    import tomllib
+
+    from nh_gateway._shared import harness_toml
+
+    root = project(tmp_path, toml)
+    cfg = config.load(root)
+    data = tomllib.loads((root / "harness.toml").read_text())
+    level, valid = harness_toml.preset_level(data)
+    assert level == cfg["preset"]["level"]
+    assert valid is (
+        LEVEL_PROBLEM not in cfg.problems and "preset must be a table" not in cfg.problems
+    )
+    ratio, set_by = harness_toml.comment_ratio(data)
+    assert ratio == cfg["lint"]["comment_ratio"]
+    explicit = isinstance(data.get("lint"), dict) and "comment_ratio" in data["lint"]
+    taken = "lint.comment_ratio must be int" not in cfg.problems
+    assert (set_by == "harness.toml") is (explicit and taken)

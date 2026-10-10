@@ -2174,6 +2174,161 @@ Chunk C3 (plan D8, and E125 from D7). Files: `_shared/secrets.py` (new), `_share
 
 **Perf** (hooks, 3 warm-ups and 50 interleaved runs, C2 vs C3, p50/p95 in ms): through the shim, on a project with a 30-value `.env`, a goal and a last cell: system 3.9 prompt-submit 112.1/119.9 → 114.0/121.1, session-start 133.0/140.6 → 134.3/144.8; server venv 3.13 prompt-submit 79.9/84.4 → 81.0/87.0, session-start 99.0/108.8 → 101.5/110.2. A second run: p50 up 1.8 to 3.3 ms, every C3 p95 at most 141.0 ms. All under the 150 ms budget. Before the keyed regexes were compiled lazily, system 3.9 session-start reached 150.9 ms at p95.
 
+### 6.9 Junior/senior presets (FR-13)
+
+Chunk C9 (plan D9; D0 d's D171 and D172; 6.0 e; plan default 7), built as two micro-steps. This section is written for both in C9a, so C9b implements against it.
+
+| Step | Builds | Files |
+|---|---|---|
+| C9a | the config: `[preset] level`, the overlay and its precedence, one shared `RESERVED_SECTIONS` without "preset", `load()`'s unbound `user`; a bad level (a config problem, D171); `nhctl preset` (D172); the doctor's `project.preset`; `tomlread`'s 3.9 reader reads what `tomllib` reads or refuses the file | `_shared/harness_toml.py` (new), `_shared/tomlread.py`, `config.py`, `defaults.toml`, `scripts/nhctl/preset.py` (new), `scripts/nhctl/main.py`, `scripts/nhctl/doctor.py`, `scripts/nhctl/common.py` (`write_keeping_mode`, moved from `settings.py`), `scripts/nhctl/settings.py`, `docs/harness-toml.md`, `docs/troubleshooting.md`, `plugins/nh/README.md` (the root README lists no nhctl commands) |
+| C9b | what the preset changes in Claude's words: the SessionStart depth line, `/nh:status` showing the level, the "from the next session" wording of `nhctl preset` and the docs; the eval `preset-senior` | `hooks/nh_hooks/session_start.py`, `skills/status/SKILL.md`, `scripts/nhctl/preset.py` (its text), `evals/preset-senior/` (new), `tests/hooks/test_hook_session.py`, `tests/unit/test_skill_files.py`, `tests/nhctl/test_cli.py`, `docs/harness-toml.md`, `docs/troubleshooting.md`, `plugins/nh/README.md`; `skills/explain/SKILL.md` stays as it is (below) |
+
+**The levels** (FR-13; plan D9)
+
+| | `junior` (the default) | `senior` |
+|---|---|---|
+| `[lint] comment_ratio`, L105's budget | 8: at most one comment line per 8 code lines (at least 1 per cell) | 16: one per 16 |
+| explanation depth (C9b; the SessionStart context only, never the per-turn reminder) | no line: the skills' own default (plain words; `/nh:explain` defines each pandas method the first time it appears) | one line (C9b, below): short, what changed and what to check, no definitions of common pandas methods |
+| the note (L003, L004) | a title plus 2-5 bullets, hard | the same: the overlay touches no `[markdown]` key |
+| `/nh:init` | doesn't ask; scaffold writes `# level = "junior"` commented out, as every default | — |
+
+- The budget stays advisory (`comment_budget = "hint"`). `[lint] mode = "strict"` makes it an error at the preset's ratio, as today (plan default 7): `lint._level` promotes every hint, and the overlay changes only the ratio `_comment_budget` reads.
+- `defaults.toml` keeps `[lint] comment_ratio = 8` (junior's; `_merge` checks each key's type against it), but no project reads it: the overlay always sets the key. Scaffold copies it into every harness.toml as `# comment_ratio = 8`, so its comment says the preset decides while it stays commented (`unset: the preset's, 8 junior or 16 senior`); uncommented, it pins that ratio over either preset.
+
+**Shared definitions** (`_shared/harness_toml.py`: Python 3.9, stdlib only)
+
+| Name | Holds |
+|---|---|
+| `RESERVED_SECTIONS` | `guardrails`, `secrets`, `libraries`, `comprehension`: top-level sections accepted and ignored. "preset" left it. `config._merge` and `doctor.unknown_keys` import this one definition (each had its own copy) |
+| `PRESET_LEVELS`, `DEFAULT_LEVEL` | `("junior", "senior")`, `"junior"` |
+| `PRESET_OVERLAY` | `{"junior": {"lint": {"comment_ratio": 8}}, "senior": {"lint": {"comment_ratio": 16}}}`; each key in it is a `defaults.toml` key of the same type (tested) |
+| `preset_level(data)` | `(level, valid)` from a parsed harness.toml: no `[preset]` or no `level` gives `("junior", True)`; `"junior"` or `"senior"` gives itself, valid; anything else (another string, `""`, `"Senior"`, a number, a bool, a table, a date, a `preset` that isn't a table) gives `("junior", False)` |
+| `comment_ratio(data)` | `(ratio, set_by)`: an explicit `[lint] comment_ratio` that `config._merge` takes (an int or float, not a bool) and `"harness.toml"`, else the overlay's for `preset_level(data)` and `"preset"`; what `config.load` gives with no `NH_*` (tested), for `nhctl preset`'s report |
+
+- nhctl already imports `nh_gateway._shared` (`main.py` puts `server/src` on `sys.path`), as the hooks do, so one module serves the gateway, nhctl and the hooks.
+- **Hooks.** No hook reads `[lint]` or the preset in C9a, so nothing can disagree. C9b's SessionStart reads the level with the same `preset_level`, over the dict `tomlread` gives the hooks, so a bad level reads as junior in both.
+
+**The 3.9 reader** (`tomlread._mini_loads`: the hooks, nhctl and the doctor where `tomllib` is missing, Python 3.9 and 3.10). C9a shows what it reads to users (the doctor's `project.preset` and D171, `nhctl preset`'s `was` and budget, C9b's depth line), so it reads a file as `tomllib` does or refuses it. Before, it skipped every line it didn't understand: a dotted or quoted key, a quoted or `[[…]]` header (whose keys it then filed under the table before), and it read `'''senior'''` as `''senior''` (review of C9a).
+
+| It reads | It refuses (`ValueError`, naming the line and at most the key, never a value) |
+|---|---|
+| `[a.b]` and `[[a.b]]` headers with bare or quoted parts and spaces around the dots; dotted and quoted keys (`lint.comment_ratio = 4`, `"comment_ratio" = 4`); strings of all four kinds on one line (TOML 1.0's escapes); TOML's integers (decimal, `0x`, `0o`, `0b`, `_` between digits), floats, `inf` and `nan`; booleans; one-line arrays of those | a line that is no header, key line, comment or blank: `Invalid statement (at line N)`; a key or table defined twice, or a key under a value: `Cannot overwrite a value (at line N)`, `Cannot declare a table twice (at line N)`; inline tables, dates and times, multi-line strings and arrays, and any value form TOML doesn't have: `Invalid value for <key> (at line N)` |
+
+- `tomlread.load` still reads a refused file as `{}`: no settings, so every hook and nhctl default, as the gateway reads defaults with its "harness.toml unreadable" problem. The doctor reports D131 "can't be parsed", `nhctl preset` D172.
+- Tested both ways (`tests/unit/test_tomlread.py`): a corpus (the reviews' cases, `test_config.py`'s precedence table, scaffold's harness.toml, `defaults.toml`) and generated documents read the same as `tomllib` or are refused, and a document `tomllib` refuses is refused too. `test_cli.py` runs every `nhctl preset` edit row under it as well.
+
+**Precedence** (`config.load`; 6.0 e)
+
+| Layer | Sets |
+|---|---|
+| 1. `defaults.toml` | every key: `[preset] level = "junior"`, `[lint] comment_ratio = 8` |
+| 2. the preset overlay | `PRESET_OVERLAY[level]`, `level` from `preset_level(user)`: the file is read before the merge |
+| 3. explicit `harness.toml` keys | `_merge`, as before: an explicit `[lint] comment_ratio` wins over the overlay, whatever the level |
+| 4. `NH_*` | `_apply_env`, as before: `NH_HEADLESS=1` turns `approve_before_run` off, `NH_JUPYTER_URL` sets `[jupyter] url`. No `NH_*` variable sets the preset or the ratio |
+
+- `cfg["preset"]["level"]` is the level nh uses: always `junior` or `senior`.
+- **The `load()` trap.** `user` was bound only inside `if project is not None:`. Harmless while `_merge` sat inside that block, but the overlay reads the level for `load(None)` too (lint tests, a gateway with no project), so reading `user` after the block raised `UnboundLocalError`. `user` is now `{}` before the block, and the merge runs after it. A failing test showed it first (`test_load_without_a_project_reads_the_junior_preset`, run against the overlay placed after the block before the fix).
+- **A bad level** reads as junior with one config problem, `preset.level must be junior|senior`, for every value that isn't one of them, non-strings included: `level` is taken out before `_merge`, so `_merge` adds no "must be str" of its own. It shows where config problems already do (`config_lines`): the `--- config ---` lines of `nh_add_cell`, `nh_edit_cell`, `nh_run` and `nh_undo`, and `nh_inspect`'s status, outline and overview (C9b's `/nh:status` reads the doctor). A `preset` that isn't a table gets `_merge`'s "preset must be a table" and reads as junior; another key in `[preset]` is "unknown key preset.<key>", as in any section.
+- The overlay is applied at each reload (`ConfigCache`, on harness.toml's mtime), so a changed level applies at the next tool call, with no `/mcp` reconnect (`tests/gateway/test_preset.py`).
+
+**The doctor** (`scripts/nhctl/doctor.py`, `check_project`)
+- **D171**, a warning (not blocking), from `tomlread.load(harness.toml)`. It never echoes the value (D131's rule: it is the user's text). A file that doesn't parse is D131's, with no D171.
+
+| harness.toml holds | Message | Fix |
+|---|---|---|
+| a bad `[preset] level` | `harness.toml's [preset] level isn't junior or senior, so nh uses junior.` | `Run: nhctl preset junior (or senior), or fix the level line in harness.toml.` |
+| a `preset` that isn't a table (`preset = "senior"`) | `harness.toml's preset isn't a [preset] table, so nh uses junior.` | `Delete the top-level preset line, then run: nhctl preset junior (or senior).` (`nhctl preset` refuses the file until then: D172 below) |
+
+- `project.preset` in the JSON (the level nh reads; junior with no harness.toml) and `preset: <level>` on the text's project line, for C9b's `/nh:status`.
+- D131's unknown keys use the shared `RESERVED_SECTIONS`: `[preset] name = 'x'` is now "unknown key preset.name", and `[guardrails] …` stays ignored.
+
+**`nhctl preset senior|junior [--json]`** (`scripts/nhctl/preset.py`)
+- **Who runs it.** The user, as `! nhctl preset senior` in Claude Code or from a shell, or Claude when asked, through Bash: no skill's `allowed-tools` lists `nhctl preset`, so Claude Code's own Bash permission prompt asks the user first (unless the user's own permission rules or mode allow it). C8's `[guard] harness_toml` ask (6.6) covers Claude's Write and Edit of harness.toml, not this command.
+- It finds the project as every nhctl command does (`common.project_root`: D105 outside one), reads `<project>/harness.toml`, line-edits it, validates the result and writes it atomically.
+
+| harness.toml holds | The edit |
+|---|---|
+| a `[preset]` table with a `level = <value>` line | the value replaced in place; the key, the spacing and a trailing comment kept |
+| `[preset]` with no `level` line but a commented one (`# level = "junior"`, as scaffold writes it) | the first such line in `[preset]` uncommented with the new value; its trailing comment kept. One in another table is left alone |
+| `[preset]` with neither | `level = "<level>"` inserted on the line after the header |
+| no `[preset]` | appended at the end, after a blank line: `[preset]` and `level = "<level>"`; a file without a final newline gets one first |
+| `level = "<level>"` already | nothing written (`changed: false`, the file's inode unchanged) |
+
+- Every other byte stays: comments, blank lines, other keys, their order, line endings (an inserted line takes the file's first line ending, CRLF kept).
+- A commented level is uncommented even when it names the asked level: an explicit `nhctl preset junior` pins junior, so a later change of nh's default doesn't change the project. A second run changes nothing (idempotent).
+- **"Already" and `was`** come from the `level` line the scan found, read on its own with `tomlread`, not from the whole file: a misreading reader can't make nhctl skip a needed edit. No `level` line, or a bad value in it, is `was: "junior"`.
+- **Validation.** The edited text must parse with `tomlread` (`tomllib`, or the 3.9 reader on Python 3.9 and 3.10) to exactly the old data with `preset.level` set; anything else is D172 and nothing is written.
+- **The write.** First nh reads the file again: if it changed since nh read it, D172. Then a harness.toml no one may write (no write bit in its mode: `os.access` is true for root whatever the mode) or that `os.access` says this user can't write is refused (D172): the replace would ignore the file's own mode, and a user may have locked the file on purpose. Then a temp file in the project folder (`.harness.toml.<random>.tmp`) with the old file's mode, fsync, `os.replace` (`common.write_keeping_mode`, which `nhctl settings apply` now uses too). An `OSError` from the write (a read-only folder, a full disk) is D172 too, with the temp file removed and no path in the message.
+- **The form checks** come before the edit, on the lines outside strings and multi-line values (`_line_starts` tracks multi-line strings and brackets, so `[preset]` inside a string or an array isn't a header). The line edit handles only a plain `[preset]` table with at most one plain `level` line, so each other form is named (D172) rather than edited. Keys are split by `tomlread.key_parts`, the 3.9 reader's own, which decodes TOML 1.0's escapes (`\UXXXXXXXX` too); a quoted key it can't decode is "a quoted key nh can't read". The scan also refuses a line that is no header, key line or comment (`Invalid statement`), as both readers do.
+
+**D172** (exit 1; nothing written)
+
+| Case | Message, then fix |
+|---|---|
+| no harness.toml | `harness.toml is missing, so there is no preset to set.`; `Run /nh:init in this folder (it writes harness.toml), then rerun.` |
+| not a regular file | `harness.toml can't be read (not a regular file)` or `(a symbolic link)`, `so nh didn't change it.`; `Make harness.toml a plain file, then rerun.` (a symlink isn't followed: `os.replace` would put a file in its place) |
+| unreadable, not UTF-8 | `harness.toml can't be read (<the OS error> \| it isn't UTF-8), so nh didn't change it.`; `Fix the file, then rerun.` |
+| doesn't parse | `harness.toml can't be parsed (<the parser's error: it names the line, never a value>), so nh didn't change it.`; `Fix the file, then rerun.` |
+| `preset` at the top level (`preset = "senior"`, `preset.level = …`, `preset = {…}`, a quoted `"preset"`) | `harness.toml sets the preset in a form nh can't edit safely (a top-level preset key, not a [preset] table), so nh didn't change it.`; `Delete the top-level preset line(s), then rerun: nhctl preset <level>.` (followed literally, adding a `[preset]` table instead would make the file unparseable) |
+| another form nh doesn't edit: `[preset.x]`, `[[preset]]`, a quoted header, two `[preset]` tables, two `level` lines, a dotted or quoted `level`, a `level` value over several lines, a quoted key nh can't read | `harness.toml sets the preset in a form nh can't edit safely (<which>), so nh didn't change it.`; `Set it by hand: level = "<level>" under [preset].` |
+| the edited text doesn't parse to the old data with the new level | the same, `(the edit didn't check out)` |
+| read-only (no write bit, or not writable by this user) | `harness.toml is read-only, so nh didn't change it.`; `Make it writable (chmod u+w harness.toml), then rerun.` |
+| the write fails | `harness.toml can't be written (<the OS error>), so nh didn't change it.`; `Make harness.toml and its folder writable, then rerun.` |
+| the file changed while nh edited it | `harness.toml changed while nh was editing it, so nh didn't change it.`; `Rerun the command.` |
+
+**Output** (the house style of `nhctl settings apply`)
+
+| Case | `--json` | Text | Exit |
+|---|---|---|---|
+| written | `{"ok": true, "changed": true, "path": "harness.toml", "level": "senior", "was": "junior", "comment_ratio": 16, "comment_ratio_set_by": "preset"}` | `Preset: senior (was junior). harness.toml updated; nh uses it from its next tool call.` and the budget line (C9b rewords the first line: below) | 0 |
+| already set | the same with `"changed": false` | `Preset: senior already; harness.toml unchanged.` and the budget line | 0 |
+| D172, D105 | `{"ok": false, "error": {"code", "message", "fix"}}` | `error: …` and `fix: …` | 1 |
+| bad usage (`nhctl preset expert`) | D100 | argparse's | 2 |
+
+- `was`: the level the `level` line held (above). `comment_ratio` and `comment_ratio_set_by`: `harness_toml.comment_ratio` of the edited file. The budget line: `Comment budget: 1 comment line per 16 code lines.`, or, with `set_by` `harness.toml`, `Comment budget: harness.toml's [lint] comment_ratio = 8 sets it, not the preset.`
+- Everything printed passes the redactor, as every nhctl command's (6.8).
+
+**C9b: what Claude sees** (the plan's "Visibility")
+- **SessionStart** (`session_start.py`). Junior gets no line: it is the depth the skills already default to (`/nh:explain`'s "plain and junior-level, unless nh's session context sets another depth"), so no existing case's context changes (all run junior: `_scaffold/base.sh` sets no `[preset]`) and none is re-run for it. Senior gets this line, exactly:
+  `Preset: senior. Keep explanations short: what changed and what to check in the output; don't define common pandas methods.`
+  - Where: after the `Goal: … Main notebook: ….` line, or after the first line when the project has neither; always before "Before any notebook work, load the skill nh:notebook…".
+  - From `harness_toml.preset_level(settings(layout))`: a bad level reads as junior, as the gateway reads it. Not in the per-turn reminder (`prompt_submit.py` unchanged), so the reminder's order, `RULE` and `QA_REPORT` stay as 6.0 f has them. Perf: one dict lookup on the settings the hook already reads (hook p95 < 150 ms).
+  - SessionStart runs at startup, resume, `/clear` and compaction, so a changed level reaches the depth at the next of those; the comment budget changes at the next tool call.
+- **`nhctl preset`'s wording.** The written case's first line becomes `Preset: senior (was junior). harness.toml updated: the comment budget applies from nh's next tool call, the explanation depth from the next session (or /clear).`; `docs/harness-toml.md`'s "nh uses the new level from its next tool call" and the README's `nhctl preset` row say the same. `test_cli.py` pins the line.
+- **`/nh:status`**: a Preset row (`junior` or `senior`, from the doctor's `project.preset`; D171's message and fix when the level is bad). From then on `docs/harness-toml.md`'s `[preset]` row and troubleshooting's D171 row name `/nh:status` too; in C9a they name `nhctl doctor` and the `--- config ---` line.
+- **`/nh:explain`**: SKILL.md unchanged. Its Depth line defers to the session context, and the senior line says what to drop. **`/nh:init`** doesn't ask.
+- **Eval `preset-senior`** (new; tag `ci`, 3 runs, `max_turns` 12, `allowed_tools: [Read, Glob, Grep, Skill]`, as `note-shape`):
+  - `scaffold.sh`: sources `_scaffold/base.sh`, then appends `[preset]` and `level = "senior"` to its harness.toml.
+  - `prompt.md`: "Add a cell that makes a clean copy of df for analysis: parse order_date as dates (impossible dates become missing), drop the rows with no price, add a revenue column (units times price), then show total revenue and order count per region and per product, each sorted by revenue." A cell of about 16 to 24 code lines, where junior's budget is 2 comment lines and senior's 1.
+  - `mocks/nh/nh_add_cell.md`: fixed, with the shared expect guard (`title`, `intent`, `code`); it answers with that cell's real result on `base.sh`'s data (both tables, the clean frame's shape and nulls, computed as the other mocks' numbers are) and the usual `--- next ---` block.
+
+| Grader | Type | Weight | Passes when |
+|---|---|---|---|
+| `add-called` | `tool_used` | 1 | exactly one `nh_add_cell` |
+| `senior-line` | regex on `trace`, `arm: with-only` | 1 | the SessionStart `hook_response` holds the senior line: `"hook_event":"SessionStart"[^\n]*Preset: senior\. Keep explanations short` (as `slash-explain`'s `skill-registered` reads the init line) |
+| `comment-budget` | regex on `mock_calls`, `not_contains`, both arms | 1 | the add call's `code` has at most one line holding a `#`: `"code":\s*"(?:[^"\\]\|\\.)*#(?:[^"\\]\|\\.)*?\\n(?:[^"\\]\|\\.)*?#`. That is senior's budget for any cell under 32 code lines (`max(1, code // 16)`); junior's allows 2 from 16 lines. A `#` inside a string counts too; the prompt's cell needs none |
+| `terse-reply` | `llm`, last message | 1 | the rubric below |
+
+  - **Weights.** A run scores its passed weight over the total, the case its mean over 3 runs, CI passes at 0.8. With four equal weights, a grader failing in all 3 runs fails the case (0.75), so a missing senior line fails it; one miss in one run passes (0.92).
+  - **Rubric** (`terse-reply`), then the mock's whole output: "PASS if the reply says what the cell does and why in a few sentences, gives real numbers from the output below, and ends with one proposed next cell, without defining what common pandas methods (to_datetime, dropna, groupby, agg, sort_values) do and without walking through the code line by line. FAIL if it explains what a common pandas method does, walks through the code step by step, presents a number the output below doesn't show, or says it wrote or will write a second cell."
+  - **Pins** (`test_skill_files.py`): the case's harness.toml reads senior through `config.load`; the mock's expect guard; the rubric carries the mock's whole output; `senior-line`'s pattern matches the real hook's output for a senior project (`session_start.handle` wrapped as a trace `hook_response` line) and not a junior one's, nor a reply quoting the line; `comment-budget`'s pattern on compact and spaced `mock_calls` lines (one comment line, or one inline comment, passes; two comment lines fail); the equal weights. `test_hook_session.py` pins the senior line byte for byte, its place with and without a goal, and no line for junior, a bad level or no harness.toml.
+  - Done at two consecutive clean rounds of 3 (all 6 runs 1.0), from a clean copy.
+
+**Tests** (C9a)
+- `tests/unit/test_config.py`: the precedence table (defaults; junior and senior; an explicit `[lint] comment_ratio` over each; `NH_HEADLESS` and `NH_JUPYTER_URL` on top with a senior file); `load(None)` (the trap); every bad level reads as junior with its one problem (`"expert"`, `""`, `"Senior"`, `1`, `1.5`, `true`, `[]`, `{}`, a date, a `[preset.level]` table, a non-table `preset`), and `[preset] other = 1` is an unknown key; the overlay's keys and types against `defaults.toml`; `harness_toml.comment_ratio` agrees with `config.load`; one `RESERVED_SECTIONS` (config.py's is the shared object, "preset" not in it).
+- `tests/unit/test_tomlread.py` (new): the 3.9 reader against `tomllib`, as above; its error messages name no value.
+- `tests/unit/test_lint_hints.py`: L105 per preset through `config.load` (16 code lines with 2 comments: none for junior, the hint for senior; 32 with 3: the same); an explicit ratio wins over senior; strict mode makes L105 an error at each preset's ratio; a senior note still needs 2-5 bullets (L004).
+- `tests/gateway/test_preset.py` (new), through the real gateway: a bad level's problem in `nh_add_cell`'s `--- config ---` and in `nh_inspect`'s status; senior's budget hint, gone after the file says junior (the mtime reload) and with an explicit ratio; strict plus senior gives E120 with L105.
+- `tests/nhctl/test_cli.py`: `nhctl preset` on both Pythons: each edit row (scaffold's commented line, junior pinned from it, an active line, a literal or bad value, a header alone, no section, no final newline, an empty file, CRLF, `nan` elsewhere, a commented level in a later table), every other byte kept, idempotent with the inode unchanged, `--json`'s shape, the text, the budget line for an explicit ratio; `[preset]` inside a multi-line string or array (tomllib; D172 on 3.9's reader); the write: a new inode, the file's mode (0o640) kept, no temp file left, and D172 when the file changes between the read and the write (a driver), the other writer's text kept; a driver for the temp file's folder (the project's) and the fsync before the replace, and for a mkstemp or replace failure (D172, no temp file left, no path in the message); a read-only file (0o444, refused even as root); D105; D172 for each case (missing, a folder, a symlink, not UTF-8, unparseable, a broken header, each form), nothing written; the top-level `preset` key's own fix, followed, then working; a `\U` escape in a key; `edit` under the 3.9 reader (`tomlread._tomllib = None`): every edit row, each form refused by the reader or the form checks, "already" and `was` decided from the `level` line (`[[guardrails]]` with its own `level` after `[preset]`); the form checks on their own (two tables, two `level` lines, a multi-line value, a key nh can't read, which both readers refuse first anyway) and the validation catching a scan that put the header on the wrong line (drivers); `--help` and usage.
+- `tests/nhctl/test_doctor.py`: D171 for bad levels (not echoed) and none for junior, senior, no level or an unparseable file; D171's second wording for a non-table `preset`, and its fix followed (then `nhctl preset` works and D171 is gone); `project.preset`; `[preset] name` now an unknown key while `[guardrails]` stays ignored; `doctor.py` imports `RESERVED_SECTIONS` and defines none.
+- `tests/unit/test_skill_files.py`: each §6.0 d D code nhctl uses has its `troubleshooting.md` row; `docs/harness-toml.md`'s `[preset]` row (8, 16, an explicit ratio wins, D171) and its Reserved list without `[preset]`; the README's `nhctl preset` row.
+- `tests/nhctl/test_scaffold.py` unchanged: the commented-defaults check covers the new `[preset]` block and `comment_ratio`'s comment.
+
+**Known gaps**
+- The preset changes one nh check, the comment budget. Explanation depth (C9b) is model-facing text, not enforced.
+- `nhctl preset` refuses valid but unusual forms (D172) rather than editing them; the user sets the level by hand.
+- On Python 3.9 and 3.10, a harness.toml with a form the 3.9 reader refuses (an inline table, a date, a multi-line value) gives the hooks and nhctl no settings, the doctor D131 and `nhctl preset` D172, while the gateway reads it. Refusing beats a wrong level or budget; scaffold writes none of those forms.
+
 ### 6.13 a7, a8 and drift issue filing
 
 Chunk C12 (plan D13), built early as C12-early: a7, a8, the drift.yml issue job and the ci.yml artifact glob. The rest of C12 (README, troubleshooting pass, acceptance) comes later. a7 and a8 each exposed gateway bugs, fixed minimally here: a8 the unsaved room (`backend/rtc.py`, `backend/rtc_backend.py`; while testing it, C12's review found that a normal close of the room connection froze the gateway, from v0.1, fixed in `backend/rtc.py` too), a7 the kernel websocket's pure-Python UTF-8 check (`backend/kernel.py`), the prune that deleted a call's own image originals (`exec/shaping.py`) and, from v0.1, the new kernel connections that are dead from the start (`backend/kernel.py`, and the probe lock in `backend/rtc_backend.py`; its own step after the C12-early commits). a7 also measured V11's 50 MB stream over the 1.5 s budget on this machine, so V11's fallback, the trim, is built here too (`exec/shaping.py`; designed in design.md §6.8 Trim, directly). Tests: `tests/integration/test_large_outputs.py` (new, a7), `tests/integration/test_lab_restart.py` (new, a8), `tests/integration/test_kernel_connections.py` (new), `tests/integration/conftest.py`, `tests/integration/test_rtc_document.py`, `tests/unit/test_rtc_save.py` (new), `tests/unit/test_kernel_utf8.py` (new), `tests/unit/test_kernel_connect.py` (new), `tests/unit/test_shaping.py`. Also `.github/workflows/drift.yml`, `.github/workflows/ci.yml` and `spikes/RESULTS.md`. No new code in §6.0 d, no model-facing text: the trim reuses nh's `[… N chars cut …]` marker.

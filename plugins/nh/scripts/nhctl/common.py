@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -136,6 +137,25 @@ def resolve_notebook(project: Path, value: str | None) -> Path:
         here = Path.cwd() / candidate
         candidate = here if here.exists() else project / candidate
     return candidate.resolve()
+
+
+def write_keeping_mode(path: Path, text: str) -> None:
+    """Atomic replace that keeps an existing file's permissions (0644 for a new one): a temp file
+    in the same folder, written as UTF-8 bytes (line endings as given), fsynced, then renamed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def read_env_json(layout: paths.Layout) -> dict:

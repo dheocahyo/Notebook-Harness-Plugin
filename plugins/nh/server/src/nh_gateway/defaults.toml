@@ -10,6 +10,9 @@ data_source = ""
 notebook = "notebooks/01_eda.ipynb"
 env_manager = ""                # uv | conda (written by nhctl scaffold)
 
+[preset]
+level = "junior"                # junior | senior (senior: 1 comment line per 16 code lines, not 8)
+
 [jupyter]
 url = ""                        # empty = discover; only a loopback URL is accepted here (remote: NH_JUPYTER_URL env)
 kernel_name = ""                # empty = the notebook's kernelspec, else python3
@@ -54,7 +57,7 @@ heading_level = 3
 
 [lint]
 mode = "advise"                 # advise | strict (strict turns every hint into an error)
-comment_ratio = 8               # at most 1 comment per N code lines; 0 = no comments
+comment_ratio = 8               # at most 1 comment line per N code lines; unset: the preset's, 8 junior or 16 senior; 0 = no comments
 max_line_length = 99
 max_cell_lines = 40
 max_nesting = 3

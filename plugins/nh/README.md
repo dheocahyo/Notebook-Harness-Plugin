@@ -132,6 +132,7 @@ and stops at the first error, "check this" finding or nh question.
 | `/nh:qa-cell <ask>` | one agent writes this message's cell, another QA-checks it (automatic under ultracode) |
 | `nhctl lab start`, `status`, `stop` | the project's JupyterLab |
 | `nhctl doctor` | the same checks as `/nh:status`, from a shell |
+| `nhctl preset senior`, `junior` | the project's preset in `harness.toml`: senior allows 1 comment line per 16 code lines, junior (the default) 1 per 8 |
 | `nhctl fresh-run` | run a copy of the notebook top to bottom in a fresh kernel |
 | `nhctl metrics summarize` | cells per message, undos and rejections, from `.nh/log.jsonl` |
 

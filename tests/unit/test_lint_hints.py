@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -627,6 +628,101 @@ def test_l105_ignores_pragmas_and_counts_bare_strings() -> None:
     assert report.comment_lines == 2
     assert report.code_lines == 1
     assert "L105" in {h.rule for h in report.hints}
+
+
+# The comment budget per preset (design §6.9): at most one comment line per `comment_ratio` code
+# lines (at least one per cell): 8 for junior, 16 for senior, an explicit [lint] comment_ratio
+# over either; advisory, and an error in strict mode (plan default 7).
+def preset_config(tmp_path: Path, toml: str) -> Config:
+    (tmp_path / "harness.toml").write_text(f"version = 1\n{toml}")
+    cfg = load(tmp_path)
+    assert cfg.problems == []
+    return cfg
+
+
+def commented_cell(code: int, comments: int) -> str:
+    body = [f"value_{i} = {i}" for i in range(code - 1)] + ["value_0"]
+    notes = [f"# Step {i} keeps the raw values for the check below" for i in range(comments)]
+    return lines(*notes, *body)
+
+
+JUNIOR = '[preset]\nlevel = "junior"\n'
+SENIOR = '[preset]\nlevel = "senior"\n'
+
+
+@pytest.mark.parametrize(
+    ("code", "comments", "junior", "senior"),
+    [
+        (8, 1, None, None),
+        (8, 2, "(budget 1)", "(budget 1)"),
+        (15, 1, None, None),
+        (16, 2, None, "(budget 1)"),
+        (16, 3, "(budget 2)", "(budget 1)"),
+        (32, 2, None, None),
+        (32, 3, None, "(budget 2)"),
+        (32, 4, None, "(budget 2)"),
+        (32, 5, "(budget 4)", "(budget 2)"),
+    ],
+)
+def test_l105_budget_per_preset(
+    tmp_path: Path, code: int, comments: int, junior: str | None, senior: str | None
+) -> None:
+    """Junior: 1 comment line per 8 code lines; senior: 1 per 16 (design §6.9)."""
+    cell = commented_cell(code, comments)
+    report = lint(cell)
+    assert (report.code_lines, report.comment_lines) == (code, comments)
+    for toml, budget in ((JUNIOR, junior), (SENIOR, senior), ("", junior)):
+        found = hints(cell, cfg=preset_config(tmp_path, toml)).get("L105")
+        if budget is None:
+            assert found is None, (toml, found)
+        else:
+            assert (
+                found == f"The cell has {comments} comment lines for {code} lines of code {budget}."
+            )
+
+
+@pytest.mark.parametrize("toml", [JUNIOR, SENIOR])
+def test_l105_an_explicit_comment_ratio_wins_over_the_preset(tmp_path: Path, toml: str) -> None:
+    cell = commented_cell(16, 2)
+    assert "L105" not in hints(
+        cell, cfg=preset_config(tmp_path, toml + "[lint]\ncomment_ratio = 8\n")
+    )
+    found = hints(cell, cfg=preset_config(tmp_path, toml + "[lint]\ncomment_ratio = 16\n"))
+    assert found["L105"].endswith("(budget 1).")
+    none = hints(cell, cfg=preset_config(tmp_path, toml + "[lint]\ncomment_ratio = 0\n"))
+    assert "asks for none" in none["L105"]
+
+
+@pytest.mark.parametrize(
+    ("preset", "ratio", "code", "comments", "rejected"),
+    [
+        (JUNIOR, "", 16, 2, False),
+        (JUNIOR, "", 8, 2, True),
+        (SENIOR, "", 16, 2, True),
+        (SENIOR, "", 32, 2, False),
+        (SENIOR, "comment_ratio = 8\n", 16, 2, False),
+    ],
+)
+def test_strict_mode_makes_the_presets_budget_hard(
+    tmp_path: Path, preset: str, ratio: str, code: int, comments: int, rejected: bool
+) -> None:
+    """Plan default 7: strict mode makes the comment budget hard, as before presets, now at the
+    preset's ratio (or an explicit one)."""
+    strict = preset + '[lint]\nmode = "strict"\n' + ratio
+    report = lint(commented_cell(code, comments), cfg=preset_config(tmp_path, strict))
+    assert ("L105" in {e.rule for e in report.errors}) is rejected
+    assert "L105" not in {h.rule for h in report.hints}
+    assert report.ok is not rejected
+
+
+@pytest.mark.parametrize("toml", [JUNIOR, SENIOR])
+def test_the_note_stays_two_to_five_bullets_in_both_presets(tmp_path: Path, toml: str) -> None:
+    cfg = preset_config(tmp_path, toml)
+    six = [f"Bullet {i} says what the cell shows." for i in range(6)]
+    for notes in (six, six[:1]):
+        report = lint("medians = sales.median()\nmedians", cfg=cfg, notes=notes)
+        assert "L004" in {e.rule for e in report.errors}, notes
+    assert lint("medians = sales.median()\nmedians", cfg=cfg, notes=six[:5]).ok
 
 
 def test_l106_ignores_prose_with_code_punctuation() -> None:

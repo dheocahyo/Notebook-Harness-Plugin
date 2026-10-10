@@ -82,6 +82,15 @@ Find the code below.
 | nbstripout renumbers cell ids | nbstripout without `--keep-id` | reinstall its filter with `nbstripout --install --keep-id`; nh also matches cells by its own metadata |
 | **E199** internal error | a bug in nh; nothing more was written | see `.nh/logs/gateway.log`; please report it |
 
+## Settings
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| **D171** "harness.toml's [preset] level isn't junior or senior" (`nhctl doctor`) | `harness.toml`'s `[preset] level` is another word, empty, or not a string (`level = "Senior"`, `level = 1`), so nh uses junior; every result's `--- config ---` says `preset.level must be junior\|senior` | `nhctl preset senior` (or `junior`), or fix the line by hand: `level = "senior"` under `[preset]` |
+| **D171** "harness.toml's preset isn't a [preset] table" (`nhctl doctor`) | a top-level line such as `preset = "senior"`, so nh uses junior; every result's `--- config ---` says `preset must be a table` | delete that line, then run `nhctl preset senior` (or `junior`) |
+| **D172** `nhctl preset` didn't change harness.toml | `harness.toml` is missing, isn't a plain UTF-8 file (a folder, a symlink), is read-only, doesn't parse, can't be written (a read-only folder, a full disk), changed while nh edited it, or sets the preset in a form nh doesn't edit (`[preset.x]`, a second `level` line, a quoted `"level"`); nothing was written | missing: run `/nh:init`. Read-only: `chmod u+w harness.toml`. A top-level `preset = …` or `preset.level = …` line: delete it and rerun. Otherwise fix the file, or set the level by hand: `level = "senior"` under `[preset]` |
+| After `nhctl preset senior` the comment hints didn't change | `harness.toml` sets `[lint] comment_ratio` itself, which wins over the preset (`nhctl preset` says so) | delete or comment out that line to let the preset decide |
+
 ## Logs and state
 
 | File | Holds |

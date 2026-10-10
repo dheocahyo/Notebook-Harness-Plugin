@@ -9,9 +9,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
-import os
-import tempfile
-from pathlib import Path
 
 import common
 from common import NhctlError, Result
@@ -93,21 +90,6 @@ def cmd_apply(args: argparse.Namespace) -> Result:
         data["diff"] = diff
         text = f"{diff.rstrip()}\n\nNothing written. Rerun with --yes to apply."
         return Result(data, text, 2)
-    write_keeping_mode(path, new_text)
+    common.write_keeping_mode(path, new_text)
     data = {"ok": True, "changed": True, "path": shown, "diff": diff, "deny": list(DENY_RULES)}
     return Result(data, f"Updated {shown}:\n{diff.rstrip()}")
-
-
-def write_keeping_mode(path: Path, text: str) -> None:
-    """Atomic replace that keeps an existing file's permissions (0644 for a new one)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
-    fd, tmp = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        os.unlink(tmp)
-        raise

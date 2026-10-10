@@ -9,16 +9,16 @@ it. A commented key keeps following nh's built-in default, including when a
 later nh version changes that default.
 
 - **Every key is optional.** A missing key uses the built-in default below.
-- **Precedence:** built-in defaults < `harness.toml` < `NH_*` environment
-  variables.
+- **Precedence:** built-in defaults < the preset's settings (`[preset] level`,
+  below) < keys set in `harness.toml` < `NH_*` environment variables.
 - **Reloads:** nh re-reads the file whenever it changes, before the next tool
   call. Only `[approval]` needs a restart of the MCP server: in Claude Code, run
   `/mcp`, pick `plugin:nh:nh` and choose Reconnect.
 - **Mistakes:** an unknown key, a key in the wrong section or a value of the
   wrong type is ignored, and every nh result shows it under `--- config ---`
   until it is fixed.
-- **Reserved:** the sections `[preset]`, `[guardrails]`, `[secrets]`,
-  `[libraries]` and `[comprehension]` are accepted and ignored in v0.1.
+- **Reserved:** the sections `[guardrails]`, `[secrets]`, `[libraries]` and
+  `[comprehension]` are accepted and ignored.
 - The agent changes this file only when you ask it to.
 
 ```toml
@@ -50,6 +50,35 @@ What the project is. `/nh:init` fills these in.
 | `data_source` | `""` | Where the data lives: a project-relative path, an absolute path, or a URL without credentials (a credentialed URL is kept in `.env` as `DATA_URL`). |
 | `notebook` | `"notebooks/01_eda.ipynb"` | The notebook nh works in by default, relative to the project root. The agent can switch notebooks within a session. |
 | `env_manager` | `""` | `uv` or `conda`; written by `/nh:init`. |
+
+## `[preset]`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `level` | `"junior"` | `junior` or `senior`. The preset sets `[lint] comment_ratio` (L105): 8 for junior, 16 for senior, so a senior project gets at most one comment line per 16 code lines. A `comment_ratio` you set under `[lint]` wins over the preset at either level. Any other value (another word, `""`, a number), or a `preset` that isn't a `[preset]` table, reads as `junior`, shows under `--- config ---` in every nh result, and `nhctl doctor` reports D171. |
+
+`/nh:init` doesn't ask; the level starts as junior. To change it, run
+`nhctl preset senior` (or `junior`) in the project: from a shell, as
+`! nhctl preset senior` in Claude Code, or by asking the agent, which runs it
+through Bash (Claude Code asks you first, unless your permission settings
+already allow the command). nh uses the new level from its next tool call.
+
+- **What it edits:** only the `level` line under `[preset]`: it replaces the
+  value of an existing `level = …` (keeping its comment), else uncomments the
+  `# level = "junior"` line `/nh:init` wrote, else adds `level = …` under the
+  `[preset]` header, else appends a `[preset]` section at the end of the file.
+  Comments, blank lines, line endings and every other key stay exactly as they
+  were. Running it again changes nothing.
+- **When it won't (D172):** `harness.toml` is missing, read-only (no write
+  permission) or can't be parsed or written, or sets the preset in another
+  form (`[preset.x]`, a second `level` line, a quoted `"level"`). Set the
+  level by hand then: `level = "senior"` under `[preset]`. A top-level
+  `preset = …` or `preset.level = …` line is the exception: delete it, then
+  rerun `nhctl preset` (a `[preset]` table added beside it would make the file
+  unparseable).
+- `--json` prints `{"ok", "changed", "path", "level", "was", "comment_ratio",
+  "comment_ratio_set_by"}`; `comment_ratio_set_by` is `"harness.toml"` when
+  your own `[lint] comment_ratio` sets the budget instead of the preset.
 
 ## `[jupyter]`
 
@@ -140,7 +169,7 @@ reject the cell; hints arrive with the result, after the run.
 | Key | Default | Meaning |
 |---|---|---|
 | `mode` | `"advise"` | `advise`: hints are advisory. `strict`: every hint is enforced as a hard rule; a rule at `"ask"` still asks. |
-| `comment_ratio` | `8` | At most one comment per this many code lines (L105). `0` means no comments. |
+| `comment_ratio` | `8` | At most one comment line per this many code lines (L105), and at least one per cell. `0` means no comments. Unset (the line `/nh:init` writes is commented out), the preset decides: 8 for `junior`, 16 for `senior`. A value here wins over either, so uncommenting `# comment_ratio = 8` pins 8 in a senior project too. Advisory; `mode = "strict"` makes it a hard rule at whichever ratio applies. |
 | `max_line_length` | `99` | Longest line, in characters (L101). |
 | `max_cell_lines` | `40` | Longest cell, in lines (L102). |
 | `max_nesting` | `3` | Deepest nesting of blocks (L103). |

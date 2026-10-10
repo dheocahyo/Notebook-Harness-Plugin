@@ -4779,6 +4779,50 @@ def test_every_new_v02_code_in_the_gateway_is_documented():
         assert f"| **{rule}** " in troubleshooting, rule
 
 
+def test_every_new_v02_code_in_nhctl_has_its_troubleshooting_row():
+    """Design §6.0 d: each new D code nhctl gives gets its troubleshooting.md row (C9a: D171 and
+    D172; C10 and C11 add theirs)."""
+    design = _read(REPO / "docs" / "design.md")
+    table = design.split("**d. New codes**", 1)[1].split("**e. Config**", 1)[0]
+    new_codes = re.findall(r"^\| (D\d{3}) \|", table, flags=re.MULTILINE)
+    assert {"D171", "D172"} <= set(new_codes)
+    nhctl = "\n".join(_read(path) for path in sorted((PLUGIN / "scripts" / "nhctl").glob("*.py")))
+    used = [code for code in new_codes if f'"{code}"' in nhctl]
+    assert {"D171", "D172"} <= set(used)
+    troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
+    for code in used:
+        assert f"| **{code}** " in troubleshooting, code
+
+
+def test_the_preset_is_documented():
+    """Design §6.9: harness-toml.md's [preset] row and Reserved list, troubleshooting's D171 and
+    D172 rows and the README's nhctl preset row say what C9a built."""
+    harness = _read(REPO / "docs" / "harness-toml.md")
+    row = next(line for line in harness.splitlines() if line.startswith("| `level` |"))
+    for phrase in (
+        '`"junior"`',
+        "8 for junior, 16 for senior",
+        "A `comment_ratio` you set under `[lint]` wins over the preset at either level.",
+        "`nhctl doctor` reports D171",
+        "`--- config ---`",
+    ):
+        assert phrase in row, phrase
+    reserved = next(line for line in harness.split("\n- ") if line.startswith("**Reserved:**"))
+    assert "`[guardrails]`" in reserved and "[preset]" not in reserved
+    ratio = next(line for line in harness.splitlines() if line.startswith("| `comment_ratio` |"))
+    assert "8 for `junior`, 16 for `senior`" in ratio and "pins 8" in ratio
+    assert '`mode = "strict"` makes it a hard rule' in ratio
+    troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
+    assert "harness.toml's [preset] level isn't junior or senior" in troubleshooting
+    assert "harness.toml's preset isn't a [preset] table" in troubleshooting
+    assert "read-only" in troubleshooting.split("| **D172** ", 1)[1].split("\n", 1)[0]
+    readme = _read(PLUGIN / "README.md")
+    assert (
+        "| `nhctl preset senior`, `junior` | the project's preset in `harness.toml`: senior "
+        "allows 1 comment line per 16 code lines, junior (the default) 1 per 8 |"
+    ) in readme
+
+
 def test_the_ask_flow_is_documented_where_the_model_reads_it():
     """Design §6.4: E122's flow in the skill (one pointer line), asks.md, errors.md, tools.md
     and the docs, worded as the gateway's own texts."""
