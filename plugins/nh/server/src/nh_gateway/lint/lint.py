@@ -287,6 +287,12 @@ class _Cell:
         return self.lines[node.lineno - 1]
 
 
+def kernel_provides(name: str) -> bool:
+    """A name the kernel has without any cell defining it: a builtin or one of IPython's (L120,
+    and /nh:review's hidden-state check, design §6.10)."""
+    return name in _BUILTINS or bool(_IPYTHON_NAME.fullmatch(name))
+
+
 def lint_cell(
     code: str,
     *,
@@ -1538,8 +1544,7 @@ def _kernel_only_name(cell: _Cell) -> Finding | None:
     above, flow = cell.names_above, cell.flow
     if above is None or EVERYTHING in above or not flow.parsed or flow.open:
         return None
-    candidates = flow.uses - above - flow.bound - _BUILTINS
-    missing = sorted(n for n in candidates if not _IPYTHON_NAME.fullmatch(n))
+    missing = sorted(n for n in flow.uses - above - flow.bound if not kernel_provides(n))
     if not missing:
         return None
     one = len(missing) == 1

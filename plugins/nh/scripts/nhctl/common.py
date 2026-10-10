@@ -185,6 +185,23 @@ def runtime_venv(data: Path) -> Path | None:
     return data / f"venv-{digest}"
 
 
+def runtime_python(data: Path, needed_for: str) -> Path:
+    """The ready runtime venv's Python, as libexec/nh-mcp's ``ready()`` checks it: the venv's
+    ``.nh-ready`` marker and an executable ``bin/python``. A located data dir whose venv isn't
+    ready is D120 (spike V8; D121 stays "can't locate the data dir")."""
+    venv = runtime_venv(data)
+    python = venv / "bin" / "python" if venv is not None else None
+    if python is None or not (python.parent.parent / ".nh-ready").is_file():
+        python = None
+    if python is None or not os.access(str(python), os.X_OK):
+        raise NhctlError(
+            "D120",
+            f"nh's own Python runtime isn't installed yet, so {needed_for}.",
+            'Run: nhctl runtime sync --plugin-data "${CLAUDE_PLUGIN_DATA}", then rerun.',
+        )
+    return python
+
+
 # ---------------------------------------------------------------------- processes
 
 

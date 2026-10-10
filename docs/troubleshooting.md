@@ -12,6 +12,8 @@ Find the code below.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `/nh:init` doesn't exist | the plugin isn't installed or enabled | `/plugin` → check `nh@notebook-harness` is enabled; restart Claude Code |
+| **D120** "nh's own Python runtime isn't installed yet" (`nhctl doctor`, `/nh:status`, `nhctl fresh-run --review`) | nh's runtime (a Python environment nh builds with uv the first time it starts) isn't ready: the first install is still running, or it failed. A review needs it for its analysis, and stops before running anything | `nhctl runtime sync --plugin-data "${CLAUDE_PLUGIN_DATA}"` (`nhctl runtime status` shows progress), then `/mcp` → `plugin:nh:nh` → Reconnect, or rerun the review |
+| **D121** "Can't tell where nh's plugin data lives" (`nhctl runtime`, `nhctl fresh-run --review`) | nhctl wasn't given the plugin data folder: no `--plugin-data`, no `CLAUDE_PLUGIN_DATA`, and the plugin isn't loaded from the plugin cache (`--plugin-dir`) | pass `--plugin-data "${CLAUDE_PLUGIN_DATA}"` (the skills do) |
 | nh's tools are missing, or `/mcp` shows `plugin:nh:nh` failed | the first start after installing builds nh's Python runtime (about a minute), or the server stopped | wait, then `/mcp` → `plugin:nh:nh` → Reconnect. `nhctl runtime status` shows progress. Claude Code never restarts a crashed MCP server by itself |
 | **E137** Windows | nh v0.1 runs on macOS and Linux | run Claude Code and JupyterLab inside WSL |
 | **E106** no prompt ids | Claude Code older than 2.1.196 | `claude update` (nh needs 2.1.282 or newer) |
@@ -81,6 +83,17 @@ Find the code below.
 | Another Jupyter MCP tool was blocked | nh blocks other servers' cell-changing tools in nh projects | disable that server (for example Datalayer's `datalayer` plugin) in this project, or set `[guard] foreign_mcp` |
 | nbstripout renumbers cell ids | nbstripout without `--keep-id` | reinstall its filter with `nbstripout --install --keep-id`; nh also matches cells by its own metadata |
 | **E199** internal error | a bug in nh; nothing more was written | see `.nh/logs/gateway.log`; please report it |
+
+## Fresh runs and reviews
+
+`nhctl fresh-run` runs a copy of the notebook in a separate kernel; `--review` (what `/nh:review` runs) keeps going past errors and writes its report to `.nh/reviews/`. Neither touches your kernel or the notebook file, and neither gives the kernel your Jupyter token.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| **D153** "The review stopped after Ns while … was running" (`nhctl fresh-run --review`, `/nh:review`) | the whole review took longer than its deadline (`/nh:review` gives it 540 s): a notebook slower than that, or a cell that kept running past its own limit (a third of the deadline) because it ignores the interrupt (a loop that catches `KeyboardInterrupt`, a long call into a C library). nh stopped the review's kernel and the processes its cells started; the report covers the cells before that one and lists the rest as not run. "before any cell ran" means the deadline came while the review's kernel was still starting | check that cell; from a shell, rerun with a larger deadline: `nhctl fresh-run --review --timeout 1800` |
+| A review lists a cell as failing with `KeyboardInterrupt`: "stopped by the review's N s limit per cell" | the cell ran longer than the review's limit for one cell (a third of its deadline: 180 s for `/nh:review`; it waits forever, or it is slow), so nh interrupted it and went on with the cells below | if it waits for something (a server, a read from `sys.stdin`), keep that out of the notebook; if it is just slow, from a shell: `nhctl fresh-run --review --timeout 1800 --cell-timeout 1200` |
+| **D154** "N cell(s) would do more than compute in the review's kernel" (`nhctl fresh-run --review`) | the review runs every cell again, and nh's lint says these would install packages (L009), reach the network (L012), write outside the project (L013), show an env var (L011) or show a value named like a secret (L014) there, or nh can't parse them (syntax newer than nh's own Python, or a syntax error), so it can't tell what they do. So it asked first, and ran nothing. "changed since that yes": the cells it asks about changed after you answered | `/nh:review` asks you: yes runs them too (`--yes <digest>`, the digest its message gives, which names exactly those cells: if they change before the run, it asks again), no runs the rest and reports them as not run (`--skip-flagged`). A rule set to `off` under `[lint.rules]` isn't asked about |
+| A review lists "Cells that fail only in a fresh kernel" or "Names read before any cell above defines them" | the notebook only worked because of something the live kernel had: a cell run out of order, a name from a deleted cell, or a value typed into the kernel directly | define the name in the cell that needs it or one above it, then `/nh:review` again |
 
 ## Settings
 

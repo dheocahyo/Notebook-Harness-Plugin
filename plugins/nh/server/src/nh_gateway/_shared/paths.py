@@ -61,6 +61,7 @@ class Layout:
         self.outputs = self.nh / "outputs"
         self.logs = self.nh / "logs"
         self.tmp = self.nh / "tmp"
+        self.reviews = self.nh / "reviews"  # /nh:review's reports (design §6.10)
         self.log_file = self.nh / "log.jsonl"
         self.harness_toml = project / HARNESS_TOML
         self.last_cell = self.state / "last_cell.json"

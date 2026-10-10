@@ -5097,9 +5097,48 @@ def test_every_new_v02_code_in_nhctl_has_its_troubleshooting_row():
     nhctl = "\n".join(_read(path) for path in sorted((PLUGIN / "scripts" / "nhctl").glob("*.py")))
     used = [code for code in new_codes if f'"{code}"' in nhctl]
     assert {"D171", "D172"} <= set(used)
+    assert {"D153", "D154"} <= set(used)  # C10a
     troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
     for code in used:
         assert f"| **{code}** " in troubleshooting, code
+
+
+def test_the_review_command_is_documented():
+    """Design §6.10 (C10a): troubleshooting's D120 and D121 rows name `nhctl fresh-run --review`,
+    its "Fresh runs and reviews" section holds D153, D154 and the hidden-state row (whose quoted
+    headings are the report's), and the plugin README's nhctl table has the --review row."""
+    troubleshooting = _read(REPO / "docs" / "troubleshooting.md")
+    rows = troubleshooting.splitlines()
+    for code in ("D120", "D121"):
+        row = next(r for r in rows if r.startswith(f"| **{code}** "))
+        assert "`nhctl fresh-run --review`" in row, code
+    section = troubleshooting.split("\n## Fresh runs and reviews\n", 1)[1].split("\n## ", 1)[0]
+    assert "neither gives the kernel your Jupyter token" in section
+    for code in ("D153", "D154"):
+        assert f"| **{code}** " in section, code
+    d154 = next(r for r in rows if r.startswith("| **D154** "))
+    for phrase in (
+        "(L009)", "(L012)", "(L013)", "(L011)", "(L014)", "nh can't parse them",
+        "`--yes <digest>`", "`--skip-flagged`", "changed since that yes",
+    ):  # fmt: skip
+        assert phrase in d154, phrase
+    d153 = next(r for r in rows if r.startswith("| **D153** "))
+    assert "input()" not in d153  # it fails at once in a review: nbclient allows no stdin
+    assert "stopped by the review's N s limit per cell" in section
+    review = _read(PLUGIN / "server" / "src" / "nh_gateway" / "review.py")
+    for heading in ("Cells that fail only in a fresh kernel", "Names read before any cell above "
+                    "defines them"):  # fmt: skip
+        assert f'"{heading}' in section and f'"{heading}:"' in review, heading
+    readme = _read(PLUGIN / "README.md")
+    row = next(r for r in readme.splitlines() if r.startswith("| `nhctl fresh-run --review` |"))
+    for phrase in (
+        "`/nh:review`'s run",
+        "in `.nh/reviews/`",
+        "(exit 2) until you pass `--yes <digest>` (run them; the digest names the cells it "
+        "listed) or `--skip-flagged` (skip them)",
+        "your kernel and the notebook file are never touched",
+    ):
+        assert phrase in row, phrase
 
 
 def test_the_preset_is_documented():

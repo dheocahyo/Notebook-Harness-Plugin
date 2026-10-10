@@ -2359,6 +2359,220 @@ Chunk C9 (plan D9; D0 d's D171 and D172; 6.0 e; plan default 7), built as two mi
 - `nhctl preset` refuses valid but unusual forms (D172) rather than editing them; the user sets the level by hand.
 - On Python 3.9 and 3.10, a harness.toml with a form the 3.9 reader refuses (an inline table, a date, a multi-line value) gives the hooks and nhctl no settings, the doctor D131 and `nhctl preset` D172, while the gateway reads it. Refusing beats a wrong level or budget; scaffold writes none of those forms.
 
+### 6.10 /nh:review (FR-11)
+
+Chunk C10 (plan D10; D0 d's D153 and D154; spikes V7 and V8), built as two micro-steps. This section is written for both in C10a, so C10b implements against it. The review runs a copy of the notebook in a separate kernel and keeps going past errors; the live kernel and the notebook file are never touched (user decision for FR-11, 2026-09-28).
+
+| Step | Builds | Files |
+|---|---|---|
+| C10a | `nhctl fresh-run --review`: the copy and its rotation, the per-cell MARKER runner (V7) on its own pipe, the deadline's kills and partial report (D153), the flagged-cell check (D154) and its digest-bound yes, the token drop on every fresh-run path; the analysis `python -m nh_gateway.review` in the runtime venv (V8; "runtime not ready" is D120); the report file and JSON | `scripts/nhctl/freshrun.py`, `scripts/nhctl/common.py` (`runtime_python`), `review.py` (new), `dataflow.py` (`Flow.now`, `Flow.later`, `NAMESPACE_CELL_MAGICS`), `lint/lint.py` (`kernel_provides`), `_shared/paths.py` (`Layout.reviews`), `docs/troubleshooting.md`, `plugins/nh/README.md`, `tests/nhctl/test_freshrun.py`, `tests/unit/test_review.py` (new), `tests/unit/test_dataflow.py` (`now`, `later`), `tests/integration/test_review_timeout.py` (new), `tests/unit/test_skill_files.py` (the troubleshooting and README pins) |
+| C10b | the skill `skills/review`, the skill-set pins (six skills), both READMEs' `/nh:review` rows, the eval `review-report` | `skills/review/SKILL.md` (new), `README.md`, `plugins/nh/README.md`, `evals/review-report/` (new), `tests/unit/test_skill_files.py`, `.gitignore` if the case keeps results, `docs/troubleshooting.md` (a "/nh:review" row) |
+
+**What a review reports** (FR-11; plan D10)
+
+| Finding | From | Rule |
+|---|---|---|
+| failing cells | the copy's run (MARKER lines) | every code cell whose run ended in an error: its label, `ename` and `evalue` (redacted, 500 chars) |
+| hidden state: names read before any earlier definition | `dataflow` over the cells' sources, in notebook order | two kinds of read (`Flow`, below). A cell's `now` reads (when the cell runs) minus every name bound by the code cells above it, builtins and IPython's names (`lint.kernel_provides`): `df = df.dropna()` reads `df` before it binds it, so it counts. Its `later` reads (function, lambda and method bodies: read when called) count only when no code cell in the notebook binds them, so a helper written above the cell that defines its global isn't hidden state. A cell is skipped when it doesn't parse, may bind names nh can't see (`open`: star import, `%run`, `exec`), or a cell above may (`*`); `later` reads are skipped when any cell may. Each name says where it is defined: in a later cell (its label: the notebook only ran because that cell ran first), or in no cell (only the kernel had it) |
+| hidden state: out-of-order execution counts | the copy's stored `execution_count`s (the live notebook's) | a code cell whose count is lower than a count above it: "ran before" the cell above with the highest count (`after`). Else one whose count equals a count above it: `same_as` that cell (one kernel session never gives a count twice, so their outputs come from different sessions). Cells never run (no count) are skipped |
+| hidden state: fails only in a fresh kernel | the run and the copy's stored outputs | a cell whose fresh run ended in `NameError`, `UnboundLocalError` or `KeyError` while the notebook shows it ran (a count) with no error output. Marked `after_not_run` when a cell above didn't run (skipped or stopped), and `after_error` when a cell above failed in the review: either may be the cell that defines the name |
+| `src/` candidates | the cells' sources and `[lint] max_cell_lines` (40) | code cells with more non-blank lines than `max_cell_lines`, as L102 counts them |
+| intent summary | `metadata.nh` (titles from the paired note, `intent`) | code cells grouped under the markdown heading above them (the headings of a markdown cell that isn't an nh note: ATX `#`..`######` lines and setext ones, a paragraph over a `===` or `---` line, outside fenced code, where a fence closes only with its own character, at least as many; a cell's last heading is the current one), one line each: the label and the intent (none for a cell nh didn't write). Cells above the first heading have no heading. Headings with no code cell under them are left out |
+
+- **`Flow.now` and `Flow.later`** (`dataflow.py`; L120 and stale marking still read `uses`, unchanged: a method's or a comprehension lambda's free names go to `later` only, so `uses` is what it was before C10a, as `test_dataflow.py` pins). `now`: the names the cell reads when it runs (module level, class bodies, decorators, default values, comprehensions) before any binding of them earlier in the cell, a branch's included (`for …: total = i` then `total` isn't one). `later`: the free names of the cell's function, lambda and method bodies.
+
+- A label is `render.cell_label`: the note's title (`"Drop rows with missing price" [7]`, the live count) or the cell's first code line (``the cell `df = load()` [3]``), redacted before its cut. Cells are also given by `index`, their position in the notebook (markdown cells counted), as plain fresh-run's `failing.index`; never an `nh-` id.
+- "Code cell" means a code cell with some source: the runner skips empty ones, as nbclient does, and so does every count.
+
+**`nhctl fresh-run --review <nb>`** (`scripts/nhctl/freshrun.py`; Python 3.9, stdlib)
+
+| Option | Default | Effect |
+|---|---|---|
+| `--review` | off | the review below; without it, fresh-run is as before (plus the token drop and the new `_run_isolated`) |
+| `--timeout S` | 1800 | the whole run's deadline, a finite number of seconds above 0 (`nan`, `inf`, 0 or less: D100, exit 2; both modes); the skill passes 540 (its Bash timeout is 600 s) |
+| `--cell-timeout N` | 600; with `--review`, a third of `--timeout`, kept within 30..600 (the skill's 540 gives 180) | each cell's, a whole number above 0 (else D100). With `interrupt_on_timeout=True` an over-long cell is interrupted and the run goes on (V7): it fails with `KeyboardInterrupt`, its `evalue` "stopped by the review's N s limit per cell". The review's default sits below its deadline so one hanging cell doesn't end the whole review; a cell that ignores the interrupt still runs into the deadline (D153) |
+| `--plugin-data DIR` | `$CLAUDE_PLUGIN_DATA`, else derived from the plugin cache | where the runtime venv is (the common option) |
+| `--yes DIGEST` | off | run the flagged cells too, if they are still the cells D154 listed with that `digest` (their indexes, rules and code); otherwise D154 again, with the cells now flagged and their new digest |
+| `--skip-flagged` | off | run the rest; the flagged cells are `not_run` (reason `flagged`). `--yes` and `--skip-flagged` together, or either without `--review`, is a usage error (D100, exit 2) |
+| `--json` | off | one JSON object (below) |
+
+The steps, in order (nothing runs before step 6):
+
+| Step | Does | Fails with |
+|---|---|---|
+| 1 | the project and the notebook, as plain fresh-run | D105, D150 |
+| 2 | the project env (`env.json`'s prefix) | D140 |
+| 3 | the runtime (V8): `common.plugin_data_dir` then `common.runtime_python(data)`: `venv-<sha(uv.lock)[:12]>/bin/python` when the venv's `.nh-ready` marker exists and the python is executable, as nh-mcp's `ready()` | D121 when the data dir can't be located (no `--plugin-data`, no `CLAUDE_PLUGIN_DATA`, not in the plugin cache); D120 when it is located but the venv isn't ready (no uv.lock, no venv, no marker) |
+| 4 | the copy: `shutil.copyfile` of the notebook to `.nh/tmp/review-<ts>-<pid>.ipynb`, then the rotation: the 3 newest `review-*.ipynb` stay (`KEEP_REVIEW_COPIES`), older ones are deleted (plain fresh-run keeps its 5 `fresh-*` copies, as before). Every later step reads the copy: the notebook itself is read only by step 1's check that it is a notebook and by this copy (a save in between is what gets reviewed) | — |
+| 5 | the flagged-cell check: the analysis's `flag` (below) on the copy | D154 (exit 2) unless `--yes` with the flagged cells' current digest, or `--skip-flagged`; the copy is deleted and nothing runs |
+| 6 | the run: the review runner (below) under `_run_isolated`, with the deadline | D151 when the run ended before the deadline without a `cell` line for every code cell of the copy (the runner broke: no nbclient, a kernel that never started; its other output's last 15 lines in `output_tail`), whatever its `done` line says; D153 when the deadline came before every code cell had its `cell` line (a partial report, below). A deadline after the last `cell` line, while the kernel shuts down, still gives a complete review (exit 0) |
+| 7 | the analysis's `report` over the copy and the run | D199 if the analysis process fails (exit ≠ 0 or no JSON: its stderr's last 15 lines, scrubbed, in `output_tail`) |
+| 8 | the report file `.nh/reviews/<ts>-<stem>.md` (`Layout.reviews`; `<ts>` is `common.now_stamp()`, `<stem>` the notebook's), written through `common.scrub` (`common.write_keeping_mode`: a new file is 0644); a `review` event in `.nh/log.jsonl` (counts only: `nb`, `ok`, `complete`, `failing`, `not_run`, `hidden_state`, `n_cells`, `ms`, `via: "nbclient"`) | — |
+
+- **The token drop** (every fresh-run path: plain and review runners). The runner's env is `common.env_with(prefix, drop=lab.TOKEN_VARS + ("NH_JUPYTER_TOKEN",), JUPYTER_PREFER_ENV_PATH="1")`, so the kernel, which runs the notebook's code, never sees `JUPYTER_TOKEN`, `JUPYTER_TOKEN_FILE` or `NH_JUPYTER_TOKEN` (C3 had done none of it: fresh-run passed the full `os.environ`). The analysis process keeps them: it runs nh's code, not the notebook's, and its Redactor needs their values to redact them (6.8).
+- **A private runtime dir.** The runner's `JUPYTER_RUNTIME_DIR` is a fresh `.nh/tmp/rt-<ts>-<pid>/` (both modes), removed after the run, and both runners set their kernel manager's `connection_file` to `<it>/kernel.json` (left unset, jupyter_client writes it as a temp file outside any runtime dir): a runner killed at the deadline leaves its kernel's connection file there, not in `/tmp` or the user's Jupyter runtime dir. The kernel's command line then names the project, which the tests use to find what is left running. A dir whose nhctl is gone (the `<pid>` in its name; a SIGKILLed run leaves its dir) is removed when the next fresh-run makes its own.
+
+**The review runner** (`_REVIEW_RUNNER`, run as `<prefix>/bin/python -I -c …` in the project env, with the notebook's folder as cwd and as the kernel's, so relative paths resolve as in the notebook; argv: copy, cwd, cell timeout, kernel name (`[jupyter].kernel_name`, else the kernelspec's, else python3, with plain fresh-run's python3 fallback on `NoSuchKernel`), the marker, the indexes to skip as JSON, the record pipe's fd)
+- `NotebookClient(nb, timeout=cell_timeout, kernel_name=…, allow_errors=True, interrupt_on_timeout=True, resources={"metadata": {"path": cwd}})`; it starts the kernel itself (`create_kernel_manager`, `start_new_kernel`), prints the `start` line, then runs inside `setup_kernel()` cell by cell (`execute_cell`), so it can skip a flagged cell, time each cell and go on past errors. A `DeadKernelError` ends the run: that cell is an error, every later cell `not_run` (reason `kernel_died`; a local kernel that dies is a finding about the notebook, not D156, which is `--via server`'s, 6.11).
+- **What the cells started.** After the last cell, before `setup_kernel()` shuts the kernel down, the runner lists the kernel's descendants (`ps -A -o pid=,ppid=,pgid=`: Linux and macOS) and sends SIGTERM to those outside the kernel's group (a cell's `start_new_session=True` child, a `setsid`); after the shutdown, SIGKILL to any of them still there. Then the `done` line. The kernel's own group is nhctl's to stop (below).
+- It never writes the copy back: the report needs only the MARKER lines and the copy as it was.
+- **MARKER lines, on their own pipe.** `_run_isolated` makes a pipe and hands its write end to the runner (`pass_fds`; the fd's number is the runner's last argument). The runner writes each line there as `<marker><json>\n`, flushed explicitly per line (`-I` ignores `PYTHONUNBUFFERED`: without the flush V7 saw 0 lines before a kill), and writes nothing else there. The kernel never holds that pipe (jupyter_client starts it with Python's default `close_fds`), so the kernel's fd-level output (`os.write`, `os.system`, a C library, a process a cell started, a write at the kernel's exit), which ipykernel echoes to the runner's stdout, can neither glue itself to a line nor split one. `<marker>` is still `NH-REVIEW-<16 random hex> ` per run; the parent keeps only that pipe's lines that start with it and parse as a JSON object, at most 1 MB each.
+- **The runner's other output** (stdout and stderr: nbclient's log, the kernel's echoed output, a traceback) goes to a second pipe that nhctl reads only to keep it flowing: it keeps its last 15 lines (at most 64 KB) for D151's `output_tail` and its "No module named" check, so a cell's output never piles up in nhctl's memory. Plain fresh-run's runner writes its one result line (`NH-FRESH-RUN <json>`) to the record pipe the same way.
+
+| `t` | Fields | When |
+|---|---|---|
+| `start` | `kernel`, `pid`, `pgid` (the kernel's: jupyter_client starts it in its own session, V7) | once the kernel process exists, before the client waits for it |
+| `cell_start` | `i` | before each code cell runs |
+| `cell` | `i`, `status` (`ok`, `error`, `not_run`), `ename`, `evalue` (raw, at most 8,000 chars: 6.8's `EVALUE_RAW_CHARS`), `ms`, `reason` (`not_run` only: `flagged`, `kernel_died`) | after each code cell, or for a skipped one |
+| `done` | — | after the last cell and the cleanup of what the cells started. A run killed at the deadline has none |
+
+- `status` and the error come from the cell's execute reply (`on_cell_executed`), else its first error output. A `KeyboardInterrupt` that came at or after the cell timeout is the per-cell limit's: its `evalue` becomes `stopped by the review's N s limit per cell`.
+- **"Scrubbed evalue".** The runner runs in the project env without nh's code, so it can't redact (6.8); nhctl redacts each `cell` line's `ename` and `evalue` as it parses it (`redact_head(evalue, 500)`, then the cut), before the run goes anywhere: the analysis gets the run on stdin, never a raw value, and nothing raw is written to disk.
+
+**The deadline** (`_run_isolated(cmd, cwd, env, timeout, marker)` → `Isolated(out, timed_out, code, tail)`: the record lines read so far, whether the deadline came first, the runner's exit code, the other output's tail; plan D10 named the first two, the code and the tail stay for D151's message)
+- The runner starts in its own session (`start_new_session=True`). The parent reads both pipes without blocking (`selectors`), so it holds every record line the runner flushed, and notes the kernel's `pid`/`pgid` from the `start` line as it arrives.
+- **Finished in time.** When the runner exits, what is left in both pipes is read (the record pipe until its end, at most 2 s; it closes with the runner), then the kernel's group gets the kill below if anything in it still lives. The other pipe isn't waited for: a process the notebook started may still hold it.
+- **At the deadline:** one last non-blocking read; that is `out`, and anything after is dropped (a dying runner must not add lines). Then:
+
+| Order | Signal | Why (V7) |
+|---|---|---|
+| 0 | none: the runner's descendants are listed first (`ps -A -o pid=,ppid=,pgid=`). Those outside the runner's group and the kernel's are the strays: a cell's own-session child, or the kernel itself before its `start` line | they can only be found through their parents, which steps 1 and 2 end |
+| 1 | the runner's group: `SIGKILL` when the `start` line has named the kernel (review), else `SIGTERM`, then `SIGKILL` after 5 s (plain fresh-run: `client.execute()`'s SIGTERM handler stops its kernel, 0.31 s in V7) | the runner first, so it starts no new cell |
+| 2 | the kernel's group and each stray: `SIGTERM`, then `SIGKILL` to whatever still lives after 1 s | the kernel has its own session, so the runner's group misses it; after a runner's SIGKILL it would live ~1 s until ipykernel's parent poller (V7). Its group also holds what its cells started in it |
+| 3 | both pipes closed | a writer left (a daemon that escaped by a double fork) gets EPIPE instead of blocking on a full pipe |
+
+  - The kernel's group is signalled only when the `start` line's `pgid` equals its `pid` (a session leader, as jupyter_client starts it) and is neither 0, 1, nhctl's own group nor the runner's; otherwise only that `pid` is. A stray is signalled by its pid, never 0, 1 or nhctl's. Liveness is `os.killpg(pgid, 0)` or `os.kill(pid, 0)` (a zombie the init process hasn't reaped yet counts as gone in the tests).
+  - Plain fresh-run still raises D152 on a timeout.
+- **nhctl stopped from outside.** Ctrl-C (SIGINT), SIGTERM (a Bash tool's timeout) or SIGHUP while `_run_isolated` waits stops the runner, the kernel's group and the strays as the deadline does, then nhctl reports D198 (`Interrupted.`, exit 1). SIGTERM and SIGHUP raise `KeyboardInterrupt` there (handlers installed for the run only, main thread only); a second signal can't cut a stop short (all three are ignored while it runs). Before this, a SIGTERM ended nhctl at once and left the runner (its own session) and the kernel running until the runner's next write.
+- **The partial report (D153).** Only when the deadline came before every code cell of the copy had its `cell` line (nhctl counts the copy's code cells, as the runner does). Built from the `cell` lines and the last `cell_start`: the cell started and not finished is `stopped_at`, and `not_run` with reason `stopped`; the cells after it are `not_run` with reason `timeout`. Everything else is analysed as in a full review. When every code cell has its line, only the kernel's shutdown (or the runner's cleanup) was cut short: the review is complete, exit 0.
+
+**The analysis** (`review.py`: `python -m nh_gateway.review flag|report`; Python 3.11, the runtime venv)
+- **Launch** (V8), like `libexec/nh-mcp`: `<venv>/bin/python -s -P -m nh_gateway.review <mode>` with `PYTHONPATH=<ROOT>/server/src` and `PYTHONPYCACHEPREFIX=<data>/pycache`, `UV_PYTHON`, `VIRTUAL_ENV` and `PYTHONHOME` dropped, cwd the project, a 120 s timeout. `nh_gateway` isn't installed in the venv (`package = false`), so `-I` can't be used (V8); `-P` (Python 3.11+, as the runtime venv is) keeps the cwd off `sys.path`, so a project's own `random.py` or `secrets.py` is never imported into nh's process, which holds the Jupyter tokens. The request is one JSON object on stdin, the answer one on stdout.
+- It imports only the stdlib and nh's own stdlib-only modules (`config`, `dataflow`, `lint`, `render`, `meta`, `_shared`), so its cold start is V8's stub's (median 0.1-0.8 s), and it never imports nbformat (the copy is read as JSON).
+- It installs `secrets.Redactor.for_project(project)` first, and redacts every user text it builds (labels before their cut, intents, headings, error values) and, last, the whole Markdown.
+
+| Mode | Request | Answer |
+|---|---|---|
+| `flag` | `project`, `copy`, `notebook_dir` (the notebook's folder, relative to the project: `_notebook_dir`, `""` for the root or a notebook outside the project) | `{"flagged": [{"index", "label", "title", "rules"}], "digest"}`: `digest` is the first 16 hex of the SHA-256 of the flagged cells' `[index, rules, code]` list (what `--yes` must name) |
+| `report` | `project`, `copy`, `notebook` (as shown), `run` (parsed, redacted), `flagged`, `skipped` (indexes), `timed_out` (true only for a partial run, above), `timeout_s`, `ms`, `when` (the report's local date and time, `%Y-%m-%d %H:%M`); `notebook_dir` is carried over from the flag request, unused | `{"report": {…}, "markdown": "…"}`. A run that isn't partial and lacks a code cell's `cell` line is refused (exit 1: nhctl gives D151 before it gets there) |
+
+- **Flagged cells** (`flag`). Each code cell is linted with the gateway's own `lint_cell` and the project's config (`config.load`), as `nh_add_cell` lints a new cell at that place: `names_above` and `code_above` from the cells above, the approved hosts (`.nh/state/approved_hosts.json`), `project_root` and `notebook_dir`. Its findings of these rules flag it, whatever their level, unless the project set the rule `off`:
+
+| Rule | Key | Flags a cell that would, in the review's kernel |
+|---|---|---|
+| L009 | `package_install` | install packages (6.4) |
+| L012 | `network` | reach a host not approved (6.4) |
+| L013 | `outside_write` | write or remove files outside the project (6.4) |
+| L011 | `secret_print` | show an env var's value (6.7) |
+| L014 | `secret_name` | show a value whose name says it is a secret (6.7) |
+| — | `unreadable` | do what nh can't tell: nh's Python can't parse the cell once its magic lines are masked (a syntax error, wherever it is: an indented first line such as `    !echo hi`, which IPython dedents and runs, is one on a magic line; syntax newer than the runtime venv's Python such as 3.12's nested f-string quotes; nesting too deep), so the rules above can't see into it. Fails closed, unlike the gateway's lint, where such a cell only gets L007's hint; a cell magic whose body isn't Python (`%%bash`) is left to the rules above |
+
+  `rules` lists the keys in this order. `title` is the note's title or None.
+- **Report** (`report`): the findings above, the counts and the Markdown.
+
+**The JSON** (stdout with `--json`, after `print_result`'s scrub; no copy path, and no `nh-` id, anywhere in it)
+
+| Key | Holds |
+|---|---|
+| `ok` | the review ran to the end and every code cell ran ok (none failed, none skipped or stopped) |
+| `complete` | the review ran to the end (false with D153) |
+| `notebook` | the notebook, as shown (`notebooks/eda.ipynb`) |
+| `report` | the report file (`.nh/reviews/20261010T101500-eda.md`) |
+| `kernel` | the kernel the run used |
+| `ms`, `timeout_s` | the run's time; the deadline |
+| `code_cells` | code cells with source |
+| `ran` | `{"ok", "error", "not_run"}`, which add up to `code_cells` |
+| `failing` | `[{"index", "label", "ename", "evalue"}]` |
+| `not_run` | `[{"index", "label", "reason"}]`, reason `flagged`, `stopped`, `timeout` or `kernel_died` |
+| `stopped_at` | `{"index", "label"}` with D153, else None |
+| `hidden_state` | `{"read_before_defined": [{"index", "label", "names": [{"name", "defined_in"}]}], "out_of_order": [{"index", "label", "count", "after", "same_as"}], "fails_only_fresh": [{"index", "label", "ename", "after_not_run", "after_error"}]}`; `defined_in` is a later cell's label or None; in an `out_of_order` entry exactly one of `after` and `same_as` is a cell (`{"index", "label", "count"}`), the other None |
+| `src_candidates` | `[{"index", "label", "lines"}]` |
+| `max_cell_lines` | the limit used |
+| `summary` | `[{"heading", "cells": [{"index", "label", "intent"}]}]`, heading None before the first one |
+| `flagged` | the flagged cells (as `flag` gives them): with `--yes` they ran, with `--skip-flagged` they are `not_run` |
+| `error` | D153 only: `{"code", "message", "fix"}` |
+
+- Exit 0 when the review ran to the end, whatever it found (the report is the result); 1 with D153 (the JSON above plus `error`) and for every other error (`{"ok": false, "error": …}`); 2 with D154 or a usage error.
+- Without `--json` nhctl prints the Markdown, then `Report: <file>`; with D153 also `error: …` and `fix: …`.
+
+**The report file** (Markdown, redacted; one page for a typical notebook)
+- `# Review of <notebook>`, then one line: the date, the kernel, the counts and the time (`2026-10-10 10:15 · kernel python3 · 12 code cells: 10 ok, 1 failed, 1 not run · 8.4 s`); with D153 a `**Partial:**` line saying it stopped after N s while `<label>` was running, so the cells below it didn't run (or, with no cell running, that it stopped before any cell ran, or between two cells). `<S>` and `N` print a fractional `--timeout` as given (`0.5`).
+- Sections, each present even when empty (an empty one says so in one line): `## Failing cells`, `## Hidden state` (three sub-lists), `## Cells over N lines (candidates for src/)`, `## Not run` (only when some didn't), `## Intent summary` (a `### heading` per group).
+
+**Codes**
+
+| Code | When | Message, then fix |
+|---|---|---|
+| D120 | the runtime venv isn't ready (V8's "located, venv not ready"; D120 is the doctor's code for the same state) | `nh's own Python runtime isn't installed yet, so the review can't analyse the notebook.`; `Run: nhctl runtime sync --plugin-data "${CLAUDE_PLUGIN_DATA}", then rerun.` |
+| D121 | the data dir can't be located (`common.plugin_data_dir`, unchanged) | as before |
+| D153 | the deadline, a partial report (exit 1) | `The review stopped after <S>s while <label> was running; the report covers the cells before it.`; `Rerun with a larger --timeout, or check that cell for a wait that never ends.` With no cell running at the deadline: `The review stopped after <S>s before any cell ran; …` (its kernel was starting) or `… between cells; …`, each `the report covers the cells that finished.`; `Rerun with a larger --timeout.` |
+| D154 | flagged cells, nothing run (exit 2; `notebook`, `flagged` and `digest` in the JSON) | `<n> cell(s) would do more than compute in the review's kernel: <label> (<rule>, <rule>); <label> (<rule>); …. Nothing ran.`; `Ask the user, then rerun with --yes <digest> to run them too, or --skip-flagged to run the rest.` After a `--yes` whose digest isn't the cells' now: `The cells to ask about changed since that yes. <n> cell(s) would …` (the same listing and fix, the new digest) |
+| D199 | the analysis failed | `The review's analysis failed (exit <n>).`; `Run nhctl runtime sync, then rerun; NHCTL_DEBUG=1 shows more.` An answer without its report and Markdown: `The review's analysis gave no report.`; `Rerun the review.` |
+
+- **D11's wording.** Plan D11 says "D121 when the data dir is missing" for `--via server`. Per V8 that becomes: D121 only when the data dir can't be located; a located dir whose venv isn't ready is D120 (fix: `nhctl runtime sync`), as here (6.11 follows it).
+- `docs/troubleshooting.md` gets rows for D120 (setup), D153, D154, a cell stopped by the review's per-cell limit (its `KeyboardInterrupt` evalue) and the report's hidden-state headings (a new "Fresh runs and reviews" section); `plugins/nh/README.md`'s nhctl table gets `nhctl fresh-run --review` (the root README lists no nhctl commands).
+- The report's hidden-state lines: ``- <label> reads `<name>`, defined later in <label>`` (or `, which no cell defines (only the kernel had it)`); `- <label> ran before <label> above it`; `- <label> has the same count as <label> above it, so they ran in different kernel sessions`; `- <label>: <ename> here, though the notebook shows it ran without an error`, plus `(a cell above it failed in the review)`, `(a cell above it didn't run in the review)` or `(cells above it failed or didn't run in the review)`.
+
+**C10b: the skill** (`skills/review/SKILL.md`)
+
+```yaml
+name: review
+description: >-
+  Review this Notebook Harness project's notebook: run a copy of it top to
+  bottom in a separate kernel and report failing cells, hidden-state
+  dependencies, cells long enough to move to src/, and a one-page intent
+  summary. Never touches the live kernel or the notebook. Runs when the user
+  types /nh:review, optionally naming a notebook.
+argument-hint: "[notebook]"
+disable-model-invocation: true
+allowed-tools:
+  - Bash(nhctl fresh-run *)
+```
+
+No `nh_inspect`: it probes the live kernel. The steps:
+1. Say the review can take a few minutes: it runs every cell again in a separate kernel, and the notebook and its kernel stay as they are.
+2. Run, with Bash's `timeout: 600000`: `nhctl fresh-run --review <notebook, if the user named one> --plugin-data "${CLAUDE_PLUGIN_DATA}" --timeout 540 --json`. No `--cell-timeout`: the review's default (180 s here) interrupts a hanging cell and goes on.
+3. Exit 2 with D154: show this, then stop and wait for the answer (one question; no other call):
+   > The review runs every cell again in a separate kernel. These cells would also do more there:
+   > - `<label>`: `<what>`
+   >
+   > Run them in the review too? Yes runs every cell; no skips these, and the report lists them as not run.
+
+   One line per flagged cell, its `<what>` the rules joined with "; ": `package_install` "installs packages", `network` "reaches the network", `outside_write` "writes outside the project", `secret_print` "shows environment variables", `secret_name` "shows a value named like a secret", `unreadable` "is code nh can't parse, so it can't tell what it does". A yes reruns step 2's command with `--yes <digest>` (the D154 JSON's `digest`, as given); a no with `--skip-flagged`. A D154 again after a yes means the flagged cells changed meanwhile: ask again, the same way, about the new list.
+4. Exit 0, or 1 with D153: show the report from the JSON (failing cells, hidden state, `src/` candidates, the intent summary; with D153 first say it stopped and at which cell) and name the file (`report`). Any other error: its message and fix.
+- Name cells by their labels; never `nh-` ids, line numbers or the copy.
+
+**C10b: the eval `review-report`** (tag `ci`, 3 runs, `max_turns` 8, `allowed_tools: [Read, Glob, Grep, Skill]`)
+- **No Bash in the run.** An eval grants Bash only through the run-wide `--allow-tools`, and only under Claude Code's OS sandbox (bubblewrap and socat on Linux; checked in C10a: this machine has neither, so a run granting Bash is refused). Inside that sandbox the home directory and Claude Code's configuration are unreadable, so the real `nhctl fresh-run --review` can't reach the runtime venv under `CLAUDE_PLUGIN_DATA` or a uv-managed Python; and `nhctl` on the Bash PATH is the plugin's own, which a scaffold can't shadow. So the real run can't happen in an eval, and the case doesn't grant Bash.
+- **The stub is a recorded tool result** in the real format: `context.history_file` holds the `/nh:review` message (the skill loaded), Claude's step-1 line and its Bash call (step 2's exact command), and that call's result: the stdout of the real `nhctl fresh-run --review --json` on the case's scaffolded project, with `ms` and the report's timestamp fixed. The case's prompt is the user's next message, "What did the review find?" (the turn starts after the tool result). C10b first probes that the eval CLI resumes such a transcript; if it doesn't, the transcript also holds Claude's reply and the prompt asks "Which cells should I fix first, and why?".
+- **The fixture** (`scaffold.sh`): base.sh's project, then a notebook with: a heading `# Load` over the loader and a cell reading `df_clean` that only a later cell defines (hidden state: defined later); `# Clean` over a cell whose count is lower than one above it (out of order) and a cell that raises `KeyError: 'price'` in the fresh run while its stored output is clean (fails only fresh); a 45-line cell (`src/` candidate); nh titles and intents on each; and `.nh/reviews/<fixed ts>-eda.md`, the report the recorded run wrote.
+- **Pinned by a test** (`test_skill_files.py`): it builds the scaffold in a temp dir, runs the real `nhctl fresh-run --review --json` there (the server venv's Python as the project env and as a ready runtime venv, as `test_freshrun.py` does) and checks that the recorded result and report equal the real ones, `ms` and the timestamp normalised; it also checks the history's Bash command is the skill's step 2 byte for byte.
+- **Graders**
+
+| Grader | Type | Weight | Passes when |
+|---|---|---|---|
+| `no-ipynb-read` | `tool_used`, `tool: Read`, `input_match: \.ipynb`, `min: 0`, `max: 0` | 1 | no Read of a notebook or the copy |
+| `no-nh-calls` | `regex`, `target: mock_calls`, `match: not_contains`, pattern `"tool":\s*"mcp__plugin_nh_nh__(?:nh_add_cell\|nh_edit_cell\|nh_run\|nh_undo\|nh_inspect)"` | 5 | no nh tool call: the suite's mocks (`evals/mocks/nh/`) answer every case without a grant, so nh's tools are there to call. A review neither writes, runs nor undoes cells, and doesn't probe the live kernel (`nh_inspect`) |
+| `names-file` | `regex`, `last_message` | 2 | the report file's path, `\.nh/reviews/<ts>-eda\.md` |
+| `no-ids` | `regex`, `last_message`, `match: not_contains` | 1 | no `nh-[0-9a-f]{10}` id and no `.nh/tmp/` path |
+| `findings` | `llm`, `last_message` | 3 | the reply names the failing cell and its `KeyError`, the `df_clean` read before its definition with the cell that defines it, the out-of-order cell, the 45-line cell as a `src/` candidate, and summarises the intents by heading; it states no number the recorded result doesn't hold |
+
+**Tests** (C10a)
+- `tests/nhctl/test_freshrun.py` (real nbclient and ipykernel from the server venv, both Pythons; a ready runtime venv: `venv-<sha>/` with `.nh-ready`, `bin/python` linking the server venv's Python): review mode end to end (failing cell, hidden state, long cell, summary, report file, the JSON's keys, bytecode under `<data>/pycache`); the analysis's launch (a `bin/python` wrapper that records its argv and environment: `-s -P -m nh_gateway.review`, `PYTHONPATH`, `PYTHONPYCACHEPREFIX`); MARKER parsing with forged and broken lines skipped (`parse_run` directly); cells whose fd-level output lacks a newline (`os.write`, a C `printf`, a background writer, a write at the kernel's exit) losing no record; nhctl's memory flat under 150 MB of a cell's output; a per-run marker that differs between runs; the copy's rotation (3 `review-*`, plain fresh-run's 5 `fresh-*` untouched) and a stale `rt-*` dir removed while a live one stays; the token drop on both runners (a cell writes the three variables' presence to a file); D154 (exit 2, its listing, its digest, nothing run, no copy left), `--yes <digest>`, a stale digest (D154 again, nothing run), `--skip-flagged` (`not_run`, reason `flagged`); `--timeout` and `--cell-timeout` refused when not finite and above 0 (D100), and the review's default cell timeout; `--cell-timeout 2` interrupting a sleeping cell and going on; a kernel that dies (`os._exit`: the later cells `kernel_died`); a deadline's partial D153 (exit 1, cells before reported, `stopped_at`, the rest `timeout`) and one before any cell ran (`--timeout 0.5`), each leaving no process whose command line names the project; a deadline after the last `cell` line (a fake runner that lingers: a complete review, exit 0); a run that ends before the deadline without every cell's line (a fake runner that still says `done`: D151, no report); a cell's own-session child gone after a deadline and after a normal finish; plain fresh-run's D152 leaving nothing running and no `rt-*` dir; nhctl stopped mid-review by SIGTERM or SIGINT (D198, and no runner, kernel or child left); the notebook's bytes and mtime unchanged; no copy path and no `nh-` id in the JSON or the report; D120 (no venv, no marker), D121; usage errors; a secret in an error value redacted in the JSON and the report; `_notebook_dir` (a folder, nested folders, the root, outside the project).
+- `tests/unit/test_review.py` (the analysis in-process and through `python -m nh_gateway.review`): hidden state, including a name defined only in a later cell, a name no cell defines, builtins and IPython names, cells skipped when `open`, a cell reading its own output (`df = df.dropna()`, `counter += 1`), a name read only in a function, lambda or method body that a later cell defines (not hidden state) or no cell defines (hidden state); out-of-order counts, equal counts (`same_as`); `NameError`/`KeyError` where the stored output was clean (and not where it already failed, or never ran), below a cell that didn't run or failed; long cells at the limit and over it, with a configured `max_cell_lines`; the intent summary's grouping by headings (none, several, a cell with two headings, setext headings, mixed fences, notes not counted as headings, empty groups dropped); each flag rule, `off` respected, approved hosts, a cell nh can't parse (`unreadable`), a project outside `/tmp` whose notebook writes `../` (inside) and `../../` (outside); the digest; a project-root `random.py` never imported by `python -s -P -m nh_gateway.review`; a run missing a line refused; redaction of a secret in an `evalue`, a title, an intent and a heading, in the JSON and the Markdown.
+- `tests/unit/test_dataflow.py`: `now` and `later` for module-level reads, a read before the cell's own binding, a branch's binding, function, lambda, method and class bodies, comprehensions, decorators and defaults; `uses` unchanged by them (an except handler's name read in a method or a comprehension's lambda).
+- `tests/integration/test_review_timeout.py` (`-m integration`): a notebook whose fourth cell sleeps and starts a child process, run with a short `--timeout` through a real kernel: D153, the three cells before it reported (one failing), `stopped_at` the sleeper, the last cell `not_run` (timeout), and no runner, kernel or child process left (their pids, which the cells wrote into the project). A live kernel the test starts first, in the `JUPYTER_RUNTIME_DIR` nhctl is given, keeps running with its state, and its runtime dir holds only its own connection file.
+
+**Known gaps**
+- The flag check is the lint's: what L009, L011-L014 can't see (a URL built at run time, a write through a library nh doesn't know) runs without a question, as in the live notebook. So does what L013 exempts: a write under `/tmp`, `/var/tmp` or `/dev`.
+- A cell the user runs by hand with side effects nh's rules don't name (a database write) runs in the review too.
+- Out-of-order counts read the live notebook's stored counts: a notebook saved without them (nbstripout) has none to compare.
+- The review kernel runs in the project env with the notebook's folder as cwd, so a cell that writes inside the project does write there (as in the notebook).
+- What the cells started: a process that left the kernel's tree before the end (a daemon's double fork, or an own-session child of a kernel that died, whose parent is gone, so it hangs off init) can't be found by its parents and keeps running. Plain fresh-run's runner (unchanged from v0.1 apart from the token drop, the private runtime dir and the record pipe) doesn't stop a cell's own-session child after a normal finish; at its deadline nhctl does.
+- A `later` read the review doesn't report (a helper called in the same cell as a lambda passed to `sorted`, reading a name a later cell defines) still shows up in the run, as a fresh-only `NameError`, when the live notebook's output was clean.
+- The `--yes` digest names the flagged cells' code, not the others': a cell that isn't flagged may change between the question and the yes and runs anyway, as in a plain fresh-run.
+- If nhctl itself is SIGKILLed, it can't stop anything: the runner lives until its next record write fails or a cell timeout hits, and ipykernel's parent poller ends the kernel about 1 s after the runner. The per-run marker is in the runner's argv, readable through `/proc` by a cell (not a concern for the user's own notebook).
+
 ### 6.13 a7, a8 and drift issue filing
 
 Chunk C12 (plan D13), built early as C12-early: a7, a8, the drift.yml issue job and the ci.yml artifact glob. The rest of C12 (README, troubleshooting pass, acceptance) comes later. a7 and a8 each exposed gateway bugs, fixed minimally here: a8 the unsaved room (`backend/rtc.py`, `backend/rtc_backend.py`; while testing it, C12's review found that a normal close of the room connection froze the gateway, from v0.1, fixed in `backend/rtc.py` too), a7 the kernel websocket's pure-Python UTF-8 check (`backend/kernel.py`), the prune that deleted a call's own image originals (`exec/shaping.py`) and, from v0.1, the new kernel connections that are dead from the start (`backend/kernel.py`, and the probe lock in `backend/rtc_backend.py`; its own step after the C12-early commits). a7 also measured V11's 50 MB stream over the 1.5 s budget on this machine, so V11's fallback, the trim, is built here too (`exec/shaping.py`; designed in design.md §6.8 Trim, directly). Tests: `tests/integration/test_large_outputs.py` (new, a7), `tests/integration/test_lab_restart.py` (new, a8), `tests/integration/test_kernel_connections.py` (new), `tests/integration/conftest.py`, `tests/integration/test_rtc_document.py`, `tests/unit/test_rtc_save.py` (new), `tests/unit/test_kernel_utf8.py` (new), `tests/unit/test_kernel_connect.py` (new), `tests/unit/test_shaping.py`. Also `.github/workflows/drift.yml`, `.github/workflows/ci.yml` and `spikes/RESULTS.md`. No new code in §6.0 d, no model-facing text: the trim reuses nh's `[… N chars cut …]` marker.

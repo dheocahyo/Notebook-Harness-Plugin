@@ -134,6 +134,7 @@ and stops at the first error, "check this" finding or nh question.
 | `nhctl doctor` | the same checks as `/nh:status`, from a shell |
 | `nhctl preset senior`, `junior` | the project's preset in `harness.toml`: senior allows 1 comment line per 16 code lines and asks for short explanations, junior (the default) 1 per 8; the comment budget applies from nh's next tool call, the explanation depth from a new session or /clear |
 | `nhctl fresh-run` | run a copy of the notebook top to bottom in a fresh kernel |
+| `nhctl fresh-run --review` | `/nh:review`'s run: a copy of the notebook in a separate kernel, past errors; reports failing cells, hidden-state dependencies, cells over `[lint] max_cell_lines` (candidates for `src/`) and the cells' intents by heading, in `.nh/reviews/`. Cells that would install packages, reach the network, write outside the project or show a secret, or that nh can't parse, stop it before anything runs (exit 2) until you pass `--yes <digest>` (run them; the digest names the cells it listed) or `--skip-flagged` (skip them); your kernel and the notebook file are never touched |
 | `nhctl metrics summarize` | cells per message, undos and rejections, from `.nh/log.jsonl` |
 
 `nhctl` is on Claude Code's Bash PATH while nh is enabled.
